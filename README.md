@@ -37,3 +37,7 @@ For more detailed information on setting up and running an app that calls a Goog
 
 - This script requires OAuth 2.0 credentials to access the Google Drive API. Ensure that you set up the credentials file (`credentials.json`) correctly.
 - Make sure the specified download directory (`DOWNLOAD_PATH`) exists and has write permissions.
+
+## Activity
+
+![Alt](https://repobeats.axiom.co/api/embed/25976cb32f4e20b563591e534b83230e6b3d61f8.svg "Repobeats analytics image")
