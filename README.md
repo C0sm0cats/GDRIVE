@@ -14,6 +14,7 @@ data from silent overwrites or deletions.
   `REMOVED_REMOTE`, `LOCAL_ONLY`, and `SKIPPED` statuses
 - Atomic file replacement through temporary `.part` files
 - Google-native document export to local formats
+- Drive shortcuts followed to their target files and folders
 - Local change detection through checksums and a managed state file
 - Recovery of tracked files removed from Drive instead of permanent deletion
 - Preservation of unknown local files and folders
@@ -90,6 +91,8 @@ The final managed folder must be:
 - empty; or
 - an existing GDrive Pull folder containing
   `.gdrivepull-managed-state.json`.
+
+Press `Ctrl+S` to save the destination or `Esc` to cancel.
 
 A non-empty folder without that state file is refused to prevent accidental
 adoption or overwriting of unrelated data.
