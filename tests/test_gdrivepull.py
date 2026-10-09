@@ -961,7 +961,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("X", *"empty", "enter")
             await pilot.pause()
             self.assertFalse((self.root / gdrivepull.RECOVERY_DIR_NAME).exists())
-            self.assertIn("Nothing set aside", str(app.query_one("#removed-summary").render()))
+            self.assertIn("Nothing here yet", str(app.query_one("#removed-summary").render()))
             await pilot.press("tab")  # back to My Drive, with the tree
             self.assertTrue(app.query_one(Tree).display)
             self.assertEqual(app.query_one("#keys").context, "tree")

@@ -2222,10 +2222,10 @@ class DriveSelectorApp(App):
             summary.append("x", style="bold #f59e0b")
             summary.append(" deletes it for good. Nothing here is on Drive any more.", style="dim")
         else:
-            summary.append("Nothing set aside.", style="bold")
+            summary.append("Nothing here yet.", style="bold")
             summary.append(
-                " When a file you downloaded is removed from Drive, the next download moves your copy here "
-                "instead of deleting it.", style="dim",
+                " If a file you downloaded gets deleted on Drive, your copy lands here at the next download "
+                "instead of being deleted: you can put it back or delete it.", style="dim",
             )
         self.query_one("#removed-summary", Static).update(summary)
         if self.removed_rows:
