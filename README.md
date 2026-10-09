@@ -1,4 +1,4 @@
-# SaveGDrive
+# GDRIVE - Two-Way Google Drive Sync
 
 SaveGDrive syncs Google Drive folders and files with a local folder, both ways,
 from the terminal, on Linux and other POSIX environments. You pick what to sync
