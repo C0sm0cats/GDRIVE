@@ -138,8 +138,8 @@ help, or run `./run-gdrivepull.sh --help`.
 | `Left` / `Right` | Collapse / expand a folder, or go to the parent folder / first child |
 | `Enter` | Expand or collapse a folder |
 | `Space` | Select or unselect an item |
-| `A` | Select all (only the matching items while a filter is active) |
-| `C` | Clear the selection |
+| `A` | Select all, or unselect all when everything is already selected (only the matching items while a filter is active) |
+| `C` | Unselect everything, including items hidden by the filter |
 | `E` | Expand or collapse everything below the cursor |
 | `/` | Filter by name or path: `Enter` keeps the filter, `Esc` clears it |
 | `O` | Open the item in Google Drive |

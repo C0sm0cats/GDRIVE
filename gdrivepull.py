@@ -796,8 +796,8 @@ KEY_HELP = [
     ("← →", "collapse / expand a folder, or go to the parent folder / first child"),
     ("enter", "expand or collapse a folder"),
     ("space", "select / unselect (a selected folder includes everything below it)"),
-    ("a", "select all (only the matching items while a filter is active)"),
-    ("c", "clear the selection"),
+    ("a", "select / unselect all (only the matching items while a filter is active)"),
+    ("c", "unselect everything, including items hidden by the filter"),
     ("e", "expand or collapse everything below the cursor"),
     ("/", "filter by name or path: enter keeps the filter, esc clears it"),
     ("o", "open the item in Google Drive"),
@@ -851,7 +851,7 @@ class DriveTree(Tree):
     # These replace Tree's own space / enter and go to the app, so the selection stays there.
     BINDINGS = [
         Binding("space", "app.toggle_current", "Select"),
-        Binding("enter", "app.activate_current", "Expand", show=False),
+        Binding("enter", "app.activate_current", "Expand", key_display="enter"),
         Binding("left", "app.collapse_or_parent", "Collapse", show=False),
         Binding("right", "app.expand_or_child", "Expand", show=False),
         Binding("e", "app.expand_all", "Expand all", show=False),
@@ -895,7 +895,7 @@ class DriveSelectorApp(App):
 
     BINDINGS = [
         Binding("a", "select_all", "Select all"),
-        Binding("c", "clear_selection", "Clear"),
+        Binding("c", "clear_selection", "Unselect all"),
         Binding("slash", "start_filter", "Filter"),
         Binding("o", "open_in_drive", "Open in Drive", show=False),
         Binding("d", "confirm", "Download"),
@@ -1189,12 +1189,26 @@ class DriveSelectorApp(App):
 
     def action_select_all(self):
         if self.filter_terms:
-            for entry in self.nodes:
-                if entry["index"] in self.filter_visible and matches_filter(entry, self.filter_terms):
-                    self.add_entry(entry)
+            targets = [
+                entry for entry in self.nodes
+                if entry["index"] in self.filter_visible and matches_filter(entry, self.filter_terms)
+            ]
+        else:
+            targets = self.children_of.get(None, [])
+        if all(path_selection_state(selected_path(entry), self.selections) != " " for entry in targets):
+            # Everything is already selected: unselect it.
+            paths = {selected_path(entry) for entry in targets}
+            self.selections[:] = [
+                entry for entry in self.selections
+                if selected_path(entry) not in paths
+                and not any(path in selected_path(entry).parents for path in paths)
+            ]
+        elif self.filter_terms:
+            for entry in targets:
+                self.add_entry(entry)
         else:
             self.selections.clear()
-            for entry in self.children_of.get(None, []):
+            for entry in targets:
                 self.add_entry(entry)
         self.refresh_node_labels()
 

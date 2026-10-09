@@ -343,7 +343,13 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.selected(app), ["Photos/beach.jpg"])
             await pilot.press("a")
             self.assertEqual(self.selected(app), ["Docs", "Photos", "notes.txt"])
-            await pilot.press("c", "escape")
+            await pilot.press("a")  # everything selected: a unselects all
+            self.assertEqual(self.selected(app), [])
+            await pilot.press("slash", *"beach", "enter", "a", "a")  # same with a filter
+            self.assertEqual(self.selected(app), [])
+            await pilot.press("a", "escape", "c")
+            self.assertEqual(self.selected(app), [])
+            await pilot.press("escape")
         self.assertEqual(app.return_value, [])
 
     async def test_help_and_expand_all(self):
