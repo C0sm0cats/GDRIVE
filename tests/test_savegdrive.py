@@ -8,13 +8,13 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import gdrivepull  # noqa: E402
+import savegdrive  # noqa: E402
 
 from googleapiclient.errors import HttpError  # noqa: E402
 from rich.console import Console  # noqa: E402
 from textual.widgets import Input, Tree  # noqa: E402
 
-FOLDER = gdrivepull.FOLDER_MIME_TYPE
+FOLDER = savegdrive.FOLDER_MIME_TYPE
 DOC = "application/vnd.google-apps.document"
 FORM = "application/vnd.google-apps.form"
 
@@ -86,6 +86,7 @@ class FakeDrive:
         self.failures = {}  # folder id -> errors raised by its next listings
         self.change_log = []
         self.shared_drives = list(shared_drives)
+        self.uploads = []
 
     def files(self):
         return self
@@ -122,9 +123,9 @@ class FakeDrive:
 
     def list(self, q, pageToken=None, **kwargs):
         if q.startswith("sharedWithMe"):
-            folder_id = gdrivepull.SHARED_WITH_ME
+            folder_id = savegdrive.SHARED_WITH_ME
         elif q == "trashed = true":
-            folder_id = gdrivepull.TRASH
+            folder_id = savegdrive.TRASH
         else:
             folder_id = q.split("'")[1]
         want_trashed = q.endswith("trashed = true")
@@ -133,9 +134,9 @@ class FakeDrive:
             failures = self.failures.get(folder_id)
             if failures:
                 raise failures.pop(0)
-            if folder_id == gdrivepull.SHARED_WITH_ME:
+            if folder_id == savegdrive.SHARED_WITH_ME:
                 children = [self.public(item) for item in self.items.values() if item.get("shared")]
-            elif folder_id == gdrivepull.TRASH:
+            elif folder_id == savegdrive.TRASH:
                 children = [
                     dict(self.public(item), explicitlyTrashed=bool(item.get("trashed")))
                     for item in self.items.values() if self.is_trashed(item)
@@ -203,7 +204,27 @@ class FakeDrive:
 
 
 def fake_fetch(service, item, file_handle, stop=None):
-    file_handle.write(service.items[gdrivepull.effective_id(item)]["content"])
+    file_handle.write(service.items[savegdrive.effective_id(item)]["content"])
+
+
+def fake_upload(service, path, file_id=None, name=None, parent_id=None, stop=None, on_bytes=lambda count: None):
+    import hashlib
+
+    content = path.read_bytes()
+    if file_id is None:
+        file_id = f"up{len(service.items)}"
+        service.items[file_id] = {"id": file_id, "name": name, "mimeType": "text/plain", "parent": parent_id}
+    item = service.items[file_id]
+    service.uploads.append(file_id)
+    item.update(content=content, size=str(len(content)), md5Checksum=hashlib.md5(content).hexdigest(),
+                modifiedTime=f"2026-02-0{len(service.uploads) % 9 + 1}T00:00:00.000Z")
+    return service.public(item)
+
+
+def fake_create_folder(service, name, parent_id):
+    folder_id = f"dir{len(service.items)}"
+    service.items[folder_id] = {"id": folder_id, "name": name, "mimeType": FOLDER, "parent": parent_id}
+    return {"id": folder_id, "name": name, "mimeType": FOLDER}
 
 
 def file_item(item_id, name, parent, content, **extra):
@@ -232,27 +253,27 @@ def demo_drive():
 
 class NamesTest(unittest.TestCase):
     def test_local_names(self):
-        self.assertEqual(gdrivepull.local_name({"name": "a/b", "mimeType": "text/plain"}), "a_b")
-        self.assertEqual(gdrivepull.local_name({"name": "..", "mimeType": "text/plain"}), "_unnamed_")
-        self.assertEqual(gdrivepull.local_name({"name": "Plan", "mimeType": DOC}), "Plan.docx")
-        self.assertEqual(gdrivepull.local_name({"name": "Plan.DOCX", "mimeType": DOC}), "Plan.DOCX")
+        self.assertEqual(savegdrive.local_name({"name": "a/b", "mimeType": "text/plain"}), "a_b")
+        self.assertEqual(savegdrive.local_name({"name": "..", "mimeType": "text/plain"}), "_unnamed_")
+        self.assertEqual(savegdrive.local_name({"name": "Plan", "mimeType": DOC}), "Plan.docx")
+        self.assertEqual(savegdrive.local_name({"name": "Plan.DOCX", "mimeType": DOC}), "Plan.DOCX")
 
     def test_human_size(self):
-        self.assertEqual(gdrivepull.human_size(999), "999 B")
-        self.assertEqual(gdrivepull.human_size(2_400_000), "2.4 MB")
-        self.assertEqual(gdrivepull.human_size(340_000_000), "340 MB")
+        self.assertEqual(savegdrive.human_size(999), "999 B")
+        self.assertEqual(savegdrive.human_size(2_400_000), "2.4 MB")
+        self.assertEqual(savegdrive.human_size(340_000_000), "340 MB")
 
     def test_shortcut_follows_target(self):
-        shortcut = {"id": "s", "name": "Link", "mimeType": gdrivepull.SHORTCUT_MIME_TYPE,
+        shortcut = {"id": "s", "name": "Link", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
                     "shortcutDetails": {"targetId": "t", "targetMimeType": FOLDER}}
-        self.assertTrue(gdrivepull.is_folder(shortcut))
-        self.assertEqual(gdrivepull.effective_id(shortcut), "t")
-        self.assertIn("/folders/t", gdrivepull.drive_url(shortcut))
+        self.assertTrue(savegdrive.is_folder(shortcut))
+        self.assertEqual(savegdrive.effective_id(shortcut), "t")
+        self.assertIn("/folders/t", savegdrive.drive_url(shortcut))
 
     def test_unsupported(self):
-        self.assertTrue(gdrivepull.is_unsupported({"mimeType": FORM}))
-        self.assertFalse(gdrivepull.is_unsupported({"mimeType": DOC}))
-        self.assertFalse(gdrivepull.is_unsupported({"mimeType": FOLDER}))
+        self.assertTrue(savegdrive.is_unsupported({"mimeType": FORM}))
+        self.assertFalse(savegdrive.is_unsupported({"mimeType": DOC}))
+        self.assertFalse(savegdrive.is_unsupported({"mimeType": FOLDER}))
 
 
 class ListingTest(unittest.TestCase):
@@ -262,7 +283,7 @@ class ListingTest(unittest.TestCase):
         items.append({"id": "sub", "name": "A sub", "mimeType": FOLDER, "parent": "f0"})
         drive = FakeDrive(items, page_size=2)
         cache = {}
-        gdrivepull.list_folders(drive, [f"f{i}" for i in range(60)], cache)
+        savegdrive.list_folders(drive, [f"f{i}" for i in range(60)], cache)
         self.assertEqual(len(cache), 60)
         self.assertEqual(len(cache["f0"]), 6)
         self.assertEqual(cache["f0"][0]["id"], "sub")  # folders first
@@ -272,19 +293,19 @@ class ListingTest(unittest.TestCase):
     def test_retries_rate_limits(self):
         drive = demo_drive()
         drive.failures["docs"] = [http_error(429)]
-        with mock.patch.object(gdrivepull.time, "sleep"):
+        with mock.patch.object(savegdrive.time, "sleep"):
             cache = {}
-            gdrivepull.list_folders(drive, ["docs"], cache)
+            savegdrive.list_folders(drive, ["docs"], cache)
         self.assertEqual(len(cache["docs"]), 4)
 
     def test_raises_other_errors(self):
         drive = demo_drive()
         drive.failures["docs"] = [http_error(404)]
         with self.assertRaises(HttpError):
-            gdrivepull.list_folders(drive, ["docs"], {})
+            savegdrive.list_folders(drive, ["docs"], {})
 
     def test_tree_order_and_totals(self):
-        nodes, browsed = gdrivepull.collect_drive_tree(demo_drive(), "root", {})
+        nodes, browsed = savegdrive.collect_drive_tree(demo_drive(), "root", {})
         paths = [node["display_path"] for node in nodes]
         self.assertEqual(paths[:3], ["Docs", "Photos", "notes.txt"])
         self.assertIn("Docs/Report", paths)
@@ -292,16 +313,16 @@ class ListingTest(unittest.TestCase):
             if node["parent"] is not None:
                 self.assertLess(node["parent"], node["index"])
         self.assertEqual(len(browsed[Path()]), 3)
-        totals = gdrivepull.folder_totals(nodes)
+        totals = savegdrive.folder_totals(nodes)
         self.assertEqual(totals[0], [4, 10])  # Docs: a, b, Report, Survey; 5 + 5 known bytes
 
     def test_shortcut_cycle_stops(self):
         drive = FakeDrive([
             {"id": "loop", "name": "Loop", "mimeType": FOLDER, "parent": "root"},
-            {"id": "back", "name": "Back", "mimeType": gdrivepull.SHORTCUT_MIME_TYPE, "parent": "loop",
+            {"id": "back", "name": "Back", "mimeType": savegdrive.SHORTCUT_MIME_TYPE, "parent": "loop",
              "shortcutDetails": {"targetId": "loop", "targetMimeType": FOLDER}},
         ])
-        nodes, _ = gdrivepull.collect_drive_tree(drive, "root", {})
+        nodes, _ = savegdrive.collect_drive_tree(drive, "root", {})
         self.assertEqual([node["display_path"] for node in nodes], ["Loop", "Loop/Back"])
 
 
@@ -312,45 +333,53 @@ class SelectionTest(unittest.TestCase):
 
     def test_parent_replaces_children(self):
         selections = []
-        gdrivepull.add_selected_item(selections, self.child, Path("Docs"))
-        gdrivepull.add_selected_item(selections, self.folder, Path())
-        self.assertEqual([gdrivepull.selected_path(entry) for entry in selections], [Path("Docs")])
-        self.assertFalse(gdrivepull.add_selected_item(selections, self.child, Path("Docs")))
-        self.assertEqual(gdrivepull.path_selection_state(Path("Docs/a.txt"), selections), "*")
+        savegdrive.add_selected_item(selections, self.child, Path("Docs"))
+        savegdrive.add_selected_item(selections, self.folder, Path())
+        self.assertEqual([savegdrive.selected_path(entry) for entry in selections], [Path("Docs")])
+        self.assertFalse(savegdrive.add_selected_item(selections, self.child, Path("Docs")))
+        self.assertEqual(savegdrive.path_selection_state(Path("Docs/a.txt"), selections), "*")
 
     def test_scopes(self):
         root_items = [self.folder, {"name": "n.txt", "mimeType": "text/plain"}]
         selections = []
-        gdrivepull.add_selected_item(selections, self.folder, Path())
-        self.assertEqual(gdrivepull.build_local_scopes(selections, {Path(): root_items}), [Path("Docs")])
-        gdrivepull.add_selected_item(selections, root_items[1], Path())
-        self.assertEqual(gdrivepull.build_local_scopes(selections, {Path(): root_items}), [Path()])
+        savegdrive.add_selected_item(selections, self.folder, Path())
+        self.assertEqual(savegdrive.build_local_scopes(selections, {Path(): root_items}), [Path("Docs")])
+        savegdrive.add_selected_item(selections, root_items[1], Path())
+        self.assertEqual(savegdrive.build_local_scopes(selections, {Path(): root_items}), [Path()])
 
 
 class SyncTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "GDrive"
-        gdrivepull.initialize_managed_destination(self.root)
-        patcher = mock.patch.object(gdrivepull, "fetch_media", fake_fetch)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        savegdrive.initialize_managed_destination(self.root)
+        self.trash = Path(self.temp.name) / "system trash"
+        self.trash.mkdir()
+
+        def fake_trash_local(path):
+            os.replace(path, self.trash / f"{len(list(self.trash.iterdir()))}-{path.name}")
+
+        for name, fake in [("fetch_media", fake_fetch), ("upload_file", fake_upload),
+                           ("create_remote_folder", fake_create_folder), ("trash_local", fake_trash_local)]:
+            patcher = mock.patch.object(savegdrive, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.addCleanup(self.temp.cleanup)
         self.drive = demo_drive()
 
     def run_sync(self, jobs=1):
         cache = {}
-        nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         selections = []
         for node in nodes:
             if node["parent"] is None:
-                gdrivepull.add_selected_item(selections, node["item"], node["relative_parent"])
-        scopes = gdrivepull.build_local_scopes(selections, browsed)
-        state = gdrivepull.load_state(self.root)
-        plan = gdrivepull.build_plan(self.drive, selections, scopes, self.root, state, cache)
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
         statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
-        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            results = gdrivepull.apply_plan(self.drive, plan, self.root, state, jobs, lambda: self.drive)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            results = savegdrive.apply_plan(self.drive, plan, self.root, state, jobs, lambda: self.drive)
         return statuses, results
 
     def test_first_run_then_unchanged(self):
@@ -365,24 +394,113 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs", "Docs/a.txt", "Docs/Report.docx")}, {"UNCHANGED"})
 
-    def test_update_conflict_removed_and_local_only(self):
+    def test_changes_go_both_ways(self):
         self.run_sync()
+        # On Drive: a changed, beach.jpg deleted. Here: b changed, notes deleted, new.txt and a new folder.
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
-        (self.root / "Docs/b.txt").write_bytes(b"edited locally")
         del self.drive.items["p"]
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        (self.root / "notes.txt").unlink()
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        (self.root / "Ideas/2026").mkdir(parents=True)
+        (self.root / "Ideas/2026/plan.txt").write_bytes(b"plan")
         (self.root / "Photos/mine.txt").write_bytes(b"local")
 
         statuses, results = self.run_sync()
         self.assertEqual(statuses["Docs/a.txt"], "UPDATE")
-        self.assertEqual(statuses["Docs/b.txt"], "CONFLICT")
-        self.assertEqual(statuses["Photos/beach.jpg"], "REMOVED_REMOTE")
-        self.assertEqual(statuses["Photos/mine.txt"], "LOCAL_ONLY")
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.assertEqual(statuses["notes.txt"], "TRASH_REMOTE")
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertEqual(statuses["Docs/new.txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Ideas"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Ideas/2026/plan.txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Photos/mine.txt"], "UPLOAD_NEW")
+
         self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
-        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"edited locally")
-        self.assertTrue((self.root / "Photos/mine.txt").exists())
-        recovered = list((self.root / gdrivepull.RECOVERY_DIR_NAME).rglob("beach.jpg"))
-        self.assertEqual(len(recovered), 1)
-        self.assertEqual(results["FILE_REMOVED_REMOTE"], 1)
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+        self.assertTrue(self.drive.items["n"]["trashed"])
+        self.assertFalse((self.root / "Photos/beach.jpg").exists())
+        self.assertEqual(sorted(path.name.split("-", 1)[1] for path in self.trash.iterdir()), ["beach.jpg"])
+        names = {item["name"]: item for item in self.drive.items.values()}
+        self.assertEqual(names["new.txt"]["parent"], "docs")
+        self.assertEqual(names["plan.txt"]["parent"], names["2026"]["id"])
+        self.assertEqual(names["2026"]["parent"], names["Ideas"]["id"])
+        self.assertEqual(names["Ideas"]["parent"], "root")
+        self.assertEqual(results["FILE_UPLOAD_NEW"], 3)
+
+        # Everything is now the same on both sides, and the tree marks the sent files as synced.
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        marks = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        b_node = next(node for node in nodes if node["display_path"] == "Docs/b.txt")
+        self.assertEqual(marks.get(b_node["index"]), "synced")
+        statuses, _ = self.run_sync()
+        self.assertEqual({status for path, status in statuses.items() if path != "Docs/Survey"}, {"UNCHANGED"})
+
+    def test_conflicts(self):
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha from Drive"))
+        (self.root / "Docs/a.txt").write_bytes(b"alpha from here")
+        (self.root / "Docs/Report.docx").write_bytes(b"edited export")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")  # changed on both sides
+        self.assertEqual(statuses["Docs/Report.docx"], "CONFLICT")  # exports never go back up
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha from here")
+        self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
+        self.assertEqual(self.drive.uploads, [])
+
+    def test_deleted_on_one_side_but_changed_on_the_other_comes_back(self):
+        self.run_sync()
+        (self.root / "Docs/a.txt").unlink()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        del self.drive.items["b"]
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "NEW")  # deleted here, changed on Drive: downloaded
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD_NEW")  # deleted on Drive, changed here: sent
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+
+    def test_folder_deleted_here_goes_to_the_drive_trash(self):
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos"], "TRASH_REMOTE")
+        self.assertNotIn("Photos/beach.jpg", statuses)
+        self.assertTrue(self.drive.items["photos"]["trashed"])
+        self.assertEqual(results["FOLDER_TRASH_REMOTE"], 1)
+
+    def test_folder_deleted_on_drive_goes_to_your_trash(self):
+        self.run_sync()
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Photos").exists())  # left empty: removed
+
+    def test_mass_deletion_needs_a_check(self):
+        for i in range(30):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        self.run_sync()
+        import shutil
+        for path in (self.root / "Photos").iterdir():
+            path.unlink()
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = [{"item": node["item"], "relative_parent": node["relative_parent"]}
+                      for node in nodes if node["parent"] is None]
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(
+            self.drive, selections, savegdrive.build_local_scopes(selections, browsed), self.root, state, cache
+        )
+        self.assertEqual(savegdrive.deletion_count(plan, state)[0], 31)
+        self.assertTrue(savegdrive.needs_deletion_check(plan, state))
+        args = mock.Mock(yes=True, allow_deletions=False)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            with self.assertRaises(SystemExit):
+                savegdrive.confirm_in_terminal(args, plan, state)
+            args.allow_deletions = True
+            self.assertTrue(savegdrive.confirm_in_terminal(args, plan, state))
+        shutil.rmtree(self.root / "Photos")
 
     def test_parallel_downloads(self):
         for i in range(20):
@@ -390,17 +508,17 @@ class SyncTest(unittest.TestCase):
         statuses, results = self.run_sync(jobs=4)
         self.assertEqual(results["FILE_NEW"], 25)
         self.assertEqual((self.root / "Photos/m7.txt").read_bytes(), b"file 7")
-        state = gdrivepull.load_state(self.root)
+        state = savegdrive.load_state(self.root)
         self.assertEqual(len(state["files"]), 25)
 
     def test_marks(self):
         self.run_sync()
-        nodes, _ = gdrivepull.collect_drive_tree(self.drive, "root", {})
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
         by_path = {node["display_path"]: node["index"] for node in nodes}
 
         def marks():
-            state = gdrivepull.load_state(self.root)
-            found = gdrivepull.local_marks(nodes, self.root, state)
+            state = savegdrive.load_state(self.root)
+            found = savegdrive.local_marks(nodes, self.root, state)
             return {path: found.get(index) for path, index in by_path.items()}
 
         self.assertEqual(marks()["Docs/a.txt"], "synced")
@@ -417,40 +535,40 @@ class SyncTest(unittest.TestCase):
 
     def test_again(self):
         cache = {}
-        nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         by_path = {node["display_path"]: node for node in nodes}
         selections = []
         for path in ("Photos", "Docs/a.txt"):
-            gdrivepull.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
-        scopes = gdrivepull.build_local_scopes(selections, browsed)
-        state = gdrivepull.load_state(self.root)
-        gdrivepull.remember_selection(state, selections, scopes)
-        gdrivepull.save_state(self.root, state)
+            savegdrive.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        savegdrive.remember_selection(state, selections, scopes)
+        savegdrive.save_state(self.root, state)
 
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
         del self.drive.items["photos"]
-        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            again, again_scopes = gdrivepull.last_selection(self.drive, gdrivepull.load_state(self.root), {})
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
         self.assertEqual([entry["item"]["name"] for entry in again], ["a.txt"])
         self.assertEqual(again[0]["item"]["md5Checksum"], self.drive.items["a"]["md5Checksum"])
         self.assertEqual(again_scopes, [Path("Photos")])  # gone from Drive: still scanned locally
-        self.assertIsNone(gdrivepull.last_selection(self.drive, {"files": {}}, {}))
+        self.assertIsNone(savegdrive.last_selection(self.drive, {"files": {}}, {}))
 
     def test_again_with_whole_view_takes_new_items(self):
         state = {"last_selection": {"roots": [{"id": "root", "base": "."}], "items": [], "scopes": ["."]}}
         self.drive.items["new"] = file_item("new", "new.txt", "root", b"new")
-        selections, scopes = gdrivepull.last_selection(self.drive, state, {})
+        selections, scopes = savegdrive.last_selection(self.drive, state, {})
         self.assertEqual(
-            sorted(gdrivepull.selected_path(entry).as_posix() for entry in selections),
+            sorted(savegdrive.selected_path(entry).as_posix() for entry in selections),
             ["Docs", "Photos", "new.txt", "notes.txt"],
         )
         self.assertEqual(scopes, [Path()])
 
     def test_changes_replay_matches_a_fresh_listing(self):
         cache = {}
-        token = gdrivepull.start_page_token(self.drive)
-        gdrivepull.prefetch_folders(self.drive, ["root"], cache)
-        gdrivepull.save_snapshot(self.root, token, cache, ["root"])
+        token = savegdrive.start_page_token(self.drive)
+        savegdrive.prefetch_folders(self.drive, ["root"], cache)
+        savegdrive.save_snapshot(self.root, token, cache, ["root"])
 
         self.drive.items["a"].update(file_item("a", "a renamed.txt", "docs", b"alpha v2"))
         self.drive.change("a")
@@ -463,139 +581,116 @@ class SyncTest(unittest.TestCase):
         self.drive.items["x"] = file_item("x", "elsewhere.txt", "unknown-folder", b"x")
         self.drive.change("x")
 
-        replayed, new_token = gdrivepull.apply_changes(self.drive, gdrivepull.load_snapshot(self.root))
+        replayed, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
         fresh = {}
-        gdrivepull.prefetch_folders(self.drive, ["root"], fresh)
+        savegdrive.prefetch_folders(self.drive, ["root"], fresh)
         self.assertEqual(replayed, fresh)
         self.assertEqual(new_token, "5")
-        self.assertIsNone(gdrivepull.apply_changes(self.drive, {"token": "expired", "folders": {}}))
+        self.assertIsNone(savegdrive.apply_changes(self.drive, {"token": "expired", "folders": {}}))
 
     def test_shared_views_get_their_own_folders(self):
         self.drive.items["s"] = file_item("s", "from Ann.pdf", "nobody", b"pdf", shared=True)
         self.drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")
         self.drive.shared_drives = [{"id": "team", "name": "Team"}]
-        views = gdrivepull.drive_views(self.drive, "root")
+        views = savegdrive.drive_views(self.drive, "root")
         self.assertEqual([view.name for view in views], ["My Drive", "Shared with me", "Team", "Trash"])
         cache = {}
         selections = []
         for view in views:
-            gdrivepull.load_view(self.drive, view, cache)
+            savegdrive.load_view(self.drive, view, cache)
             for entry in view.children_of.get(None, []):
-                gdrivepull.add_selected_item(selections, entry["item"], entry["relative_parent"])
+                savegdrive.add_selected_item(selections, entry["item"], entry["relative_parent"])
         browsed = {}
         for view in views:
             browsed.update(view.browsed)
-        scopes = gdrivepull.build_local_scopes(selections, browsed, [view.base for view in views])
+        scopes = savegdrive.build_local_scopes(selections, browsed, [view.base for view in views])
         self.assertEqual(scopes, [Path(), Path("Shared with me"), Path("Shared drives/Team")])
-        state = gdrivepull.load_state(self.root)
-        plan = gdrivepull.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
         paths = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
         self.assertEqual(paths["Shared with me/from Ann.pdf"], "NEW")
         self.assertEqual(paths["Shared drives/Team/plan.txt"], "NEW")
-        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            gdrivepull.apply_plan(self.drive, plan, self.root, state)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.apply_plan(self.drive, plan, self.root, state)
         # A later My Drive-only run does not report the view folders as local only.
         _, results = self.run_sync()
         self.assertEqual(results["FOLDER_LOCAL_ONLY"], 0)
 
     def test_space_line(self):
         cache = {}
-        nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         selections = []
         for node in nodes:
             if node["parent"] is None:
-                gdrivepull.add_selected_item(selections, node["item"], node["relative_parent"])
-        plan = gdrivepull.build_plan(
-            self.drive, selections, gdrivepull.build_local_scopes(selections, browsed),
-            self.root, gdrivepull.load_state(self.root), cache,
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        plan = savegdrive.build_plan(
+            self.drive, selections, savegdrive.build_local_scopes(selections, browsed),
+            self.root, savegdrive.load_state(self.root), cache,
         )
-        self.assertEqual(gdrivepull.download_size(plan), (19, 1))  # a, b, beach, notes; Report has no size
-        with mock.patch.object(gdrivepull.shutil, "disk_usage", return_value=mock.Mock(free=2_000_000)):
-            text, fits = gdrivepull.space_line(plan, self.root)
+        self.assertEqual(savegdrive.download_size(plan), (19, 1))  # a, b, beach, notes; Report has no size
+        with mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=2_000_000)):
+            text, fits = savegdrive.space_line(plan, self.root)
         self.assertEqual(text, "19 B to download + 1 exported file of unknown size · 2.0 MB free")
         self.assertTrue(fits)
-        with mock.patch.object(gdrivepull.shutil, "disk_usage", return_value=mock.Mock(free=10)):
-            self.assertFalse(gdrivepull.space_line(plan, self.root)[1])
-        self.assertEqual(gdrivepull.space_line([], self.root), (None, True))
+        with mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=10)):
+            self.assertFalse(savegdrive.space_line(plan, self.root)[1])
+        self.assertEqual(savegdrive.space_line([], self.root), (None, True))
 
     def test_header_text(self):
         home = Path.home()
         self.assertEqual(
-            gdrivepull.header_text("you@gmail.com", home / "GDrive", "preview"),
-            "preview · you@gmail.com · downloads to ~/GDrive",
+            savegdrive.header_text("you@gmail.com", home / "GDrive", "preview"),
+            "preview · you@gmail.com · syncs with ~/GDrive",
         )
-        self.assertEqual(gdrivepull.header_text(None, Path("/data/x")), "downloads to /data/x")
+        self.assertEqual(savegdrive.header_text(None, Path("/data/x")), "syncs with /data/x")
 
     def test_destination_option(self):
         target = Path(self.temp.name) / "Once"
-        self.assertEqual(gdrivepull.resolve_destination(str(target)), target)
-        self.assertTrue(gdrivepull.has_valid_state(target))
+        self.assertEqual(savegdrive.resolve_destination(str(target)), target)
+        self.assertTrue(savegdrive.has_valid_state(target))
         with self.assertRaises(OSError):
-            gdrivepull.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
+            savegdrive.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
 
     def test_keep_both(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"edited locally")
-        self.drive.items["d"] = file_item("d", "a.txt", "docs", b"same name")  # two Drive files, one path
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))  # changed on both sides
+        (self.root / "Docs/Report.docx").write_bytes(b"edited export")
+        self.drive.items["d"] = file_item("d", "a.txt", "docs", b"same name")  # two Drive files, one name
         cache = {}
-        nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         selections = []
         for node in nodes:
             if node["parent"] is None:
-                gdrivepull.add_selected_item(selections, node["item"], node["relative_parent"])
-        state = gdrivepull.load_state(self.root)
-        plan = gdrivepull.build_plan(
-            self.drive, selections, gdrivepull.build_local_scopes(selections, browsed), self.root, state, cache
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(
+            self.drive, selections, savegdrive.build_local_scopes(selections, browsed), self.root, state, cache
         )
-        conflicts = [entry for entry in plan if entry["status"] == "CONFLICT"]
-        self.assertEqual(len(conflicts), 3)  # b edited, and both a.txt
-        gdrivepull.set_keep_both(plan, plan, True)
-        names = sorted(entry["destination"].name for entry in plan if entry["status"] == "KEEP_BOTH")
-        self.assertEqual(names, ["a (Drive 2).txt", "a (Drive).txt", "b (Drive).txt"])
-        gdrivepull.set_keep_both(plan, plan, False)
-        self.assertEqual(len([entry for entry in plan if entry["status"] == "CONFLICT"]), 3)
-        self.assertEqual(sorted(entry["destination"].name for entry in conflicts), ["a.txt", "a.txt", "b.txt"])
-        gdrivepull.set_keep_both(plan, plan, True)
+        conflicts = {entry["relative_path"].as_posix() for entry in plan if entry["status"] == "CONFLICT"}
+        self.assertEqual(conflicts, {"Docs/a.txt", "Docs/b.txt", "Docs/Report.docx"})
+        savegdrive.set_keep_both(plan, plan, True)
+        kept = sorted(entry["local_copy"].name for entry in plan if entry["status"] == "KEEP_BOTH")
+        self.assertEqual(kept, ["Report (local).docx", "b (local).txt"])  # same-name Drive files: not here
+        savegdrive.set_keep_both(plan, plan, False)
+        self.assertEqual(len([entry for entry in plan if entry["status"] == "CONFLICT"]), 4)
+        savegdrive.set_keep_both(plan, plan, True)
 
-        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            results = gdrivepull.apply_plan(self.drive, plan, self.root, state)
-        self.assertEqual(results["FILE_KEEP_BOTH"], 3)
-        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"edited locally")
-        self.assertEqual((self.root / "Docs/b (Drive).txt").read_bytes(), b"bravo")
-        # Copies are not tracked: next time they are local only, never moved to recovery.
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            results = savegdrive.apply_plan(self.drive, plan, self.root, state)
+        self.assertEqual(results["FILE_KEEP_BOTH"], 2)
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo v2")
+        self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"edited locally")
+        self.assertEqual((self.root / "Docs/Report (local).docx").read_bytes(), b"edited export")
+
+        # Next sync: the conflict is gone, your version goes up as a new file.
+        del self.drive.items["d"]
         statuses, _ = self.run_sync()
-        self.assertEqual(statuses["Docs/b (Drive).txt"], "LOCAL_ONLY")
-        self.assertEqual(gdrivepull.drive_copy_path(Path("/x/.env"), set()), Path("/x/.env (Drive)"))
-
-    def test_recovery_list_and_empty(self):
-        self.run_sync()
-        del self.drive.items["p"]
-        self.run_sync()
-        runs = gdrivepull.recovery_runs(self.root)
-        self.assertEqual(len(runs), 1)
-        self.assertEqual([path.name for path in runs[0]["files"]], ["beach.jpg"])
-        self.assertIn("1 file removed from Drive set aside", gdrivepull.recovery_note(self.root))
-        self.assertIn("Removed from Drive", gdrivepull.recovery_note(self.root, interactive=True))
-        old = self.root / gdrivepull.RECOVERY_DIR_NAME / "20200101-000000"
-        old.mkdir()
-        (old / "old.txt").write_text("old")
-
-        output = io.StringIO()
-        with mock.patch.object(gdrivepull, "console", Console(file=output)):
-            gdrivepull.show_recovery(self.root)
-            gdrivepull.empty_recovery(self.root, older_than=30, assume_yes=True)
-        self.assertIn("2020-01-01 00:00", output.getvalue())
-        self.assertFalse(old.exists())
-        self.assertEqual(len(gdrivepull.recovery_runs(self.root)), 1)  # the recent run stays
-
-        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())) as quiet:
-            quiet.input = mock.Mock(return_value="no")
-            gdrivepull.empty_recovery(self.root)
-            self.assertEqual(len(gdrivepull.recovery_runs(self.root)), 1)
-            quiet.input = mock.Mock(return_value="empty")
-            gdrivepull.empty_recovery(self.root)
-        self.assertFalse((self.root / gdrivepull.RECOVERY_DIR_NAME).exists())
-        self.assertIsNone(gdrivepull.recovery_note(self.root))
+        self.assertEqual(statuses["Docs/b.txt"], "UNCHANGED")
+        self.assertEqual(statuses["Docs/Report.docx"], "UNCHANGED")
+        self.assertEqual(statuses["Docs/b (local).txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
+        self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
     def test_existing_identical_file_is_adopted(self):
         (self.root / "notes.txt").write_bytes(b"notes")
@@ -608,18 +703,56 @@ class SyncTest(unittest.TestCase):
             raise KeyboardInterrupt
 
         entry = {"destination": self.root / "x.txt", "item": self.drive.items["a"]}
-        with mock.patch.object(gdrivepull, "fetch_media", interrupted):
+        with mock.patch.object(savegdrive, "fetch_media", interrupted):
             with self.assertRaises(KeyboardInterrupt):
-                gdrivepull.download_file_atomically(self.drive, entry)
-        self.assertEqual(sorted(path.name for path in self.root.iterdir()), [gdrivepull.STATE_FILE_NAME])
+                savegdrive.download_file_atomically(self.drive, entry)
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), [savegdrive.STATE_FILE_NAME])
 
     def test_destination_must_be_empty_or_managed(self):
         other = Path(self.temp.name) / "Other"
         other.mkdir()
         (other / "file").write_text("x")
         with self.assertRaises(ValueError):
-            gdrivepull.initialize_managed_destination(other)
-        self.assertEqual(gdrivepull.initialize_managed_destination(self.root), self.root)
+            savegdrive.initialize_managed_destination(other)
+        self.assertEqual(savegdrive.initialize_managed_destination(self.root), self.root)
+
+
+class UploadTest(unittest.TestCase):
+    def test_upload_file_sends_every_chunk(self):
+        class Request:
+            def __init__(self):
+                self.calls = 0
+
+            def next_chunk(self, num_retries=0):
+                self.calls += 1
+                if self.calls < 3:
+                    return mock.Mock(resumable_progress=4 * self.calls), None
+                return None, {"id": "new", "name": "x.bin"}
+
+        request = Request()
+        service = mock.Mock()
+        service.files.return_value.create.return_value = request
+        sent = []
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "x.bin"
+            path.write_bytes(b"0123456789")
+            item = savegdrive.upload_file(service, path, name="x.bin", parent_id="docs", on_bytes=sent.append)
+        self.assertEqual(item["id"], "new")
+        self.assertEqual(sum(sent), 10)
+        body = service.files.return_value.create.call_args.kwargs["body"]
+        self.assertEqual(body, {"name": "x.bin", "parents": ["docs"]})
+
+    def test_upload_stops_on_ctrl_c(self):
+        import threading
+
+        stop = threading.Event()
+        stop.set()
+        service = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "x.bin"
+            path.write_bytes(b"x")
+            with self.assertRaises(savegdrive.Stopped):
+                savegdrive.upload_file(service, path, file_id="a", stop=stop)
 
 
 class SignInTest(unittest.TestCase):
@@ -631,9 +764,9 @@ class SignInTest(unittest.TestCase):
                 '"scopes": ["https://www.googleapis.com/auth/drive.readonly"], "expiry": "2999-01-01T00:00:00Z"}'
             )
             new = mock.Mock(to_json=lambda: "{}")
-            with mock.patch.object(gdrivepull, "TOKEN_PATH", token), \
-                    mock.patch.object(gdrivepull, "sign_in", return_value=new) as sign_in:
-                self.assertIs(gdrivepull.authenticate(), new)
+            with mock.patch.object(savegdrive, "TOKEN_PATH", token), \
+                    mock.patch.object(savegdrive, "sign_in", return_value=new) as sign_in:
+                self.assertIs(savegdrive.authenticate(), new)
             self.assertIn("full Drive access", sign_in.call_args[0][0])
 
 
@@ -644,19 +777,19 @@ class KeyListTest(unittest.TestCase):
     def listed(self, context):
         return {
             token
-            for _, entries in gdrivepull.KEYS[context][1]
+            for _, entries in savegdrive.KEYS[context][1]
             for keys, _, description in entries
             for token in keys.split() + [description]
         }
 
     def test_every_binding_is_listed(self):
         screens = {
-            ("tree", "trash", "removed"): [gdrivepull.DriveSelectorApp, gdrivepull.DriveTree],
-            "confirm": [gdrivepull.ConfirmScreen],
-            "preview": [gdrivepull.PreviewScreen],
-            "preview-again": [gdrivepull.StandalonePreviewScreen],
-            "folder": [gdrivepull.DestinationSetupScreen],
-            "help": [gdrivepull.HelpScreen],
+            ("tree", "trash"): [savegdrive.DriveSelectorApp, savegdrive.DriveTree],
+            ("confirm", "confirm-word"): [savegdrive.ConfirmScreen],
+            "preview": [savegdrive.PreviewScreen],
+            "preview-again": [savegdrive.StandalonePreviewScreen],
+            "folder": [savegdrive.DestinationSetupScreen],
+            "help": [savegdrive.HelpScreen],
         }
         for context, classes in screens.items():
             contexts = context if isinstance(context, tuple) else (context,)
@@ -669,27 +802,27 @@ class KeyListTest(unittest.TestCase):
                         self.assertTrue(name in listed or name in text, f"{context}: {key} is not listed")
 
     def test_help_mentions_every_context(self):
-        lines = "\n".join(gdrivepull.help_lines())
-        for title, _ in gdrivepull.KEYS.values():
+        lines = "\n".join(savegdrive.help_lines())
+        for title, _ in savegdrive.KEYS.values():
             self.assertIn(title.lower(), lines)
 
 
 class SelectorTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.addCleanup(gdrivepull.TRASHED_FOLDERS.clear)
+        self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = gdrivepull.initialize_managed_destination(Path(self.temp.name) / "GDrive")
+        self.root = savegdrive.initialize_managed_destination(Path(self.temp.name) / "GDrive")
 
     def make_app(self, drive=None, views=None):
         drive = drive or demo_drive()
         cache = {}
-        views = views or [gdrivepull.DriveView("My Drive", "root")]
-        gdrivepull.load_view(drive, views[0], cache)
-        return gdrivepull.DriveSelectorApp(views, self.root, gdrivepull.load_state(self.root), drive, None, cache)
+        views = views or [savegdrive.DriveView("My Drive", "root")]
+        savegdrive.load_view(drive, views[0], cache)
+        return savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), drive, None, cache)
 
     def selected(self, app):
-        return [gdrivepull.selected_path(entry).as_posix() for entry in app.selections]
+        return [savegdrive.selected_path(entry).as_posix() for entry in app.selections]
 
     async def test_select_expand_and_download(self):
         app = self.make_app()
@@ -706,14 +839,14 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("d")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            self.assertIsInstance(app.screen, gdrivepull.PreviewScreen)
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
             self.assertIn("to download", str(app.screen.query_one("#preview-summary").render()))
             table = app.screen.query_one("DataTable")
             self.assertEqual(table.row_count, 5)  # Docs/, a, b, Report, and Survey skipped
             await pilot.press("tab", "tab")  # everything, then each status: new
             self.assertEqual(table.row_count, 4)
             await pilot.press("escape")  # back to the tree, selection kept
-            self.assertNotIsInstance(app.screen, gdrivepull.PreviewScreen)
+            self.assertNotIsInstance(app.screen, savegdrive.PreviewScreen)
             self.assertEqual(self.selected(app), ["Docs"])
             await pilot.press("d")
             await app.workers.wait_for_complete()
@@ -723,7 +856,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.sort, "name")
             await pilot.press("y")
         result = app.return_value
-        self.assertEqual([gdrivepull.selected_path(entry).as_posix() for entry in result["selections"]], ["Docs"])
+        self.assertEqual([savegdrive.selected_path(entry).as_posix() for entry in result["selections"]], ["Docs"])
         self.assertEqual(result["destination"], self.root)
         self.assertEqual(len(result["plan"]), 5)
 
@@ -731,7 +864,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         drive = demo_drive()
         drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")
         drive.shared_drives = [{"id": "team", "name": "Team"}]
-        views = gdrivepull.drive_views(drive, "root")
+        views = savegdrive.drive_views(drive, "root")
         app = self.make_app(drive, views)
         async with app.run_test() as pilot:
             await pilot.press("down", "space", "tab")  # Docs, then Shared with me (empty)
@@ -790,13 +923,13 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             async with app.run_test() as pilot:
                 await pilot.press("f")
-                self.assertIsInstance(app.screen, gdrivepull.DestinationSetupScreen)
+                self.assertIsInstance(app.screen, savegdrive.DestinationSetupScreen)
                 app.screen.query_one("#parent-path", Input).value = temp
                 app.screen.query_one("#folder-name", Input).value = "Session"
                 await pilot.press("ctrl+s")
                 await pilot.pause()
                 self.assertEqual(app.destination, Path(temp).resolve() / "Session")
-                self.assertTrue(gdrivepull.has_valid_state(app.destination))
+                self.assertTrue(savegdrive.has_valid_state(app.destination))
                 self.assertIn("Session", app.sub_title)
                 await pilot.press("q")
 
@@ -823,7 +956,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_tree_comes_back_after_a_download(self):
         drive = demo_drive()
-        views = [gdrivepull.DriveView("My Drive", "root")]
+        views = [savegdrive.DriveView("My Drive", "root")]
         app = self.make_app(drive, views)
         async with app.run_test() as pilot:
             await pilot.press("z", "down", "space", "d")
@@ -831,19 +964,19 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("y")
         result = app.return_value
-        with mock.patch.object(gdrivepull, "fetch_media", fake_fetch), \
-                mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
+        with mock.patch.object(savegdrive, "fetch_media", fake_fetch), \
+                mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             args = mock.Mock(jobs=1)
-            results = gdrivepull.run_downloads(
+            results = savegdrive.run_sync(
                 args, drive, lambda: drive, result["plan"], result["selections"], result["scopes"], [],
                 self.root, result["state"], app.cache, "0",
             )
-        notice = gdrivepull.result_notice(result["plan"], results, self.root)
+        notice = savegdrive.result_notice(result["plan"], results)
         self.assertIn("3 downloaded", notice.plain)
 
         # The next round: same view and sort, the result on top, marks from the download, nothing selected.
-        again = gdrivepull.DriveSelectorApp(
-            views, self.root, gdrivepull.load_state(self.root), drive, None, app.cache,
+        again = savegdrive.DriveSelectorApp(
+            views, self.root, savegdrive.load_state(self.root), drive, None, app.cache,
             view=app.view, sort=app.sort, notice=notice,
         )
         async with again.run_test() as pilot:
@@ -863,18 +996,18 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_drive_trash_restore_and_delete(self):
         drive = demo_drive()
-        views = gdrivepull.drive_views(drive, "root")
+        views = savegdrive.drive_views(drive, "root")
         app = self.make_app(drive, views)
         tree_names = lambda: [node.data["item"]["name"] for node in app.query_one(Tree).root.children]  # noqa: E731
         async with app.run_test() as pilot:
             await pilot.press("down", "down", "x")  # Photos, moved to the Drive trash after y
-            self.assertIsInstance(app.screen, gdrivepull.ConfirmScreen)
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("y")
             await self.wait(app, pilot)
             self.assertTrue(drive.items["photos"]["trashed"])
             self.assertEqual(tree_names(), ["Docs", "notes.txt"])
 
-            await pilot.press("shift+tab", "shift+tab")  # Trash, just before Removed from Drive
+            await pilot.press("shift+tab")  # Trash is the last view
             await self.wait(app, pilot)
             self.assertEqual(app.view.name, "Trash")
             self.assertEqual(app.query_one("#keys").context, "trash")
@@ -892,7 +1025,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await self.wait(app, pilot)
             await pilot.press("down", "x")
             await pilot.press(*"delet", "enter")  # wrong word: still asking
-            self.assertIsInstance(app.screen, gdrivepull.ConfirmScreen)
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("backspace", "backspace", "backspace", "backspace", "backspace", *"delete", "enter")
             await self.wait(app, pilot)
             self.assertNotIn("n", drive.items)
@@ -905,10 +1038,10 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("a", drive.items)
             self.assertEqual(tree_names(), [])
             await pilot.press("r")  # only in the Trash view; here: nothing to restore, no question
-            await pilot.press("tab", "tab")  # past Removed from Drive, to My Drive
+            await pilot.press("tab")  # back to My Drive
             await self.wait(app, pilot)
             await pilot.press("r")
-            self.assertNotIsInstance(app.screen, gdrivepull.ConfirmScreen)
+            self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
 
     async def test_unfold_the_whole_view(self):
@@ -921,59 +1054,42 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(node.is_expanded for node in tree.root.children if node.allow_expand))
             await pilot.press("q")
 
-    async def test_removed_from_drive_view(self):
-        run = self.root / gdrivepull.RECOVERY_DIR_NAME / "20260101-120000"
-        (run / "Photos").mkdir(parents=True)
-        (run / "Photos/beach.jpg").write_bytes(b"jpeg")
-        (run / "notes.txt").write_bytes(b"old notes")
-        (run / "keep.txt").write_bytes(b"keep")
-        (self.root / "notes.txt").write_bytes(b"current notes")
+    async def test_last_selection_is_checked_at_start(self):
+        drive = demo_drive()
+        app = self.make_app(drive)
+        state = savegdrive.load_state(self.root)
+        selections = [{"item": dict(drive.public(drive.items["photos"])), "relative_parent": Path()}]
+        savegdrive.remember_selection(state, selections, [Path("Photos")])
+        savegdrive.save_state(self.root, state)
+        app = self.make_app(drive)
+        async with app.run_test() as pilot:
+            await self.wait(app, pilot)
+            line = str(app.query_one("#notice").render())
+            self.assertIn("Since the last sync: 1 ↓ to download", line)
+            await pilot.press("s")
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
+            await pilot.press("y")
+        result = app.return_value
+        self.assertEqual(result["roots"], [])
+        self.assertEqual([entry["relative_path"].as_posix() for entry in result["plan"]],
+                         ["Photos", "Photos/beach.jpg"])
+
+    async def test_no_last_selection_no_line(self):
         app = self.make_app()
         async with app.run_test() as pilot:
-            self.assertIn("Removed from Drive (3)", str(app.query_one("#views").render()))
-            await pilot.press("shift+tab")  # the last view
-            self.assertEqual(app.view.root_id, gdrivepull.REMOVED)
-            self.assertEqual(app.query_one("#keys").context, "removed")
-            self.assertFalse(app.query_one(Tree).display)
-            names = sorted(relative.as_posix() for _, relative, _ in app.removed_rows)
-            self.assertEqual(names, ["Photos/beach.jpg", "keep.txt", "notes.txt"])
-            await pilot.press("space", "a", "slash", "z")  # tree keys do nothing here
-            self.assertEqual(app.selections, [])
-            self.assertFalse(app.query_one(Input).display)
-
-            def go(name):
-                rows = [relative.as_posix() for _, relative, _ in app.removed_rows]
-                app.query_one("#removed-table").move_cursor(row=rows.index(name))
-
-            go("notes.txt")
-            await pilot.press("r")  # taken in the download folder: stays set aside
-            self.assertEqual((self.root / "notes.txt").read_bytes(), b"current notes")
-            self.assertEqual(len(app.removed_rows), 3)
-            go("Photos/beach.jpg")
-            await pilot.press("r")
-            self.assertEqual((self.root / "Photos/beach.jpg").read_bytes(), b"jpeg")
-            self.assertFalse((run / "Photos").exists())  # empty folders go too
-            self.assertIn("Removed from Drive (2)", str(app.query_one("#views").render()))
-            go("keep.txt")
-            await pilot.press("x", "y")
-            await pilot.pause()
-            self.assertFalse((run / "keep.txt").exists())
-            await pilot.press("X", *"empty", "enter")
-            await pilot.pause()
-            self.assertFalse((self.root / gdrivepull.RECOVERY_DIR_NAME).exists())
-            self.assertIn("Nothing here yet", str(app.query_one("#removed-summary").render()))
-            await pilot.press("tab")  # back to My Drive, with the tree
-            self.assertTrue(app.query_one(Tree).display)
-            self.assertEqual(app.query_one("#keys").context, "tree")
+            await self.wait(app, pilot)
+            self.assertFalse(app.query_one("#notice").display)
+            await pilot.press("s")  # nothing to review
+            self.assertNotIsInstance(app.screen, savegdrive.PreviewScreen)
             await pilot.press("q")
 
     async def test_help_and_expand_all(self):
         app = self.make_app()
         async with app.run_test() as pilot:
             await pilot.press("question_mark")
-            self.assertIsInstance(app.screen, gdrivepull.HelpScreen)
+            self.assertIsInstance(app.screen, savegdrive.HelpScreen)
             await pilot.press("escape")
-            self.assertNotIsInstance(app.screen, gdrivepull.HelpScreen)
+            self.assertNotIsInstance(app.screen, savegdrive.HelpScreen)
             await pilot.press("e")
             tree = app.query_one(Tree)
             self.assertTrue(all(node.is_expanded for node in tree.root.children if node.allow_expand))

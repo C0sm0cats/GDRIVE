@@ -1,16 +1,18 @@
 import argparse
 import hashlib
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -18,8 +20,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from rich.console import Console, Group
+from send2trash import send2trash
 from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -41,7 +44,7 @@ from textual.widgets import (
 )
 
 
-APP_NAME = "GDrive Pull"
+APP_NAME = "SaveGDrive"
 # Full Drive access, like GMAIL: downloads only read, but the Trash view can restore, delete and empty,
 # and x moves items to the Drive trash. Tokens from the read-only versions ask for a new sign-in.
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -49,13 +52,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DOWNLOAD_PATH = "~/GDrive"
 TOKEN_PATH = SCRIPT_DIR / "token.json"
 CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
-STATE_FILE_NAME = ".gdrivepull-managed-state.json"
-RECOVERY_DIR_NAME = ".gdrivepull-recovery"
-REMOTE_CACHE_NAME = ".gdrivepull-remote-cache.json"
+STATE_FILE_NAME = ".savegdrive-state.json"
+REMOTE_CACHE_NAME = ".savegdrive-cache.json"
+PART_SUFFIX = ".savegdrive.part"
 RESERVED_NAMES = {
     STATE_FILE_NAME,
     f"{STATE_FILE_NAME}.tmp",
-    RECOVERY_DIR_NAME,
     REMOTE_CACHE_NAME,
     f"{REMOTE_CACHE_NAME}.tmp",
 }
@@ -65,8 +67,6 @@ SHARED_WITH_ME_DIR = "Shared with me"
 SHARED_DRIVES_DIR = "Shared drives"
 TRASH = "trash"  # pseudo folder id: the items you moved to the Drive trash
 TRASH_DIR = "Trash"
-REMOVED = "removed"  # pseudo view id: the local files set aside because they were removed from Drive
-REMOVED_VIEW_NAME = "Removed from Drive"
 VIEW_DIRS = {SHARED_WITH_ME_DIR, SHARED_DRIVES_DIR, TRASH_DIR}
 STATE_VERSION = 1
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -120,7 +120,7 @@ def error_text(error):
 
 # --- Sign-in ---------------------------------------------------------------
 
-SIGN_IN_SUCCESS_PAGE = "gdrivepull: signed in. You can close this tab."
+SIGN_IN_SUCCESS_PAGE = "savegdrive: signed in. You can close this tab."
 
 
 def oauth_flow():
@@ -175,11 +175,11 @@ def sign_in(reason):
                 console.print(f"  {url}", style="dim", markup=False, soft_wrap=True)
             return open_quietly(url)
 
-    webbrowser.register("gdrivepull", None, QuietBrowser("gdrivepull"))
+    webbrowser.register("savegdrive", None, QuietBrowser("savegdrive"))
     with console.status("[dim]Waiting for sign-in…[/]"):
         creds = flow.run_local_server(
             port=0,
-            browser="gdrivepull",
+            browser="savegdrive",
             authorization_prompt_message="",
             success_message=SIGN_IN_SUCCESS_PAGE,
         )
@@ -206,7 +206,7 @@ def authenticate():
         if not creds.has_scopes(SCOPES):
             # A token from the read-only versions: Google must ask again for the wider access.
             debug("Saved token lacks the full Drive scope")
-            creds = sign_in("GDrive Pull now manages the Drive trash: allow full Drive access in your browser.")
+            creds = sign_in("SaveGDrive now syncs both ways: allow full Drive access in your browser.")
             TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
             return creds
 
@@ -668,7 +668,7 @@ def display_date(item):
 def header_text(account, destination, prefix=None):
     parts = [part for part in (prefix, account) if part]
     if destination is not None:
-        parts.append(f"downloads to {short_path(destination)}")
+        parts.append(f"syncs with {short_path(destination)}")
     return " · ".join(parts)
 
 
@@ -804,9 +804,9 @@ Header {
 
 
 class DestinationSetupScreen(Screen):
-    """Pick the download folder for this session (f in the tree)."""
+    """Pick the local folder for this session (f in the tree)."""
 
-    SUB_TITLE = "Download folder for this session"
+    SUB_TITLE = "Local folder for this session"
 
     DEFAULT_CSS = """
     #setup-body {
@@ -1009,7 +1009,7 @@ TREE_MOVE = ("Move", [
     ("pgup pgdn", "scroll", "scroll a page (home / end: top / bottom)"),
 ])
 TREE_VIEW = ("View", [
-    ("tab", "next view", "next view: My Drive, Shared with me, each shared drive, Trash, Removed from Drive"),
+    ("tab", "next view", "next view: My Drive, Shared with me, each shared drive, then Trash"),
     ("shift+tab", "previous", "previous view"),
     ("/", "filter", "filter by name or path"),
     ("z", "by size", "sort by size, biggest first; again: by name"),
@@ -1021,11 +1021,12 @@ TREE_SELECT = ("Select", [
     ("c", "none", "unselect everything, including items hidden by the filter or in other views"),
 ])
 TREE_GO = ("Go", [
-    ("d", "preview", "compare with the download folder and open the preview"),
-    ("f", "folder", "change the download folder for this session"),
+    ("d", "preview", "compare the selection with the local folder and open the preview"),
+    ("s", "sync last", "review the sync of your last selection, checked at start (the line above the tree)"),
+    ("f", "folder", "change the local folder for this session"),
     ("o", "open in Drive", "open the item under the cursor in Google Drive"),
     ("?", "help", "show the key help"),
-    ("q esc", "quit", "quit (esc first closes the filter); after a download, the tree comes back"),
+    ("q esc", "quit", "quit (esc first closes the filter); after a sync, the tree comes back"),
 ])
 
 # Every key, by screen: (title, [(group, [(keys, short label for the key bar, description for ? and --help)])]).
@@ -1047,25 +1048,6 @@ KEYS = {
         ]),
         TREE_GO,
     ]),
-    "removed": ("In Removed from Drive", [
-        ("Move", [
-            ("↑ ↓", "move", "move (pgup / pgdn, home / end: by page, to the top / bottom)"),
-            ("tab", "next view", "next view"),
-            ("shift+tab", "previous", "previous view"),
-        ]),
-        ("Files", [
-            ("r", "put back", "put the file back at its place in the download folder (never over another file)"),
-            ("x", "delete", "delete the file under the cursor from your disk, for good"),
-            ("shift+x", "delete all", "delete every set-aside file, after typing empty"),
-            ("o", "open folder", "open the folder holding the set-aside files in your file manager"),
-        ]),
-        ("Go", [
-            ("d", "preview", "compare the selection from the other views and open the preview"),
-            ("f", "folder", "change the download folder for this session"),
-            ("?", "help", "show the key help"),
-            ("q esc", "quit", "quit"),
-        ]),
-    ]),
     "filter": ("While typing a filter", [
         ("Filter", [
             ("enter", "keep", "keep the filter and go back to the tree"),
@@ -1079,11 +1061,11 @@ KEYS = {
             ("shift+tab", "previous filter", "previous filter tab"),
         ]),
         ("Conflicts", [
-            ("b", "keep both", "keep both versions of the conflict under the cursor: the Drive one as 'name (Drive).ext'"),
+            ("b", "keep both", "keep both versions of the conflict under the cursor: yours as 'name (local).ext'"),
             ("shift+b", "keep both: all", "keep both for every conflict; again: undo"),
         ]),
         ("Go", [
-            ("y", "download", "download: apply the preview"),
+            ("y", "sync", "sync: apply the preview"),
             ("esc n", "back", "back to the tree, selection kept"),
         ]),
     ]),
@@ -1094,12 +1076,12 @@ KEYS = {
             ("shift+tab", "previous filter", "previous filter tab"),
         ]),
         ("Conflicts", [
-            ("b", "keep both", "keep both versions of the conflict under the cursor"),
+            ("b", "keep both", "keep both versions of the conflict under the cursor: yours as 'name (local).ext'"),
             ("shift+b", "keep both: all", "keep both for every conflict; again: undo"),
         ]),
         ("Go", [
-            ("y", "download", "download: apply the preview"),
-            ("esc n q", "cancel", "cancel: nothing is downloaded"),
+            ("y", "sync", "sync: apply the preview"),
+            ("esc n q", "cancel", "cancel: nothing changes"),
         ]),
     ]),
     "folder": ("In the folder screen (f)", [
@@ -1112,8 +1094,14 @@ KEYS = {
     ]),
     "confirm": ("In a confirmation", [
         ("Confirm", [
-            ("y", "yes", "yes (or type the word asked, then enter)"),
+            ("y", "yes", "yes"),
             ("n esc", "no", "no: nothing changes"),
+        ]),
+    ]),
+    "confirm-word": ("In a confirmation that asks for a word (delete, empty)", [
+        ("Confirm", [
+            ("enter", "confirm", "confirm, once the word is typed"),
+            ("esc", "cancel", "cancel: nothing changes"),
         ]),
     ]),
     "help": ("In this help", [
@@ -1124,13 +1112,13 @@ KEYS = {
     ]),
 }
 KEY_HELP_NOTE = (
-    "Nothing changes on disk before the preview is confirmed. "
-    "The mouse works too: click to move, click a folder's arrow to unfold it."
+    "Nothing changes, here or on Drive, before you confirm: y in the preview, or the question of x, r and "
+    "shift+t. The mouse works too: click to move, click a folder's arrow to unfold it."
 )
 MARKS = {
-    "synced": ("✓", "green", "downloaded and up to date"),
-    "changed": ("↻", "bright_cyan", "changed on Drive, or new files in the folder"),
-    "edited": ("✎", "yellow", "changed locally (kept as a conflict)"),
+    "synced": ("✓", "green", "synced and the same on both sides"),
+    "changed": ("↻", "bright_cyan", "changed on Drive since the last sync, or new files in the folder"),
+    "edited": ("✎", "yellow", "changed here since the last sync: sent to Drive at the next one"),
 }
 
 
@@ -1142,9 +1130,9 @@ def help_lines():
         for _, keys in groups:
             lines += [f"  {key:<11}{description}" for key, _, description in keys]
         lines.append("")
-    lines.append("marks (from the last downloads):")
+    lines.append("marks (since the last sync):")
     lines += [f"  {symbol:<11}{description}" for symbol, _, description in MARKS.values()]
-    return lines + ["", "  " + KEY_HELP_NOTE]
+    return lines + [""] + ["  " + line for line in textwrap.wrap(KEY_HELP_NOTE, 76)]
 
 
 def help_text():
@@ -1162,7 +1150,7 @@ def help_text():
             for key, _, description in entries:
                 keys.add_row(key, description)
         parts += [keys, Text()]
-    parts.append(Text.assemble(("Marks", "bold bright_cyan"), (" (from the last downloads)", "dim")))
+    parts.append(Text.assemble(("Marks", "bold bright_cyan"), (" (since the last sync)", "dim")))
     marks = table()
     for symbol, style, description in MARKS.values():
         marks.add_row(Text(symbol, style=f"bold {style}"), description)
@@ -1367,7 +1355,7 @@ class ConfirmScreen(ModalScreen):
                 yield Input(id="confirm-word")
             else:
                 yield Static(Text.assemble(("y", "bold #f59e0b"), " yes   ", ("n esc", "bold #f59e0b"), " no"))
-            yield KeyBar("confirm")
+            yield KeyBar("confirm-word" if self.word else "confirm")
 
     def on_mount(self):
         if self.word:
@@ -1387,29 +1375,6 @@ class ConfirmScreen(ModalScreen):
 
     def action_answer(self, answer):
         self.dismiss(answer)
-
-
-def set_aside_files(destination):
-    """(path in the set-aside folder, its place in the download folder, when it was set aside), oldest first."""
-    return [
-        (path, path.relative_to(run["path"]), run["date"])
-        for run in recovery_runs(destination)
-        for path in run["files"]
-    ]
-
-
-def put_back(destination, path, relative):
-    """Move a set-aside file back to its place; never over another file. Returns an error message or None."""
-    target = destination / relative
-    if target.exists():
-        return f"{relative.as_posix()} already exists in the download folder: nothing moved."
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(path, target)
-        prune_empty_dirs(path.parent, destination / RECOVERY_DIR_NAME)
-    except OSError as error:
-        return f"Could not put it back: {error}"
-    return None
 
 
 def prune_empty_dirs(directory, stop):
@@ -1495,6 +1460,14 @@ def drive_views(service, folder_id):
             return views + shared_drives + [DriveView(TRASH_DIR, TRASH, Path(TRASH_DIR))]
 
 
+def view_roots(views):
+    """Each view's local base and the Drive folder new local files go to (None: Shared with me, Trash)."""
+    return {
+        view.base: (None if view.root_id in {SHARED_WITH_ME, TRASH} else view.root_id)
+        for view in views
+    }
+
+
 def load_view(service, view, cache, on_progress=lambda folders, items: None):
     nodes, browsed = collect_drive_tree(service, view.root_id, cache, on_progress, view.base)
     view.load(nodes, browsed)
@@ -1571,33 +1544,6 @@ class DriveSelectorApp(App):
         border: round #f59e0b;
     }
 
-    #removed {
-        display: none;
-        height: 1fr;
-        margin: 1 2 0 2;
-    }
-
-    #removed-summary {
-        height: auto;
-        padding: 0 1 1 1;
-    }
-
-    #removed-table {
-        height: 1fr;
-        border: round #c084fc;
-        background: #081525;
-    }
-
-    #removed-table > .datatable--cursor {
-        background: #164e63;
-        color: #ffffff;
-    }
-
-    #removed-table > .datatable--header {
-        background: #0f2742;
-        color: #93c5fd;
-    }
-
     #selection-summary {
         height: 1;
         margin: 0 2;
@@ -1625,11 +1571,11 @@ class DriveSelectorApp(App):
         Binding("z", "sort('size')", "Sort by size", show=False),
         Binding("m", "sort('date')", "Sort by date", show=False),
         Binding("f", "change_destination", "Folder"),
-        Binding("X", "delete_all_removed", "Delete all", show=False, key_display="shift+x"),
         Binding("x", "trash", "Trash", show=False),
         Binding("r", "restore", "Restore", show=False),
         Binding("T", "empty_trash", "Empty trash", show=False, key_display="shift+t"),
-        Binding("d", "confirm", "Download"),
+        Binding("d", "confirm", "Preview"),
+        Binding("s", "review_last", "Sync last", show=False),
         Binding("question_mark", "help", "Help"),
         Binding("escape", "cancel", "Quit"),
         Binding("q", "quit_selector", "Quit", show=False),
@@ -1640,14 +1586,12 @@ class DriveSelectorApp(App):
         super().__init__()
         self.keep_both = keep_both
         self.notice = notice
+        self.last_sync = None  # the plan of the last selection, checked in the background at start
+        self.last_sync_text = None
+        self.last_sync_round = 0
         self.account = account
-        if not any(existing.root_id == REMOVED for existing in views):
-            removed_view = DriveView(REMOVED_VIEW_NAME, REMOVED)
-            removed_view.nodes = []  # local files: nothing to load from Drive
-            views.append(removed_view)
         self.views = views
         self.view = view if view in views else views[0]
-        self.removed_rows = []
         self.destination = destination
         self.state = state
         self.service = service
@@ -1697,13 +1641,10 @@ class DriveSelectorApp(App):
         views = Static(id="views")
         views.display = len(self.views) > 1
         yield views
-        notice = Static(self.notice or "", id="notice")
-        notice.display = bool(self.notice)
+        notice = Static(id="notice")
+        notice.display = False
         yield notice
         yield DriveTree(Text(self.view.name, style="bold bright_blue"), id="drive-tree")
-        with Vertical(id="removed"):
-            yield Static(id="removed-summary")
-            yield DataTable(id="removed-table", cursor_type="row")
         filter_input = Input(placeholder="filter by name or path", id="filter")
         filter_input.display = False
         yield filter_input
@@ -1715,6 +1656,68 @@ class DriveSelectorApp(App):
         tree = self.query_one("#drive-tree", Tree)
         tree.focus()
         self.show_view(self.view)
+        self.check_last_sync()
+
+    # The last selection, checked at start: what changed on either side since the last sync.
+
+    def check_last_sync(self):
+        self.last_sync = None
+        state = self.state or {}
+        if self.service is None or self.destination is None or not state.get("last_selection"):
+            self.last_sync_text = None
+            self.update_notice()
+            return
+        self.last_sync_text = Text("Checking your last selection against Drive…", style="dim")
+        self.update_notice()
+        self.last_sync_round += 1
+        destination, round_ = self.destination, self.last_sync_round
+        self.run_worker(lambda: self.last_sync_in_background(destination, round_), thread=True)
+
+    def last_sync_in_background(self, destination, round_):
+        try:
+            service = self.make_service()
+            state = load_state(destination)
+            selections, scopes = last_selection(service, state, self.cache)
+            roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
+            upload_roots = {base: (None if root_id in {SHARED_WITH_ME, TRASH} else root_id)
+                            for root_id, base in roots}
+            plan = build_plan(service, selections, scopes, destination, state, self.cache, roots=upload_roots)
+            if self.keep_both:
+                set_keep_both(plan, plan, True)
+            result = {"plan": plan, "selections": selections, "scopes": scopes, "destination": destination,
+                      "state": state, "roots": roots, "round": round_}
+        except Exception as error:  # a worker error would end the app: report it instead
+            self.call_from_thread(self.last_sync_failed, round_, error_text(error))
+            return
+        self.call_from_thread(self.last_sync_ready, result)
+
+    def last_sync_ready(self, result):
+        if result["round"] != self.last_sync_round:
+            return  # the folder or Drive changed meanwhile: a newer check is on its way
+        self.last_sync = result
+        self.last_sync_text = last_sync_summary(result["plan"])
+        self.update_notice()
+
+    def last_sync_failed(self, round_, message):
+        if round_ == self.last_sync_round:
+            self.last_sync_text = Text(f"Could not check your last selection: {message}", style="red")
+            self.update_notice()
+
+    def update_notice(self):
+        if not self.is_mounted:
+            return
+        lines = [text for text in (self.notice, self.last_sync_text) if text]
+        notice = self.query_one("#notice", Static)
+        notice.display = bool(lines)
+        notice.update(Text("\n").join(Text(line) if isinstance(line, str) else line for line in lines))
+
+    def action_review_last(self):
+        if self.busy:
+            return
+        if self.last_sync is None:
+            self.notify("Your last selection is still being checked, or there is none yet.", severity="warning")
+            return
+        self.plan_ready(self.last_sync)
 
     # Views.
 
@@ -1723,16 +1726,6 @@ class DriveSelectorApp(App):
         if self.filter_terms or self.query_one("#filter", Input).display:
             self.clear_filter(rebuild=False)
         tree = self.query_one("#drive-tree", Tree)
-        removed = view.root_id == REMOVED
-        tree.display = not removed
-        self.query_one("#removed", Vertical).display = removed
-        if removed:
-            self.fill_removed()
-            self.query_one("#removed-table", DataTable).focus()
-            self.update_views()
-            self.update_selection_summary()
-            self.query_one("#keys", KeyBar).set_context("removed")
-            return
         tree.focus()
         if view.nodes is None:
             tree.clear()
@@ -1755,7 +1748,8 @@ class DriveSelectorApp(App):
         try:
             load_view(self.make_service(), view, self.cache)
             view.marks = local_marks(view.nodes, self.destination, self.state)
-        except (HttpError, OSError) as error:
+        except Exception as error:  # a worker error would end the app: show it on the view instead
+            view.nodes = None
             view.error = error_text(error)
         self.call_from_thread(self.view_loaded, view)
 
@@ -1770,8 +1764,6 @@ class DriveSelectorApp(App):
                 1 for entry in self.selections
                 if entry.get("view") is view
             )
-            if view.root_id == REMOVED:
-                selected = len(set_aside_files(self.destination)) if self.destination else 0
             label = f" {view.name}" + (f" ({selected})" if selected else "") + " "
             if view is self.view:
                 text.append(label, style="bold #07111f on #38bdf8")
@@ -1789,25 +1781,15 @@ class DriveSelectorApp(App):
     TREE_ACTIONS = {
         "next_view", "previous_view", "select_all", "clear_selection", "start_filter", "open_in_drive",
         "sort", "change_destination", "confirm", "cancel", "quit_selector", "trash", "restore",
-        "empty_trash", "delete_all_removed",
+        "empty_trash", "review_last",
     }
-    # In Removed from Drive (local files, no tree), these keys have nothing to act on.
-    TREE_ONLY_ACTIONS = {"select_all", "clear_selection", "start_filter", "sort", "unfold_view", "expand_all",
-                         "toggle_current", "activate_current", "collapse_or_parent", "expand_or_child"}
 
     def check_action(self, action, parameters):
         # While another screen is open (preview, help, folder, a confirmation), the tree's keys
         # must not act behind it (Tab, for one, belongs to the preview's filter tabs).
         if action in self.TREE_ACTIONS and len(self.screen_stack) > 1:
             return False
-        removed = self.view.root_id == REMOVED
-        if removed and action in self.TREE_ONLY_ACTIONS:
-            return False
-        if action == "restore" and self.view.root_id not in {TRASH, REMOVED}:
-            return False
-        if action == "empty_trash" and self.view.root_id != TRASH:
-            return False
-        if action == "delete_all_removed" and not removed:
+        if action in {"restore", "empty_trash"} and self.view.root_id != TRASH:
             return False
         return True
 
@@ -2138,14 +2120,6 @@ class DriveSelectorApp(App):
             filter_input.value = ""  # Input.Changed rebuilds the tree
 
     def action_open_in_drive(self):
-        if self.view.root_id == REMOVED:
-            current = self.current_removed()
-            folder = current[0].parent if current else self.destination / RECOVERY_DIR_NAME
-            if not folder.is_dir():
-                folder = self.destination
-            if not open_quietly(folder.as_uri()):
-                self.notify("Could not open a file manager.", severity="error")
-            return
         entry = self.current_entry()
         if entry is None:
             return
@@ -2169,10 +2143,8 @@ class DriveSelectorApp(App):
                     view.marks = local_marks(view.nodes, destination, self.state)
             self.update_sub_title()
             self.refresh_node_labels()
-            if self.view.root_id == REMOVED:
-                self.fill_removed()
-            self.update_views()
-            self.notify(f"Downloading to {destination} for this session.")
+            self.check_last_sync()
+            self.notify(f"Syncing with {destination} for this session.")
 
         self.push_screen(DestinationSetupScreen(initial), changed)
 
@@ -2193,111 +2165,6 @@ class DriveSelectorApp(App):
             current = stack.pop()
             self.expand(current)
             stack.extend(child for child in current.children if child.allow_expand)
-
-    # Removed from Drive: local files that earlier downloads set aside.
-
-    def fill_removed(self):
-        table = self.query_one("#removed-table", DataTable)
-        if not table.columns:
-            table.add_column("SET ASIDE")
-            table.add_column("FILE (its place in the download folder)")
-            table.add_column("SIZE")
-        row = table.cursor_row
-        table.clear()
-        self.removed_rows = set_aside_files(self.destination)
-        for path, relative, moment in self.removed_rows:
-            table.add_row(
-                Text(f"{moment:%Y-%m-%d %H:%M}", style="dim"),
-                Text(relative.as_posix()),
-                Text(human_size(path.stat().st_size), style="dim", justify="right"),
-            )
-        summary = Text()
-        if self.removed_rows:
-            size = human_size(sum(path.stat().st_size for path, _, _ in self.removed_rows))
-            summary.append(f"{plural(len(self.removed_rows), 'file')} · {size}", style="bold")
-            summary.append(" on your disk, set aside by earlier downloads because they were removed from Drive.\n",
-                           style="dim")
-            summary.append("r", style="bold #f59e0b")
-            summary.append(" puts one back in the download folder, ", style="dim")
-            summary.append("x", style="bold #f59e0b")
-            summary.append(" deletes it for good. Nothing here is on Drive any more.", style="dim")
-        else:
-            summary.append("Nothing here yet.", style="bold")
-            summary.append(
-                " If a file you downloaded gets deleted on Drive, your copy lands here at the next download "
-                "instead of being deleted: you can put it back or delete it.", style="dim",
-            )
-        self.query_one("#removed-summary", Static).update(summary)
-        if self.removed_rows:
-            table.move_cursor(row=min(row, len(self.removed_rows) - 1))
-
-    def current_removed(self):
-        if not self.removed_rows:
-            return None
-        return self.removed_rows[self.query_one("#removed-table", DataTable).cursor_row]
-
-    def removed_changed(self):
-        # Files put back change what the tree marks as downloaded.
-        self.state = load_state(self.destination)
-        for view in self.views:
-            if view.nodes:
-                view.marks = local_marks(view.nodes, self.destination, self.state)
-        self.fill_removed()
-        self.update_views()
-
-    def put_back_removed(self):
-        current = self.current_removed()
-        if current is None:
-            return
-        path, relative, _ = current
-        error = put_back(self.destination, path, relative)
-        if error:
-            self.notify(error, severity="warning")
-            return
-        self.notify(
-            f"Put back {relative.as_posix()}. GDrive Pull leaves it alone from now on: it shows as local only."
-        )
-        self.removed_changed()
-
-    def delete_removed(self):
-        current = self.current_removed()
-        if current is None:
-            return
-        path, relative, _ = current
-
-        def answered(yes):
-            if not yes:
-                return
-            try:
-                path.unlink()
-                prune_empty_dirs(path.parent, self.destination / RECOVERY_DIR_NAME)
-            except OSError as error:
-                self.notify(f"Could not delete: {error}", severity="error")
-            self.removed_changed()
-
-        self.push_screen(ConfirmScreen(f"Delete {relative.as_posix()} from your disk, for good?"), answered)
-
-    def action_delete_all_removed(self):
-        if not self.removed_rows:
-            return
-        size = human_size(sum(path.stat().st_size for path, _, _ in self.removed_rows))
-
-        def answered(yes):
-            if not yes:
-                return
-            try:
-                shutil.rmtree(self.destination / RECOVERY_DIR_NAME)
-            except OSError as error:
-                self.notify(f"Could not delete: {error}", severity="error")
-            self.removed_changed()
-
-        self.push_screen(
-            ConfirmScreen(
-                f"Delete the {plural(len(self.removed_rows), 'set-aside file')} ({size}) from your disk, for good?",
-                word="empty",
-            ),
-            answered,
-        )
 
     def drive_targets(self):
         """The current view's selection, or the item under the cursor."""
@@ -2348,15 +2215,12 @@ class DriveSelectorApp(App):
         TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
         self.selections.clear()
         for view in self.views:
-            if view.root_id != REMOVED:
-                view.nodes, view.error, view.expanded, view.sorted_by = None, None, set(), "name"
+            view.nodes, view.error, view.expanded, view.sorted_by = None, None, set(), "name"
         self.show_view(self.view)
+        self.check_last_sync()
 
     def action_trash(self):
         if self.busy:
-            return
-        if self.view.root_id == REMOVED:
-            self.delete_removed()
             return
         items = self.drive_targets()
         if not items:
@@ -2376,9 +2240,6 @@ class DriveSelectorApp(App):
 
     def action_restore(self):
         if self.busy:
-            return
-        if self.view.root_id == REMOVED:
-            self.put_back_removed()
             return
         items = self.drive_targets()
         if not items:
@@ -2441,10 +2302,12 @@ class DriveSelectorApp(App):
 
         try:
             state = load_state(destination)
-            plan = build_plan(self.make_service(), selections, scopes, destination, state, self.cache, on_item)
+            plan = build_plan(
+                self.make_service(), selections, scopes, destination, state, self.cache, on_item, view_roots(self.views)
+            )
             if self.keep_both:
                 set_keep_both(plan, plan, True)
-        except (HttpError, OSError) as error:
+        except Exception as error:  # a worker error would end the app: report it instead
             self.call_from_thread(self.plan_failed, error_text(error))
             return
         result = {"plan": plan, "selections": selections, "scopes": scopes,
@@ -2467,7 +2330,9 @@ class DriveSelectorApp(App):
             if confirmed:
                 self.exit(result)
 
-        self.push_screen(PreviewScreen(result["plan"], result["destination"], self.account), answered)
+        self.push_screen(
+            PreviewScreen(result["plan"], result["destination"], self.account, result["state"]), answered
+        )
 
     def action_cancel(self):
         if self.query_one("#filter", Input).display:
@@ -2662,24 +2527,48 @@ def remote_export_hash(service, item):
     return sink.hexdigest()
 
 
+def is_readonly_path(relative_path):
+    """Items here only come down: the Drive trash, and the top of Shared with me (no folder to send to)."""
+    parts = relative_path.parts
+    return bool(parts) and (parts[0] == TRASH_DIR or (parts[0] == SHARED_WITH_ME_DIR and len(parts) == 2))
+
+
+def sends_back(item):
+    """Can a local change of this Drive file go back up? Not for exports (Docs...) and shortcuts."""
+    return item["mimeType"] != SHORTCUT_MIME_TYPE and effective_mime_type(item) not in EXPORT_FORMATS
+
+
+def tracked_record(state, item, relative_path):
+    stored = state["files"].get(state_key(item, relative_path))
+    if stored is None:
+        stored = state["files"].get(effective_id(item))
+    if stored and stored.get("path") == relative_path.as_posix():
+        return stored
+    return None
+
+
 def classify_file(service, item, relative_path, destination, state):
+    """Status of a Drive file against its local copy and the last sync, and the local SHA-256 if any."""
+    record = tracked_record(state, item, relative_path)
+    signature = remote_signature(item)
+    readonly = is_readonly_path(relative_path) or item.get("readonly")
+
     if not destination.exists():
+        if record and signature == record.get("remote_signature") and not readonly:
+            return "TRASH_REMOTE", None  # synced before, deleted here
         return "NEW", None
     if not destination.is_file():
         return "CONFLICT", None
 
     current_sha256 = file_hash(destination)
-    stored = state["files"].get(state_key(item, relative_path))
-    if stored is None:
-        stored = state["files"].get(effective_id(item))
-    signature = remote_signature(item)
-
-    if stored and stored.get("path") == relative_path.as_posix():
-        if current_sha256 != stored.get("local_sha256"):
+    if record:
+        local_changed = current_sha256 != record.get("local_sha256")
+        remote_changed = signature != record.get("remote_signature")
+        if not local_changed:
+            return ("UPDATE" if remote_changed else "UNCHANGED"), current_sha256
+        if remote_changed or readonly or not sends_back(item):
             return "CONFLICT", current_sha256
-        if signature == stored.get("remote_signature"):
-            return "UNCHANGED", current_sha256
-        return "UPDATE", current_sha256
+        return "UPLOAD", current_sha256
 
     remote_md5 = item.get("md5Checksum")
     if remote_md5 and file_hash(destination, "md5") == remote_md5:
@@ -2692,6 +2581,31 @@ def classify_file(service, item, relative_path, destination, state):
         except HttpError as error:
             warn(f"Could not compare {relative_path.as_posix()}: {error_text(error)}")
     return "CONFLICT", current_sha256
+
+
+def tracked_below(state, relative_path):
+    """Records of the files synced below relative_path."""
+    prefix = relative_path.as_posix() + "/"
+    return [record for record in state["files"].values() if record.get("path", "").startswith(prefix)]
+
+
+def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, seen=frozenset()):
+    """True when every Drive file below the folder was synced and has not changed since."""
+    for child in list_children(service, folder_id, cache):
+        child_path = relative_path / local_name(child)
+        if is_folder(child):
+            child_id = effective_id(child)
+            if child_id in seen or not remote_subtree_unchanged(
+                service, child_id, child_path, state, cache, seen | {child_id}
+            ):
+                return False
+            continue
+        if is_unsupported(child):
+            continue
+        record = tracked_record(state, child, child_path)
+        if not record or record.get("remote_signature") != remote_signature(child):
+            return False
+    return True
 
 
 def collect_plan(
@@ -2717,6 +2631,14 @@ def collect_plan(
             status = "SKIPPED"
         elif destination.exists() and not destination.is_dir():
             status = "CONFLICT"
+        elif (
+            status == "NEW"
+            and item["mimeType"] != SHORTCUT_MIME_TYPE
+            and not is_readonly_path(relative_path)
+            and tracked_below(state, relative_path)
+            and remote_subtree_unchanged(service, folder_id, relative_path, state, cache)
+        ):
+            status = "TRASH_REMOTE"  # synced before, the whole folder was deleted here
         plan.append(
             {
                 "status": status,
@@ -2726,7 +2648,7 @@ def collect_plan(
                 "destination": destination,
             }
         )
-        if status in {"CONFLICT", "SKIPPED"}:
+        if status in {"CONFLICT", "SKIPPED", "TRASH_REMOTE"}:
             return
         for child in list_children(service, folder_id, cache):
             collect_plan(
@@ -2741,7 +2663,10 @@ def collect_plan(
             )
         return
 
+    shortcut = item["mimeType"] == SHORTCUT_MIME_TYPE
     item = resolve_file_shortcut(service, item)
+    if shortcut:
+        item = dict(item, readonly=True)  # the target may live anywhere: only downloaded
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
 
@@ -2777,6 +2702,7 @@ def mark_duplicate_targets(plan):
     for entry in plan:
         if entry["kind"] == "FILE" and file_targets[entry["destination"]] > 1:
             entry["status"] = "CONFLICT"
+            entry["duplicate"] = True  # two Drive files, one local name: rename one on Drive
 
 
 def path_is_in_scope(relative_path, scopes):
@@ -2797,7 +2723,11 @@ def tracked_files_by_path(state):
     return tracked
 
 
-def add_local_only_entries(plan, destination_root, state, scopes):
+def add_local_entries(plan, destination_root, state, scopes, remote_folders):
+    """Local files and folders Drive does not have: new here (sent to Drive), or deleted on Drive (to your trash).
+
+    remote_folders maps local folder paths to their Drive folder id (None: nothing can be sent there).
+    """
     remote_files = {
         entry["relative_path"]
         for entry in plan
@@ -2806,8 +2736,11 @@ def add_local_only_entries(plan, destination_root, state, scopes):
     remote_directories = {
         entry["relative_path"]
         for entry in plan
-        if entry["kind"] == "FOLDER" and entry.get("item") is not None
+        if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE"
     }
+    trashed_remote = [
+        entry["relative_path"] for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "TRASH_REMOTE"
+    ]
     tracked = tracked_files_by_path(state)
     tracked_directories = {
         parent for tracked_path in tracked for parent in tracked_path.parents
@@ -2817,22 +2750,35 @@ def add_local_only_entries(plan, destination_root, state, scopes):
         for entry in plan
         if entry.get("item") is None
     }
+    new_folders = set()
+
+    def can_send(relative_path):
+        parent = relative_path.parent
+        if is_readonly_path(relative_path):
+            return False
+        return parent in new_folders or remote_folders.get(parent) is not None
 
     def add_local_entry(relative_path, kind):
         if relative_path in planned_local_paths:
             return
         destination = destination_root / relative_path
         tracked_entry = tracked.get(relative_path) if kind == "FILE" else None
+        tracked_key, current_sha256 = None, None
 
         if tracked_entry:
             tracked_key, record = tracked_entry
             current_sha256 = file_hash(destination)
             if current_sha256 == record.get("local_sha256"):
-                status = "REMOVED_REMOTE"
+                status = "TRASH_LOCAL"  # synced before, deleted on Drive
+            elif can_send(relative_path):
+                status = "UPLOAD_NEW"  # deleted on Drive but changed here: the change wins
             else:
                 status = "CONFLICT"
+        elif can_send(relative_path):
+            status = "UPLOAD_NEW"
+            if kind == "FOLDER":
+                new_folders.add(relative_path)
         else:
-            tracked_key = None
             status = "LOCAL_ONLY"
 
         plan.append(
@@ -2843,6 +2789,7 @@ def add_local_only_entries(plan, destination_root, state, scopes):
                 "relative_path": relative_path,
                 "destination": destination,
                 "state_key": tracked_key,
+                "local_sha256": current_sha256,
             }
         )
         planned_local_paths.add(relative_path)
@@ -2861,29 +2808,32 @@ def add_local_only_entries(plan, destination_root, state, scopes):
                 and child.name in VIEW_DIRS
                 and relative_path not in remote_directories
             ):
-                continue  # the Shared with me / Shared drives views have their own scopes
-            if child.name.endswith(".gdrivepull.part"):
+                continue  # the Shared with me / Shared drives / Trash views have their own scopes
+            if child.name.endswith(PART_SUFFIX) or child.is_symlink():
                 continue
+            if any(relative_path == trashed or trashed in relative_path.parents for trashed in trashed_remote):
+                continue  # deleted here; Drive's copy goes to the Drive trash
 
             if child.is_dir():
                 if relative_path in remote_directories or relative_path in tracked_directories:
                     scan_directory(relative_path)
                 else:
                     add_local_entry(relative_path, "FOLDER")
+                    if relative_path in new_folders:
+                        scan_directory(relative_path)  # its files go up too
             elif child.is_file() and relative_path not in remote_files:
                 add_local_entry(relative_path, "FILE")
 
     for scope in scopes:
         destination = destination_root / scope
-        if scope == Path():
-            scan_directory(scope)
-        elif destination.is_dir():
+        if scope == Path() or destination.is_dir():
             scan_directory(scope)
         elif destination.is_file() and scope not in remote_files:
             add_local_entry(scope, "FILE")
 
 
-def build_plan(service, selections, scopes, destination_root, state, cache, on_item=lambda: None):
+def build_plan(service, selections, scopes, destination_root, state, cache, on_item=lambda: None, roots=None):
+    """The sync plan of the selection; roots maps view base paths to their Drive folder id (None: read only)."""
     prefetch_folders(
         service,
         [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
@@ -2904,38 +2854,60 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
         for _ in range(len(plan) - before):
             on_item()
     mark_duplicate_targets(plan)
-    add_local_only_entries(plan, destination_root, state, scopes)
+    remote_folders = dict(roots if roots is not None else {Path(): "root"})
+    for entry in plan:
+        if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE":
+            remote_folders[entry["relative_path"]] = effective_id(entry["item"])
+    add_local_entries(plan, destination_root, state, scopes, remote_folders)
+    for entry in plan:
+        if entry["status"] == "UPLOAD_NEW":
+            entry["parent_id"] = remote_folders.get(entry["relative_path"].parent)
     return plan
 
 
 # --- Preview and download --------------------------------------------------
 
+# status: (color, label in the preview, tab name). The arrows say which way it goes: ↓ to your disk, ↑ to Drive.
 STATUS_STYLES = {
-    "NEW": ("green", "new"),
-    "UPDATE": ("cyan", "update"),
-    "UNCHANGED": ("bright_black", "unchanged"),
-    "CONFLICT": ("yellow", "conflict"),
-    "KEEP_BOTH": ("bright_yellow", "keep both"),
-    "REMOVED_REMOTE": ("magenta", "removed from Drive"),
-    "LOCAL_ONLY": ("blue", "local only"),
-    "SKIPPED": ("bright_black", "skipped"),
+    "NEW": ("green", "↓ new", "↓ New"),
+    "UPDATE": ("cyan", "↓ changed", "↓ Changed"),
+    "UPLOAD_NEW": ("bright_green", "↑ new", "↑ New"),
+    "UPLOAD": ("bright_cyan", "↑ changed", "↑ Changed"),
+    "TRASH_REMOTE": ("magenta", "↑ to Drive trash", "Deleted here"),
+    "TRASH_LOCAL": ("bright_magenta", "↓ to your trash", "Deleted on Drive"),
+    "UNCHANGED": ("bright_black", "unchanged", "Unchanged"),
+    "CONFLICT": ("yellow", "conflict", "Conflict"),
+    "KEEP_BOTH": ("bright_yellow", "keep both", "Keep both"),
+    "LOCAL_ONLY": ("blue", "local only", "Local only"),
+    "SKIPPED": ("bright_black", "skipped", "Skipped"),
 }
-ACTIONS = {"NEW", "UPDATE", "REMOVED_REMOTE", "KEEP_BOTH"}
+ACTIONS = {"NEW", "UPDATE", "UPLOAD_NEW", "UPLOAD", "TRASH_REMOTE", "TRASH_LOCAL", "KEEP_BOTH"}
 DOWNLOADS = {"NEW", "UPDATE", "KEEP_BOTH"}
+UPLOADS = {"UPLOAD_NEW", "UPLOAD"}
+DELETIONS = {"TRASH_REMOTE", "TRASH_LOCAL"}
+MASS_DELETION_FILES = 20  # deleting more than this, or more than a quarter of the synced files,
+MASS_DELETION_SHARE = 0.25  # needs a typed confirmation: an unplugged disk or an emptied folder looks the same
 
 
 def can_keep_both(entry):
-    return entry["kind"] == "FILE" and entry.get("item") is not None and entry["status"] in {"CONFLICT", "KEEP_BOTH"}
+    """A file changed on both sides (or an edited export) whose local copy can step aside."""
+    return (
+        entry["kind"] == "FILE"
+        and entry.get("item") is not None
+        and entry["status"] in {"CONFLICT", "KEEP_BOTH"}
+        and not entry.get("duplicate")
+        and entry["destination"].is_file()
+    )
 
 
-def drive_copy_path(destination, taken):
-    """`name (Drive).ext` next to destination, or `(Drive 2)`... when that one is taken."""
+def local_copy_path(destination, taken):
+    """`name (local).ext` next to destination, or `(local 2)`... when that one is taken."""
     stem, suffix = destination.stem, destination.suffix
     if destination.name.startswith(".") and destination.suffix == destination.name:
         stem, suffix = destination.name, ""
     counter = 1
     while True:
-        label = "Drive" if counter == 1 else f"Drive {counter}"
+        label = "local" if counter == 1 else f"local {counter}"
         candidate = destination.with_name(f"{stem} ({label}){suffix}")
         if candidate not in taken and not candidate.exists():
             return candidate
@@ -2943,26 +2915,28 @@ def drive_copy_path(destination, taken):
 
 
 def set_keep_both(plan, entries, keep):
-    """Download the Drive version of conflicts next to the local copy (keep) or skip them again."""
-    taken = {entry["destination"] for entry in plan if entry["status"] == "KEEP_BOTH"}
+    """Keep both versions of conflicts (keep), or leave them as conflicts again.
+
+    Your version is renamed 'name (local).ext' (a new local file, sent to Drive at the next sync) and the Drive
+    version is downloaded in its place: both versions end up on both sides, and the conflict is gone.
+    """
+    taken = {entry["local_copy"] for entry in plan if entry["status"] == "KEEP_BOTH"}
     for entry in entries:
         if not can_keep_both(entry):
             continue
         if keep and entry["status"] == "CONFLICT":
-            entry["original_destination"] = entry["destination"]
-            entry["destination"] = drive_copy_path(entry["destination"], taken)
-            taken.add(entry["destination"])
+            entry["local_copy"] = local_copy_path(entry["destination"], taken)
+            taken.add(entry["local_copy"])
             entry["status"] = "KEEP_BOTH"
         elif not keep and entry["status"] == "KEEP_BOTH":
-            taken.discard(entry["destination"])
-            entry["destination"] = entry.pop("original_destination")
+            taken.discard(entry.pop("local_copy"))
             entry["status"] = "CONFLICT"
 
 
 def plan_summary(plan):
     counts = Counter(entry["status"] for entry in plan)
     parts = []
-    for status, (style, label) in STATUS_STYLES.items():
+    for status, (style, label, _) in STATUS_STYLES.items():
         if counts[status]:
             parts.append(f"[{style}]{counts[status]} {label}[/]")
     return " · ".join(parts)
@@ -2982,7 +2956,7 @@ def print_plan(plan, destination_root):
         table.add_column("ITEM", overflow="fold")
         table.add_column("SIZE", justify="right", no_wrap=True, style="dim")
         for entry in shown:
-            style, label = STATUS_STYLES[entry["status"]]
+            style, label, _ = STATUS_STYLES[entry["status"]]
             path = escape(entry["relative_path"].as_posix())
             if entry["kind"] == "FOLDER":
                 path = f"[cyan]{path}/[/]"
@@ -3023,34 +2997,74 @@ def free_space(path):
         return None
 
 
+def upload_size(plan, destination_root):
+    return sum(
+        (destination_root / entry["relative_path"]).stat().st_size
+        for entry in plan
+        if entry["kind"] == "FILE" and entry["status"] in UPLOADS
+    )
+
+
 def space_line(plan, destination_root):
-    """("12 MB to download · 40 GB free", fits): fits is False when the known size exceeds the free space."""
+    """("12 MB to download · 40 GB free · 3 MB to send", fits): fits is False when the download cannot fit."""
     total, unknown = download_size(plan)
-    if not total and not unknown:
-        return None, True
-    text = f"{human_size(total)} to download"
-    if unknown:
-        text += f" + {plural(unknown, 'exported file')} of unknown size"
-    free = free_space(destination_root)
-    if free is None:
-        return text, True
-    return f"{text} · {human_size(free)} free", total <= free
+    sent = upload_size(plan, destination_root)
+    parts = []
+    fits = True
+    if total or unknown:
+        text = f"{human_size(total)} to download"
+        if unknown:
+            text += f" + {plural(unknown, 'exported file')} of unknown size"
+        free = free_space(destination_root)
+        if free is not None:
+            text += f" · {human_size(free)} free"
+            fits = total <= free
+        parts.append(text)
+    if sent:
+        parts.append(f"{human_size(sent)} to send to Drive")
+    return (" · ".join(parts) or None), fits
+
+
+def deletion_count(plan, state):
+    """Files the plan deletes (a folder counts the synced files below it), and the synced files in play."""
+    count = 0
+    for entry in plan:
+        if entry["status"] not in DELETIONS:
+            continue
+        if entry["kind"] == "FOLDER":
+            count += max(1, len(tracked_below(state, entry["relative_path"])))
+        else:
+            count += 1
+    synced = len(state["files"])
+    return count, synced
+
+
+def needs_deletion_check(plan, state):
+    count, synced = deletion_count(plan, state)
+    return count > MASS_DELETION_FILES or (count > 2 and synced and count > synced * MASS_DELETION_SHARE)
 
 
 def plan_notes(plan):
     statuses = {entry["status"] for entry in plan}
     notes = []
     if "CONFLICT" in statuses:
-        notes.append("Conflicts are preserved and skipped (b: keep both for this one, shift+b: for all).")
-    if "KEEP_BOTH" in statuses:
-        notes.append("Keep both: the Drive version is saved as 'name (Drive).ext', the local file stays as is.")
-    if "LOCAL_ONLY" in statuses:
-        notes.append("Local-only items are preserved and skipped.")
-    if "REMOVED_REMOTE" in statuses:
         notes.append(
-            "Files removed from Drive are set aside, not deleted: after the download, "
-            "the Removed from Drive tab puts them back or deletes them."
+            "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
+            "A Google Doc, Sheet or Slides changed here is a conflict too: exports never go back to Drive."
         )
+    if "KEEP_BOTH" in statuses:
+        notes.append(
+            "Keep both: your version is renamed 'name (local).ext' and sent to Drive at the next sync; "
+            "Drive's version takes its place. Delete the one you do not want, the sync follows."
+        )
+    if any(entry.get("duplicate") for entry in plan):
+        notes.append("Two Drive files with the same name in a folder: rename one on Drive (o opens it).")
+    if "TRASH_REMOTE" in statuses:
+        notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
+    if "TRASH_LOCAL" in statuses:
+        notes.append("Deleted on Drive since the last sync: your copies go to your system trash.")
+    if "LOCAL_ONLY" in statuses:
+        notes.append("Local only: nothing on Drive to send them to (top of Shared with me, Trash); left as they are.")
     return notes
 
 
@@ -3058,13 +3072,13 @@ PREVIEW_VIEWS = [
     ("Changes", lambda entry: entry["status"] != "UNCHANGED"),
     ("Everything", lambda entry: True),
 ] + [
-    (label.capitalize(), lambda entry, status=status: entry["status"] == status)
-    for status, (_, label) in STATUS_STYLES.items()
+    (label, lambda entry, status=status: entry["status"] == status)
+    for status, (_, _, label) in STATUS_STYLES.items()
 ]
 
 
 class PreviewScreen(Screen):
-    """The plan before anything changes: y downloads, esc goes back (or cancels)."""
+    """The plan before anything changes: y syncs, esc goes back (or cancels)."""
 
     SUB_TITLE = "Preview"
 
@@ -3107,7 +3121,7 @@ class PreviewScreen(Screen):
     KEY_CONTEXT = "preview"
 
     BINDINGS = [
-        Binding("y", "confirm", "Download"),
+        Binding("y", "confirm", "Sync"),
         Binding("tab", "next_filter", "Filter", priority=True),
         Binding("shift+tab", "previous_filter", "Previous filter", show=False, priority=True),
         Binding("b", "keep_both", "Keep both"),
@@ -3115,11 +3129,12 @@ class PreviewScreen(Screen):
         Binding("escape,n", "back", "Back"),
     ]
 
-    def __init__(self, plan, destination, account=None):
+    def __init__(self, plan, destination, account=None, state=None):
         super().__init__()
         self.plan = plan
         self.destination = destination
         self.account = account
+        self.state = state
         self.filters = [
             (name, keep) for name, keep in PREVIEW_VIEWS
             if any(keep(entry) for entry in plan)
@@ -3185,12 +3200,14 @@ class PreviewScreen(Screen):
         table.clear()
         self.rows = rows
         for entry in rows:
-            style, label = STATUS_STYLES[entry["status"]]
+            style, label, _ = STATUS_STYLES[entry["status"]]
             path = entry["relative_path"].as_posix()
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
             if entry["status"] == "KEEP_BOTH":
-                path += f"  → {entry['destination'].name}"
+                path += f"  (yours → {entry['local_copy'].name})"
+            elif entry.get("duplicate"):
+                path += "  (same name on Drive)"
             table.add_row(
                 Text(label, style=style),
                 Text(path + "/", style="cyan") if entry["kind"] == "FOLDER" else Text(path),
@@ -3223,7 +3240,7 @@ class PreviewScreen(Screen):
             return
         entry = self.rows[table.cursor_row]
         if not can_keep_both(entry):
-            self.notify("Keep both applies to file conflicts from Drive.", severity="warning")
+            self.notify("Keep both applies to a file changed on both sides.", severity="warning")
             return
         set_keep_both(self.plan, [entry], entry["status"] == "CONFLICT")
         self.refresh_plan()
@@ -3238,6 +3255,22 @@ class PreviewScreen(Screen):
         self.refresh_plan()
 
     def action_confirm(self):
+        if self.state is not None and needs_deletion_check(self.plan, self.state):
+            count, _ = deletion_count(self.plan, self.state)
+
+            def answered(yes):
+                if yes:
+                    self.dismiss(True)
+
+            self.app.push_screen(
+                ConfirmScreen(
+                    f"This sync deletes {plural(count, 'file')} (to the Drive trash or your system trash). "
+                    "That is a lot: check the Deleted here / Deleted on Drive tabs first.",
+                    word="delete",
+                ),
+                answered,
+            )
+            return
         self.dismiss(True)
 
     def action_back(self):
@@ -3256,14 +3289,17 @@ class PreviewApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS = SHARED_CSS
 
-    def __init__(self, plan, destination, account=None):
+    def __init__(self, plan, destination, account=None, state=None):
         super().__init__()
         self.plan = plan
         self.destination = destination
         self.account = account
+        self.state = state
 
     def on_mount(self):
-        self.push_screen(StandalonePreviewScreen(self.plan, self.destination, self.account), self.exit)
+        self.push_screen(
+            StandalonePreviewScreen(self.plan, self.destination, self.account, self.state), self.exit
+        )
 
 
 def set_remote_mtime(destination, item):
@@ -3279,7 +3315,7 @@ def set_remote_mtime(destination, item):
 def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: None):
     destination = entry["destination"]
     temporary = destination.with_name(
-        f".{destination.name}.gdrivepull.part"
+        f".{destination.name}{PART_SUFFIX}"
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3307,32 +3343,69 @@ def state_record(entry, local_sha256):
     }
 
 
-def unused_recovery_target(recovery_root, relative_path):
-    candidate = recovery_root / relative_path
-    if not candidate.exists():
-        return candidate
+UPLOAD_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink"
 
-    counter = 2
-    while True:
-        candidate = (
-            recovery_root
-            / relative_path.parent
-            / f"{relative_path.name}.{counter}"
+
+def upload_file(service, path, file_id=None, name=None, parent_id=None, stop=None, on_bytes=lambda count: None):
+    """Send a local file to Drive: a new version of file_id, or a new file in parent_id. Returns its metadata."""
+    media = MediaFileUpload(
+        str(path),
+        mimetype=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        chunksize=8 * 1024 * 1024,
+        resumable=True,
+    )
+    if file_id:
+        request = service.files().update(
+            fileId=file_id, media_body=media, fields=UPLOAD_FIELDS, supportsAllDrives=True
         )
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    else:
+        request = service.files().create(
+            body={"name": name, "parents": [parent_id]}, media_body=media, fields=UPLOAD_FIELDS,
+            supportsAllDrives=True,
+        )
+    sent = 0
+    response = None
+    while response is None:
+        if stop is not None and stop.is_set():
+            raise Stopped()
+        status, response = request.next_chunk(num_retries=API_RETRIES)
+        if status is not None:
+            on_bytes(status.resumable_progress - sent)
+            sent = status.resumable_progress
+    on_bytes(max(0, path.stat().st_size - sent))
+    return response
+
+
+def create_remote_folder(service, name, parent_id):
+    return (
+        service.files()
+        .create(
+            body={"name": name, "parents": [parent_id], "mimeType": FOLDER_MIME_TYPE},
+            fields="id,name,mimeType,webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute(num_retries=API_RETRIES)
+    )
+
+
+def trash_local(path):
+    """Move a local file or folder to the system trash (the file manager's), never delete it."""
+    send2trash(str(path))
+
+
+def forget_below(state, relative_path):
+    """Drop the records of relative_path and of everything below it."""
+    prefix = relative_path.as_posix()
+    for key in [
+        key for key, record in state["files"].items()
+        if record.get("path") == prefix or record.get("path", "").startswith(prefix + "/")
+    ]:
+        del state["files"][key]
 
 
 def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
-    """Apply the confirmed plan; downloads run in jobs threads, each with its own Drive client."""
+    """Apply the confirmed plan. Transfers run in jobs threads, each with its own Drive client."""
     results = Counter()
-    recovery_root = (
-        destination_root
-        / RECOVERY_DIR_NAME
-        / datetime.now().strftime(RECOVERY_RUN_FORMAT)
-    )
-    downloads = []
     progress = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -3346,62 +3419,71 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
     def report(mark, text):
         progress.console.print(f"{mark} {escape(text)}")
 
+    def record(entry, item, local_sha256):
+        state["files"][state_key(item, entry["relative_path"])] = state_record(dict(entry, item=item), local_sha256)
+
+    # 1. Folders: created here, then on Drive (parents first).
+    folder_ids = {}
     for entry in plan:
-        status = entry["status"]
+        if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE":
+            folder_ids[entry["relative_path"]] = effective_id(entry["item"])
+    for entry in plan:
+        if entry["kind"] != "FOLDER":
+            continue
         relative = entry["relative_path"].as_posix()
-        if entry.get("item") is None:
-            if status == "REMOVED_REMOTE":
-                try:
-                    recovery_target = unused_recovery_target(
-                        recovery_root, entry["relative_path"]
-                    )
-                    recovery_target.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(entry["destination"], recovery_target)
-                    report("[magenta]→[/]", f"{relative}: removed from Drive, set aside")
-                    if entry.get("state_key"):
-                        state["files"].pop(entry["state_key"], None)
-                    results["FILE_REMOVED_REMOTE"] += 1
-                except OSError as error:
-                    results[f"{entry['kind']}_ERROR"] += 1
-                    report("[red]✗[/]", f"{relative}: removed from Drive, could not be set aside: {error}")
-            else:
-                results[f"{entry['kind']}_{status}"] += 1
-            continue
-
-        if entry["kind"] == "FOLDER":
-            if status == "NEW":
-                try:
-                    entry["destination"].mkdir(parents=True, exist_ok=True)
-                except OSError as error:
-                    results["FOLDER_ERROR"] += 1
-                    report("[red]✗[/]", f"{relative}/: {error}")
-                    continue
+        status = entry["status"]
+        if status == "NEW":
+            try:
+                entry["destination"].mkdir(parents=True, exist_ok=True)
+                results["FOLDER_NEW"] += 1
+            except OSError as error:
+                results["FOLDER_ERROR"] += 1
+                report("[red]✗[/]", f"{relative}/: {error}")
+        elif status in {"UNCHANGED", "CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
             results[f"FOLDER_{status}"] += 1
-            continue
+    for entry in sorted(
+        (entry for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "UPLOAD_NEW"),
+        key=lambda entry: len(entry["relative_path"].parts),
+    ):
+        relative = entry["relative_path"]
+        parent_id = folder_ids.get(relative.parent, entry.get("parent_id"))
+        try:
+            if parent_id is None:
+                raise OSError("its parent folder could not be created on Drive")
+            folder = create_remote_folder(service, relative.name, parent_id)
+            folder_ids[relative] = folder["id"]
+            results["FOLDER_UPLOAD_NEW"] += 1
+            report("[bright_green]↑[/]", f"{relative.as_posix()}/")
+        except (HttpError, OSError) as error:
+            results["FOLDER_ERROR"] += 1
+            report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(error)}")
 
+    # 2. Files that need no transfer.
+    transfers = []
+    for entry in plan:
+        if entry["kind"] != "FILE":
+            continue
+        status = entry["status"]
         if status == "UNCHANGED":
             local_sha256 = entry.get("local_sha256") or file_hash(entry["destination"])
-            state["files"][state_key(entry["item"], entry["relative_path"])] = state_record(entry, local_sha256)
+            record(entry, entry["item"], local_sha256)
             try:
                 set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
             except OSError:
                 pass
             results["FILE_UNCHANGED"] += 1
-        elif status in {"CONFLICT", "SKIPPED"}:
+        elif status in {"CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
             results[f"FILE_{status}"] += 1
-        else:
-            downloads.append(entry)
+        elif status in DOWNLOADS or status in UPLOADS:
+            transfers.append(entry)
 
-    if not downloads:
-        save_state(destination_root, state)
-        return results
-
+    # 3. Downloads and uploads.
     stop = threading.Event()
     lock = threading.Lock()
     clients = threading.local()
     started = time.monotonic()
     transferred = 0
-    task = progress.add_task("Downloading", total=len(downloads), transfer="")
+    task = progress.add_task("Syncing", total=len(transfers), transfer="")
 
     def on_bytes(count):
         nonlocal transferred
@@ -3411,41 +3493,108 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         speed = done / max(time.monotonic() - started, 0.001)
         progress.update(task, transfer=f"{human_size(done)} · {human_size(speed)}/s")
 
-    def download(entry):
+    def client():
         if make_service is None:
-            client = service
+            return service
+        if not hasattr(clients, "service"):
+            clients.service = make_service()
+        return clients.service
+
+    def transfer(entry):
+        if entry["status"] == "KEEP_BOTH":
+            os.replace(entry["destination"], entry["local_copy"])  # your version steps aside
+            try:
+                download_file_atomically(client(), entry, stop, on_bytes)
+            except BaseException:
+                os.replace(entry["local_copy"], entry["destination"])
+                raise
+            return entry["item"], file_hash(entry["destination"])
+        if entry["status"] in DOWNLOADS:
+            download_file_atomically(client(), entry, stop, on_bytes)
+            return entry["item"], file_hash(entry["destination"])
+        local_sha256 = file_hash(entry["destination"])
+        if entry["status"] == "UPLOAD":
+            item = upload_file(client(), entry["destination"], file_id=effective_id(entry["item"]),
+                               stop=stop, on_bytes=on_bytes)
         else:
-            if not hasattr(clients, "service"):
-                clients.service = make_service()
-            client = clients.service
-        download_file_atomically(client, entry, stop, on_bytes)
-        return file_hash(entry["destination"])
+            parent_id = folder_ids.get(entry["relative_path"].parent, entry.get("parent_id"))
+            if parent_id is None:
+                raise OSError("its folder could not be created on Drive")
+            item = upload_file(client(), entry["destination"], name=entry["relative_path"].name,
+                               parent_id=parent_id, stop=stop, on_bytes=on_bytes)
+        try:
+            set_remote_mtime(entry["destination"], item)  # same date on both sides: the tree marks it ✓
+        except OSError:
+            pass
+        return item, local_sha256
 
     executor = ThreadPoolExecutor(max_workers=max(1, jobs))
     try:
         with progress:
-            futures = {executor.submit(download, entry): entry for entry in downloads}
+            futures = {executor.submit(transfer, entry): entry for entry in transfers}
             for future in as_completed(futures):
                 entry = futures[future]
                 relative = entry["relative_path"].as_posix()
+                status = entry["status"]
                 try:
-                    local_sha256 = future.result()
+                    item, local_sha256 = future.result()
                 except (HttpError, OSError) as error:
                     results["FILE_ERROR"] += 1
                     report("[red]✗[/]", f"{relative}: {error_text(error)}")
                 else:
-                    results[f"FILE_{entry['status']}"] += 1
-                    if entry["status"] == "KEEP_BOTH":
-                        # Not tracked: the copy is yours to compare and resolve, like a local-only file.
-                        report("[bright_yellow]⧉[/]", f"{relative} → {entry['destination'].name}")
+                    results[f"FILE_{status}"] += 1
+                    if entry.get("state_key"):
+                        state["files"].pop(entry["state_key"], None)
+                    record(entry, item, local_sha256)
+                    if status == "KEEP_BOTH":
+                        report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
                     else:
-                        state["files"][state_key(entry["item"], entry["relative_path"])] = state_record(
-                            entry, local_sha256
-                        )
-                        report("[green]✓[/]" if entry["status"] == "NEW" else "[cyan]↻[/]", relative)
+                        mark = {"NEW": "[green]↓[/]", "UPDATE": "[cyan]↓[/]", "UPLOAD_NEW": "[bright_green]↑[/]",
+                                "UPLOAD": "[bright_cyan]↑[/]"}[status]
+                        report(mark, relative)
                 progress.advance(task)
+
+        # 4. Deleted here: Drive's copies go to the Drive trash.
+        trashed = [entry for entry in plan if entry["status"] == "TRASH_REMOTE"]
+        if trashed:
+            failed = trash_items(service, [entry["item"]["id"] for entry in trashed])
+            for entry in trashed:
+                relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
+                error = failed.get(entry["item"]["id"])
+                if error:
+                    results[f"{entry['kind']}_ERROR"] += 1
+                    report("[red]✗[/]", f"{relative}: {error}")
+                else:
+                    results[f"{entry['kind']}_TRASH_REMOTE"] += 1
+                    forget_below(state, entry["relative_path"])
+                    report("[magenta]✗[/]", f"{relative} → Drive trash")
+
+        # 5. Deleted on Drive: your copies go to your system trash; folders left empty by it go too.
+        emptied = set()
+        for entry in plan:
+            if entry["status"] != "TRASH_LOCAL":
+                continue
+            relative = entry["relative_path"]
+            try:
+                trash_local(entry["destination"])
+            except OSError as error:
+                results[f"{entry['kind']}_ERROR"] += 1
+                report("[red]✗[/]", f"{relative.as_posix()}: {error}")
+                continue
+            results[f"{entry['kind']}_TRASH_LOCAL"] += 1
+            forget_below(state, relative)
+            emptied.add(relative.parent)
+            report("[bright_magenta]✗[/]", f"{relative.as_posix()} → your trash")
+        remote_folders = {path for path in folder_ids}
+        for folder in sorted(emptied, key=lambda path: len(path.parts), reverse=True):
+            while folder != Path() and folder not in remote_folders:
+                directory = destination_root / folder
+                if not directory.is_dir() or any(directory.iterdir()):
+                    break
+                directory.rmdir()
+                folder = folder.parent
     except BaseException:
-        stop.set()  # running downloads stop at their next chunk and remove their partial file
+        stop.set()  # running transfers stop at their next chunk; downloads remove their partial file
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
@@ -3453,27 +3602,28 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
     return results
 
 
+# (counters summed, color, singular, plural)
 RESULT_LABELS = [
-    ("FILE_NEW", "green", "downloaded", "downloaded"),
-    ("FILE_UPDATE", "cyan", "updated", "updated"),
-    ("UNCHANGED", "bright_black", "unchanged", "unchanged"),
-    ("FOLDER_NEW", "green", "folder created", "folders created"),
-    ("FILE_REMOVED_REMOTE", "magenta", "removed from Drive, set aside", "removed from Drive, set aside"),
-    ("FILE_KEEP_BOTH", "bright_yellow", "Drive copy saved alongside", "Drive copies saved alongside"),
-    ("CONFLICT", "yellow", "conflict kept", "conflicts kept"),
-    ("LOCAL_ONLY", "blue", "local-only item kept", "local-only items kept"),
-    ("SKIPPED", "bright_black", "skipped", "skipped"),
-    ("ERROR", "red", "error", "errors"),
+    (("FILE_NEW",), "green", "downloaded", "downloaded"),
+    (("FILE_UPDATE",), "cyan", "updated from Drive", "updated from Drive"),
+    (("FILE_UPLOAD_NEW", "FILE_UPLOAD"), "bright_cyan", "sent to Drive", "sent to Drive"),
+    (("FILE_UNCHANGED", "FOLDER_UNCHANGED"), "bright_black", "unchanged", "unchanged"),
+    (("FOLDER_NEW",), "green", "folder created here", "folders created here"),
+    (("FOLDER_UPLOAD_NEW",), "bright_cyan", "folder created on Drive", "folders created on Drive"),
+    (("FILE_TRASH_REMOTE", "FOLDER_TRASH_REMOTE"), "magenta", "moved to the Drive trash", "moved to the Drive trash"),
+    (("FILE_TRASH_LOCAL", "FOLDER_TRASH_LOCAL"), "bright_magenta", "moved to your trash", "moved to your trash"),
+    (("FILE_KEEP_BOTH",), "bright_yellow", "conflict kept both ways", "conflicts kept both ways"),
+    (("FILE_CONFLICT", "FOLDER_CONFLICT"), "yellow", "conflict kept", "conflicts kept"),
+    (("FILE_LOCAL_ONLY", "FOLDER_LOCAL_ONLY"), "blue", "local-only item kept", "local-only items kept"),
+    (("FILE_SKIPPED", "FOLDER_SKIPPED"), "bright_black", "skipped", "skipped"),
+    (("FILE_ERROR", "FOLDER_ERROR"), "red", "error", "errors"),
 ]
 
 
 def results_summary(results):
     parts = []
-    for key, style, singular, plural_label in RESULT_LABELS:
-        if key.startswith(("FILE_", "FOLDER_")):
-            count = results[key]
-        else:
-            count = results[f"FILE_{key}"] + results[f"FOLDER_{key}"]
+    for keys, style, singular, plural_label in RESULT_LABELS:
+        count = sum(results[key] for key in keys)
         if count:
             parts.append(f"[{style}]{count} {singular if count == 1 else plural_label}[/]")
     return " · ".join(parts) or "[dim]nothing to do[/]"
@@ -3483,101 +3633,9 @@ def print_results(results):
     console.print(f"[bold]Done[/]  {results_summary(results)}")
 
 
-# --- Set-aside files (removed from Drive) ---------------------------------------
-# On disk they stay in RECOVERY_DIR_NAME, one folder per download; the interface calls them "Removed from Drive".
-
-RECOVERY_RUN_FORMAT = "%Y%m%d-%H%M%S"
-
-
-def recovery_runs(destination_root):
-    """One entry per run that moved files to recovery: path, date, files, bytes, oldest first."""
-    root = destination_root / RECOVERY_DIR_NAME
-    if not root.is_dir():
-        return []
-    runs = []
-    for run in root.iterdir():
-        if not run.is_dir():
-            continue
-        try:
-            moment = datetime.strptime(run.name, RECOVERY_RUN_FORMAT)
-        except ValueError:
-            moment = datetime.fromtimestamp(run.stat().st_mtime)
-        files = [path for path in run.rglob("*") if path.is_file()]
-        runs.append({
-            "path": run,
-            "date": moment,
-            "files": files,
-            "bytes": sum(path.stat().st_size for path in files),
-        })
-    return sorted(runs, key=lambda run: run["date"])
-
-
-def recovery_note(destination_root, interactive=False):
-    runs = recovery_runs(destination_root)
-    files = sum(len(run["files"]) for run in runs)
-    if not files:
-        return None
-    size = human_size(sum(run["bytes"] for run in runs))
-    where = 'the "Removed from Drive" tab' if interactive else "--removed"
-    return (
-        f"{plural(files, 'file')} removed from Drive set aside ({size}): {where} puts them back or deletes them."
-    )
-
-
-def show_recovery(destination_root):
-    runs = recovery_runs(destination_root)
-    if not runs:
-        console.print("[dim]Nothing set aside: no downloaded file was removed from Drive.[/]")
-        return
-    console.print(
-        "[dim]Files removed from Drive, set aside by earlier downloads instead of being deleted; "
-        "the tree's Removed from Drive tab puts them back.[/]\n"
-    )
-    for run in runs:
-        console.print(
-            f"[bold]{run['date']:%Y-%m-%d %H:%M}[/]  [dim]{plural(len(run['files']), 'file')} · "
-            f"{human_size(run['bytes'])}[/]"
-        )
-        for path in run["files"]:
-            console.print(f"  {escape(path.relative_to(run['path']).as_posix())}", highlight=False)
-    files = sum(len(run["files"]) for run in runs)
-    console.print(
-        f"\n[dim]{plural(files, 'file')} · {human_size(sum(run['bytes'] for run in runs))} in "
-        f"{escape(str(destination_root / RECOVERY_DIR_NAME))}[/]"
-    )
-
-
-def empty_recovery(destination_root, older_than=None, assume_yes=False):
-    """Delete set-aside files (only those older than older_than days, if given), after confirmation."""
-    runs = recovery_runs(destination_root)
-    if older_than is not None:
-        cutoff = datetime.now() - timedelta(days=older_than)
-        runs = [run for run in runs if run["date"] < cutoff]
-    files = sum(len(run["files"]) for run in runs)
-    if not runs:
-        console.print("[dim]Nothing set aside to delete.[/]")
-        return
-    what = f"{plural(files, 'set-aside file')} ({human_size(sum(run['bytes'] for run in runs))})"
-    if older_than is not None:
-        what += f" set aside more than {plural(older_than, 'day')} ago"
-    if not assume_yes:
-        console.print(f"[yellow]![/] This permanently deletes {what}.")
-        answer = console.input("  Type [bold]empty[/] to confirm: ").strip()
-        if answer != "empty":
-            console.print("[dim]Cancelled. Nothing was deleted.[/]")
-            return
-    for run in runs:
-        shutil.rmtree(run["path"])
-    root = destination_root / RECOVERY_DIR_NAME
-    if root.is_dir() and not any(root.iterdir()):
-        root.rmdir()
-    console.print(f"[green]✓[/] Deleted {what}.")
-
-
 # --- Main ------------------------------------------------------------------
 
-def run_downloads(args, service, make_service, plan, selections, scopes, roots, destination_root, state, cache,
-                  token):
+def run_sync(args, service, make_service, plan, selections, scopes, roots, destination_root, state, cache, token):
     """Apply a confirmed plan, save the selection for --again and the Drive snapshot, print the result."""
     remember_selection(state, selections, scopes, roots)
     results = apply_plan(service, plan, destination_root, state, args.jobs, make_service)
@@ -3587,35 +3645,81 @@ def run_downloads(args, service, make_service, plan, selections, scopes, roots, 
         + [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
     )
     if not has_actions(plan):
-        console.print("[green]✓[/] Everything is up to date.")
+        console.print("[green]✓[/] Everything is in sync.")
     else:
         print_results(results)
-    note = recovery_note(destination_root, interactive=not (args.yes or args.again))
-    if note:
-        console.print(f"[dim]{escape(note)}[/]")
     return results
 
 
-def result_notice(plan, results, destination_root):
-    """The last download's result, shown above the tree when it comes back."""
+def confirm_in_terminal(args, plan, state):
+    """The terminal preview's answer: always yes with --yes, unless it deletes too much."""
+    if needs_deletion_check(plan, state):
+        count, _ = deletion_count(plan, state)
+        if args.yes and not args.allow_deletions:
+            console.print(
+                f"[red]✗[/] This sync deletes {plural(count, 'file')}: refused with --yes. Check it in the "
+                "preview, or add --allow-deletions."
+            )
+            raise SystemExit(1)
+        if not args.yes:
+            console.print(f"[yellow]![/] This sync deletes {plural(count, 'file')}.")
+            if console.input("  Type [bold]delete[/] to go on: ").strip() != "delete":
+                console.print("[dim]Cancelled. Nothing was changed.[/]")
+                return False
+            return True
+    if args.yes or not has_actions(plan):
+        return True
+    if console.input("\nProceed? [y/N] ").strip().lower() not in {"y", "yes"}:
+        console.print("[dim]Cancelled. Nothing was changed.[/]")
+        return False
+    return True
+
+
+def changes_drive(plan):
+    return any(entry["status"] in UPLOADS | {"TRASH_REMOTE"} for entry in plan)
+
+
+def last_sync_summary(plan):
+    """One line for the start: how far the last selection is from being in sync."""
+    # Files only for transfers (a new folder comes with its files); deletions count a whole folder once.
+    counts = Counter(
+        entry["status"] for entry in plan
+        if entry["kind"] == "FILE" or entry["status"] in DELETIONS | {"CONFLICT"}
+    )
+    text = Text()
+    if not has_actions(plan) and not counts["CONFLICT"]:
+        text.append("✓ ", style="green")
+        text.append("Your last selection is in sync.", style="dim")
+        return text
+    parts = [
+        (counts["NEW"] + counts["UPDATE"], "↓ to download", "green"),
+        (counts["UPLOAD_NEW"] + counts["UPLOAD"], "↑ to send", "bright_cyan"),
+        (counts["TRASH_REMOTE"], "deleted here", "magenta"),
+        (counts["TRASH_LOCAL"], "deleted on Drive", "bright_magenta"),
+        (counts["CONFLICT"], "conflict" if counts["CONFLICT"] == 1 else "conflicts", "yellow"),
+    ]
+    text.append("Since the last sync: ", style="bold")
+    text.append_text(Text(" · ").join(Text(f"{count} {label}", style=style) for count, label, style in parts if count))
+    text.append("   ")
+    text.append("s", style="bold #f59e0b")
+    text.append(" to review and sync", style="dim")
+    return text
+
+
+def result_notice(plan, results):
+    """The last sync's result, shown above the tree when it comes back."""
     text = Text()
     if has_actions(plan):
         text.append("Done  ", style="bold")
         text.append_text(Text.from_markup(results_summary(results)))
     else:
         text.append("✓ ", style="green")
-        text.append("Everything was up to date.")
-    text.append(f"  → {short_path(destination_root)}", style="dim")
-    note = recovery_note(destination_root, interactive=True)
-    if note:
-        text.append(f"\n{note}", style="dim")
+        text.append("Everything was in sync.")
     return text
 
 
-# --- Main ------------------------------------------------------------------
-
 def resolve_destination(path_text):
-    """The download folder: new (created), empty, or already managed by GDrive Pull."""
+    """The local folder: new (created), empty, or already managed by SaveGDrive."""
     destination = Path(path_text).expanduser()
     if not destination.is_absolute():
         destination = Path.cwd() / destination
@@ -3625,13 +3729,13 @@ def resolve_destination(path_text):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="gdrivepull",
+        prog="savegdrive",
         description=(
-            "Download files and folders from Google Drive into a managed local folder.\n"
-            "Pick them in a terminal tree, review the preview, then confirm: local changes\n"
-            "are never overwritten and nothing is deleted (files removed from Drive are set aside\n"
-            "in Removed from Drive). Downloads only read Drive; the tree can also move items to the\n"
-            "Drive trash, and the Trash view restores, deletes or empties it, always after a confirmation."
+            "Sync Google Drive folders and files with a local folder, both ways. Pick them in a\n"
+            "terminal tree, review the preview, then confirm. A file changed on both sides is a\n"
+            "conflict, never overwritten, and nothing is deleted for good: what you delete on one\n"
+            "side goes to the trash of the other (the Drive trash, or your system trash). The tree\n"
+            "also moves items to the Drive trash; the Trash view restores, deletes or empties it."
         ),
         epilog="keys:\n" + "\n".join(help_lines()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3640,7 +3744,7 @@ def main():
         "--download-path",
         metavar="PATH",
         default=DOWNLOAD_PATH,
-        help="Download folder (default: %(default)s); new, empty or already managed by GDrive Pull.",
+        help="Local folder (default: %(default)s); new, empty or already managed by SaveGDrive.",
     )
     parser.add_argument(
         "--folder-id",
@@ -3651,38 +3755,23 @@ def main():
     parser.add_argument(
         "--again",
         action="store_true",
-        help="Download the previous selection again, without the tree (with --yes: no prompt at all).",
+        help="Sync the previous selection again, without the tree (with --yes: no prompt at all, e.g. from cron).",
     )
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Apply the preview without asking for confirmation, then exit after the download.",
+        help="Apply the preview without asking for confirmation, then exit after the sync.",
     )
     parser.add_argument(
         "--keep-both",
         action="store_true",
-        help="Save the Drive version of conflicts next to the local file, as 'name (Drive).ext'.",
-    )
-    removed = parser.add_mutually_exclusive_group()
-    removed.add_argument(
-        "--removed",
-        "--recovery",
-        dest="removed",
-        action="store_true",
-        help="List the files removed from Drive that downloads set aside, then exit.",
-    )
-    removed.add_argument(
-        "--empty-removed",
-        "--empty-recovery",
-        dest="empty_removed",
-        action="store_true",
-        help="Delete the set-aside files for good, after typing empty (no prompt with --yes), then exit.",
+        help="Keep both versions of conflicts: yours renamed 'name (local).ext', Drive's in its place.",
     )
     parser.add_argument(
-        "--older-than",
-        type=int,
-        metavar="DAYS",
-        help="With --empty-removed: only delete files set aside more than DAYS days ago.",
+        "--allow-deletions",
+        action="store_true",
+        help=f"With --yes: also apply a sync that deletes more than {MASS_DELETION_FILES} files or a quarter "
+        "of the synced ones (refused otherwise).",
     )
     parser.add_argument(
         "--jobs",
@@ -3690,7 +3779,7 @@ def main():
         default=4,
         choices=range(1, 17),
         metavar="N",
-        help="Files downloaded at the same time, 1 to 16 (default: 4).",
+        help="Files sent or downloaded at the same time, 1 to 16 (default: 4).",
     )
     parser.add_argument(
         "--verbose",
@@ -3698,8 +3787,6 @@ def main():
         help="Show sign-in, token and API details, and list unchanged items in the preview.",
     )
     args = parser.parse_args()
-    if args.older_than is not None and not args.empty_removed:
-        parser.error("--older-than only works with --empty-removed")
     global VERBOSE
     VERBOSE = args.verbose
 
@@ -3712,13 +3799,6 @@ def main():
                 "  [dim]Choose another folder with --download-path PATH.[/]"
             )
             raise SystemExit(1)
-
-        if args.removed:
-            show_recovery(destination_root)
-            return
-        if args.empty_removed:
-            empty_recovery(destination_root, args.older_than, args.yes)
-            return
 
         creds = authenticate()
 
@@ -3750,6 +3830,9 @@ def main():
             who = f"{escape(account)} " if account else ""
             console.print(f"[bold]Again[/]  {names}{more} [dim]{who}→ {escape(str(destination_root))}[/]")
             roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
+            upload_roots = {
+                base: (None if root_id in {SHARED_WITH_ME, TRASH} else root_id) for root_id, base in roots
+            }
             with console.status("[dim]Comparing with local files…[/]") as status:
                 checked = 0
 
@@ -3759,21 +3842,20 @@ def main():
                     if checked % 25 == 0:
                         status.update(f"[dim]Comparing with local files… {checked}[/]")
 
-                plan = build_plan(service, selections, local_scopes, destination_root, state, cache, on_item)
+                plan = build_plan(
+                    service, selections, local_scopes, destination_root, state, cache, on_item, upload_roots
+                )
             if args.keep_both:
                 set_keep_both(plan, plan, True)
             if args.yes or not interactive:
                 print_plan(plan, destination_root)
-                if not args.yes and has_actions(plan):
-                    answer = console.input("\nProceed? [y/N] ").strip().lower()
-                    if answer not in {"y", "yes"}:
-                        console.print("[dim]Cancelled. No files were changed.[/]")
-                        return
-            elif not PreviewApp(plan, destination_root, account).run():
-                console.print("[dim]Cancelled. No files were changed.[/]")
+                if not confirm_in_terminal(args, plan, state):
+                    return
+            elif not PreviewApp(plan, destination_root, account, state).run():
+                console.print("[dim]Cancelled. Nothing was changed.[/]")
                 return
-            results = run_downloads(args, service, make_service, plan, selections, local_scopes, roots, destination_root,
-                          state, cache, token)
+            results = run_sync(args, service, make_service, plan, selections, local_scopes, roots,
+                               destination_root, state, cache, token)
             if results["FILE_ERROR"] or results["FOLDER_ERROR"]:
                 raise SystemExit(1)
             return
@@ -3791,7 +3873,7 @@ def main():
             load_view(service, views[0], cache, on_progress)
         debug(f"Loaded {plural(len(views[0].nodes), 'item')} in {plural(len(cache), 'folder')}")
 
-        # Like GMAIL, the tree comes back after each download, with its result on top, until q / esc.
+        # Like GMAIL, the tree comes back after each sync, with its result on top, until q / esc.
         view, sort, notice, failed = views[0], "name", None, False
         while True:
             app = DriveSelectorApp(
@@ -3805,18 +3887,30 @@ def main():
                 break
             plan, selections, local_scopes = result["plan"], result["selections"], result["scopes"]
             destination_root, state = result["destination"], result["state"]
-            roots = [
-                (view_.root_id, view_.base) for view_ in views
-                if view_.nodes and fully_selected(view_.browsed.get(view_.base, []), view_.base, selections)
-            ]
+            roots = result.get("roots")  # from s: the last selection's own
+            if roots is None:
+                roots = [
+                    (view_.root_id, view_.base) for view_ in views
+                    if view_.nodes and fully_selected(view_.browsed.get(view_.base, []), view_.base, selections)
+                ]
             if args.yes:
                 print_plan(plan, destination_root)
-            results = run_downloads(args, service, make_service, plan, selections, local_scopes, roots,
-                                    destination_root, state, cache, token)
+                if not confirm_in_terminal(args, plan, state):
+                    break
+            results = run_sync(args, service, make_service, plan, selections, local_scopes, roots,
+                               destination_root, state, cache, token)
             failed = failed or bool(results["FILE_ERROR"] or results["FOLDER_ERROR"])
             if args.yes:
                 break
-            notice = result_notice(plan, results, destination_root)
+            notice = result_notice(plan, results)
+            if changes_drive(plan):
+                # Drive changed under the loaded tree: list it again before the next round.
+                token = start_page_token(service)
+                cache.clear()
+                TRASHED_FOLDERS.clear()
+                for view_ in views:
+                    view_.nodes, view_.error, view_.sorted_by = None, None, "name"
+                load_view(service, view, cache)
         if failed:
             raise SystemExit(1)
     except KeyboardInterrupt:

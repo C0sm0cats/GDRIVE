@@ -13,11 +13,11 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import gdrivepull  # noqa: E402
+import savegdrive  # noqa: E402
 
-COLUMNS, ROWS = 110, 25
+COLUMNS, ROWS = 110, 27
 OUT = os.path.join(ROOT, "docs", "screenshot.svg")
-FOLDER = gdrivepull.FOLDER_MIME_TYPE
+FOLDER = savegdrive.FOLDER_MIME_TYPE
 
 
 def demo_nodes():
@@ -48,7 +48,7 @@ def demo_nodes():
         if size:
             item["size"] = str(size)
         relative_parent = Path() if parent is None else (
-            nodes[parent]["relative_parent"] / gdrivepull.local_name(nodes[parent]["item"]))
+            nodes[parent]["relative_parent"] / savegdrive.local_name(nodes[parent]["item"]))
         display = name if parent is None else f"{nodes[parent]['display_path']}/{name}"
         nodes.append({"index": index, "parent": parent, "item": item,
                       "relative_parent": relative_parent, "display_path": display})
@@ -109,13 +109,20 @@ def plain_svg(svg):
     return svg.replace("<svg ", f'<svg width="{width}" height="{height}" ', 1)
 
 
+def demo_last_sync():
+    def entry(status, kind="FILE"):
+        return {"status": status, "kind": kind}
+
+    return [entry("UPDATE"), entry("NEW"), entry("UPLOAD"), entry("TRASH_REMOTE"), entry("UNCHANGED")]
+
+
 async def render():
     nodes = demo_nodes()
-    my_drive = gdrivepull.DriveView("My Drive", "root")
+    my_drive = savegdrive.DriveView("My Drive", "root")
     my_drive.load(nodes, {})
-    views = [my_drive, gdrivepull.DriveView("Shared with me", gdrivepull.SHARED_WITH_ME),
-             gdrivepull.DriveView("Team", "team"), gdrivepull.DriveView("Trash", gdrivepull.TRASH)]
-    app = gdrivepull.DriveSelectorApp(views, Path.home() / "GDrive", account="you@gmail.com")
+    views = [my_drive, savegdrive.DriveView("Shared with me", savegdrive.SHARED_WITH_ME),
+             savegdrive.DriveView("Team", "team"), savegdrive.DriveView("Trash", savegdrive.TRASH)]
+    app = savegdrive.DriveSelectorApp(views, Path.home() / "GDrive", account="you@gmail.com")
     # Marks as after an earlier download: Taxes up to date, one file changed on Drive, one edited locally.
     by_name = {entry["item"]["name"]: entry["index"] for entry in nodes}
     my_drive.marks = {by_name["2025 return.pdf"]: "synced", by_name["Receipts.zip"]: "synced",
@@ -129,10 +136,12 @@ async def render():
         for name in ("Photos", "Meeting notes"):
             app.add_entry(by_name[name])
         app.refresh_node_labels()
+        app.last_sync_text = savegdrive.last_sync_summary(demo_last_sync())  # as checked at start
+        app.update_notice()
         await pilot.pause()
         app.query_one("#drive-tree").move_cursor(app.tree_nodes[by_name["Lease agreement.pdf"]["index"]])
         await pilot.pause()
-        return app.export_screenshot(title="gdrivepull")
+        return app.export_screenshot(title="savegdrive")
 
 
 if __name__ == "__main__":
