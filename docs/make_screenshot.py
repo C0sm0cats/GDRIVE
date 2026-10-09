@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import gdrivepull  # noqa: E402
 
-COLUMNS, ROWS = 124, 23
+COLUMNS, ROWS = 110, 25
 OUT = os.path.join(ROOT, "docs", "screenshot.svg")
 FOLDER = gdrivepull.FOLDER_MIME_TYPE
 
@@ -114,8 +114,8 @@ async def render():
     my_drive = gdrivepull.DriveView("My Drive", "root")
     my_drive.load(nodes, {})
     views = [my_drive, gdrivepull.DriveView("Shared with me", gdrivepull.SHARED_WITH_ME),
-             gdrivepull.DriveView("Team", "team"), gdrivepull.DriveView("Family", "family")]
-    app = gdrivepull.DriveSelectorApp(views, Path.home() / "GDrive")
+             gdrivepull.DriveView("Team", "team"), gdrivepull.DriveView("Trash", gdrivepull.TRASH)]
+    app = gdrivepull.DriveSelectorApp(views, Path.home() / "GDrive", account="you@gmail.com")
     # Marks as after an earlier download: Taxes up to date, one file changed on Drive, one edited locally.
     by_name = {entry["item"]["name"]: entry["index"] for entry in nodes}
     my_drive.marks = {by_name["2025 return.pdf"]: "synced", by_name["Receipts.zip"]: "synced",

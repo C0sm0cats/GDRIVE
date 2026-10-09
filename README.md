@@ -1,11 +1,11 @@
 # GDrive Pull
 
-GDrive Pull is an interactive, read-only Google Drive downloader for Linux and
-other POSIX environments. You pick files and folders in a colored terminal
-tree, review a preview of every local change, then confirm. Local edits are
-never overwritten and nothing is deleted.
+GDrive Pull is an interactive Google Drive downloader for Linux and other POSIX
+environments. You pick files and folders in a colored terminal tree, review a
+preview of every local change, then confirm. Local edits are never overwritten
+and nothing local is deleted. The same tree also manages the Drive trash.
 
-![GDrive Pull in the terminal: the Drive tree with folder totals, file sizes, dates and export formats, two selected items and the key bar](docs/screenshot.svg)
+![GDrive Pull in the terminal: the Drive tree with folder totals, file sizes, dates and export formats, views as tabs, two selected items and every key, grouped under the tree](docs/screenshot.svg)
 
 ## Features
 
@@ -18,7 +18,7 @@ never overwritten and nothing is deleted.
   `Tab`
 - Multi-selection of files and folders at any depth, across views; a
   selected folder includes everything below it
-- `/` filter by name or path, `o` opens the item in Google Drive, `f` changes
+- `z` / `m` sort by size or date, `/` filter by name or path, `o` opens the item in Google Drive, `f` changes
   the download folder for the session, `?` shows the key help
 - `--again` downloads the previous selection without the tree, replaying only
   the Drive changes since the last run; with `--yes` it runs unattended, for
@@ -33,12 +33,19 @@ never overwritten and nothing is deleted.
 - Google Docs, Sheets, Slides, Drawings and Apps Script exported to local
   formats
 - Local change detection through checksums and a managed state file
-- Files removed from Drive go to a recovery folder instead of being deleted
+- Conflicts can be kept both ways: the Drive version is saved next to your
+  local copy as `name (Drive).ext`
+- Files removed from Drive are set aside on your disk instead of being
+  deleted; the Removed from Drive tab puts them back or deletes them
 - Unknown local files and folders are preserved
 - Drive shortcuts followed to their target files and folders
 - Parallel downloads (4 at a time by default), with a progress bar, the
   amount downloaded and the speed, a ✓ / ✗ line per file and a final summary
-- Compact browser sign-in with a clickable link, read-only Drive OAuth scope
+- Drive trash management: `x` moves items to the Drive trash; the Trash view
+  restores them (`r`), deletes them forever (`x`) or empties the trash
+  (`shift+t`), always after a confirmation
+- Compact browser sign-in with a clickable link; the header shows the
+  signed-in account and the download folder
 
 ## Repository contents
 
@@ -131,7 +138,11 @@ revoked, the browser sign-in comes back.
 | `--download-path PATH` | Download folder (default: `~/GDrive`); new, empty or already managed |
 | `--folder-id ID` | Browse this Drive folder instead of the root of My Drive |
 | `--again` | Download the previous selection again, without the tree |
-| `--yes` | Apply the preview without asking for confirmation |
+| `--yes` | Apply the preview without asking for confirmation, then exit after the download |
+| `--keep-both` | Save the Drive version of conflicts next to the local file, as `name (Drive).ext` |
+| `--removed` | List the files removed from Drive that downloads set aside, then exit (old name: `--recovery`) |
+| `--empty-removed` | Delete the set-aside files for good, after typing `empty` (no prompt with `--yes`), then exit (old name: `--empty-recovery`) |
+| `--older-than DAYS` | With `--empty-removed`: only delete files set aside more than `DAYS` days ago |
 | `--jobs N` | Files downloaded at the same time, 1 to 16 (default: 4) |
 | `--verbose` | Show sign-in, token and API details, and list unchanged items in the preview |
 
@@ -140,22 +151,12 @@ revoked, the browser sign-in comes back.
 The tree supports keyboard and mouse navigation. Press `?` for the same key
 help, or run `./run-gdrivepull.sh --help`.
 
-| Key | Action |
-| --- | --- |
-| `Up` / `Down` | Move through the tree |
-| `Tab` / `Shift+Tab` | Next / previous view: My Drive, Shared with me, each shared drive |
-| `Left` / `Right` | Collapse / expand a folder, or go to the parent folder / first child |
-| `Enter` | Expand or collapse a folder |
-| `Space` | Select or unselect an item |
-| `A` | Select all, or unselect all when everything is already selected (only the matching items while a filter is active) |
-| `C` | Unselect everything, including items hidden by the filter |
-| `E` | Expand or collapse everything below the cursor |
-| `/` | Filter by name or path: `Enter` keeps the filter, `Esc` clears it |
-| `O` | Open the item in Google Drive |
-| `F` | Change the download folder for this session: pick a parent directory, name the folder, `Ctrl+S` to apply, `Esc` to cancel |
-| `D` | Compare with the download folder and show the preview |
-| `?` | Key help |
-| `Q` / `Esc` | Quit |
+All the keys are listed in [Keys](#keys).
+
+After a download, the tree comes back with the result on top, the marks up to
+date and nothing selected; the view, the sort and the open folders are kept.
+Pick something else, or quit with `q` / `Esc`. With `--yes` or `--again`,
+GDrive Pull downloads once and exits.
 
 Folders show their number of files and their total size; files show their size,
 their modification date (time only for today), and the local format of
@@ -178,7 +179,8 @@ Changing the folder with `F` updates the marks for the new destination.
 ### Views
 
 `Tab` switches between My Drive, Shared with me (the items others shared with
-you) and each shared drive you are a member of. A view is loaded the first time
+you), each shared drive you are a member of, Trash (what you moved to the
+Drive trash), and Removed from Drive (local files set aside, see below). A view is loaded the first time
 it is shown; the tabs show how many items are selected in each. Selections are
 kept across views and downloaded together:
 
@@ -186,24 +188,178 @@ kept across views and downloaded together:
 <download folder>/                     My Drive
 <download folder>/Shared with me/      Shared with me
 <download folder>/Shared drives/Team/  the shared drive "Team"
+<download folder>/Trash/               Trash
 ```
 
+### Drive trash
+
+Google Drive changes only on request, always after a confirmation:
+
+| Where | Key | On Drive |
+| --- | --- | --- |
+| Any view but Trash | `x` | Move the selection, or the item under the cursor, to the Drive trash |
+| Trash | `r` | Restore the selection, or the item under the cursor, where it was |
+| Trash | `x` | Delete forever, after typing `delete` |
+| Trash | `shift+t` | Empty the whole Drive trash, after typing `empty` |
+
+After a change, the views are reloaded from Drive and the selection is cleared.
+The Trash view shows what you trashed yourself; what was inside a trashed
+folder shows below it. Items can be downloaded from there too.
+
+This needs full Drive access, like GMAIL needs full Gmail access: the first
+run after an update from a read-only version asks you to sign in again and
+allow it. Downloads themselves never change anything on Drive.
+
 With `--folder-id`, only that folder is shown.
+
+Folders always come first. Sorted by size, a folder counts the size of
+everything below it; sorted by date, its newest file. Items without a size or
+date come last. The sort applies to every view and is shown under the tree.
 
 The filter keeps the matching items, their parent folders, and everything
 below a matching folder. Selections hidden by the filter are kept.
 
-## Preview and synchronization behavior
+## Keys
 
-`D` compares the selection with the download folder and opens the preview:
-the plan, a summary by status, and notes about conflicts and recovery.
-Nothing has changed on disk yet.
+Each screen shows its keys at the bottom, grouped on several lines; `?` in the
+tree and `./run-gdrivepull.sh --help` list them all with these descriptions.
+
+### In the tree
 
 | Key | Action |
 | --- | --- |
-| `Y` | Download |
-| `V` | Show the changes (default), everything, or one status at a time |
-| `Esc` / `N` | Back to the tree, selection kept |
+| `↑` `↓` | Move |
+| `←` `→` | Collapse / expand a folder, or go to the parent folder / first child |
+| `enter` | Collapse / expand a folder |
+| `e` | Expand the whole view; again: collapse it all (shift+space: below the cursor) |
+| `pgup` `pgdn` | Scroll a page (home / end: top / bottom) |
+| `tab` | Next view: My Drive, Shared with me, each shared drive, Trash, Removed from Drive |
+| `shift+tab` | Previous view |
+| `/` | Filter by name or path |
+| `z` | Sort by size, biggest first; again: by name |
+| `m` | Sort by date, newest first; again: by name |
+| `space` | Select / unselect (a selected folder includes everything below it) |
+| `a` | Select all, or unselect all when everything is selected (with a filter: the matches) |
+| `c` | Unselect everything, including items hidden by the filter or in other views |
+| `x` | Move the selection (or the item under the cursor) to the Drive trash |
+| `d` | Compare with the download folder and open the preview |
+| `f` | Change the download folder for this session |
+| `o` | Open the item under the cursor in Google Drive |
+| `?` | Show the key help |
+| `q` `esc` | Quit (esc first closes the filter); after a download, the tree comes back |
+
+### In the Trash view
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | Move |
+| `←` `→` | Collapse / expand a folder, or go to the parent folder / first child |
+| `enter` | Collapse / expand a folder |
+| `e` | Expand the whole view; again: collapse it all (shift+space: below the cursor) |
+| `pgup` `pgdn` | Scroll a page (home / end: top / bottom) |
+| `tab` | Next view: My Drive, Shared with me, each shared drive, Trash, Removed from Drive |
+| `shift+tab` | Previous view |
+| `/` | Filter by name or path |
+| `z` | Sort by size, biggest first; again: by name |
+| `m` | Sort by date, newest first; again: by name |
+| `space` | Select / unselect (a selected folder includes everything below it) |
+| `a` | Select all, or unselect all when everything is selected (with a filter: the matches) |
+| `c` | Unselect everything, including items hidden by the filter or in other views |
+| `r` | Restore the selection (or the item under the cursor) on Drive |
+| `x` | Delete the selection (or the item under the cursor) forever, after typing delete |
+| `shift+t` | Empty the whole Drive trash, after typing empty |
+| `d` | Compare with the download folder and open the preview |
+| `f` | Change the download folder for this session |
+| `o` | Open the item under the cursor in Google Drive |
+| `?` | Show the key help |
+| `q` `esc` | Quit (esc first closes the filter); after a download, the tree comes back |
+
+### In Removed from Drive
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | Move (pgup / pgdn, home / end: by page, to the top / bottom) |
+| `tab` | Next view |
+| `shift+tab` | Previous view |
+| `r` | Put the file back at its place in the download folder (never over another file) |
+| `x` | Delete the file under the cursor from your disk, for good |
+| `shift+x` | Delete every set-aside file, after typing empty |
+| `o` | Open the folder holding the set-aside files in your file manager |
+| `d` | Compare the selection from the other views and open the preview |
+| `f` | Change the download folder for this session |
+| `?` | Show the key help |
+| `q` `esc` | Quit |
+
+### While typing a filter
+
+| Key | Action |
+| --- | --- |
+| `enter` | Keep the filter and go back to the tree |
+| `esc` | Clear the filter |
+
+### In the preview
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | Move (pgup / pgdn, home / end: by page, to the top / bottom) |
+| `tab` | Next filter tab: Changes, Everything, then one tab per status |
+| `shift+tab` | Previous filter tab |
+| `b` | Keep both versions of the conflict under the cursor: the Drive one as 'name (Drive).ext' |
+| `shift+b` | Keep both for every conflict; again: undo |
+| `y` | Download: apply the preview |
+| `esc` `n` | Back to the tree, selection kept |
+
+### In the preview of --again
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | Move (pgup / pgdn, home / end: by page, to the top / bottom) |
+| `tab` | Next filter tab |
+| `shift+tab` | Previous filter tab |
+| `b` | Keep both versions of the conflict under the cursor |
+| `shift+b` | Keep both for every conflict; again: undo |
+| `y` | Download: apply the preview |
+| `esc` `n` `q` | Cancel: nothing is downloaded |
+
+### In the folder screen (f)
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` `enter` | Pick a parent directory in the tree (space: unfold it) |
+| `tab` | Next field: parent directory, folder name, buttons |
+| `ctrl+s` | Apply: use this folder for the session |
+| `esc` | Cancel |
+
+### In a confirmation
+
+| Key | Action |
+| --- | --- |
+| `y` | Yes (or type the word asked, then enter) |
+| `n` `esc` | No: nothing changes |
+
+### In this help
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | Scroll |
+| `esc` `?` `q` | Close (enter or a click too) |
+
+Nothing changes on disk before the preview is confirmed. The mouse works too: click to move, click a folder's arrow to unfold it.
+
+## Preview and synchronization behavior
+
+`D` compares the selection with the download folder and opens the preview:
+the plan, a summary by status, the amount to download next to the free disk
+space, and notes about conflicts and files removed from Drive. Nothing has
+changed on disk yet.
+
+Google Docs, Sheets and Slides have no size before export: they are counted
+apart. When the known size exceeds the free space, the line turns red; you can
+still go back and select less.
+
+Keys: `Y` downloads, `Tab` / `Shift+Tab` switch the filter tabs (Changes, Everything,
+then one tab per status), `B` keeps both versions of a conflict (`Shift+B`: all),
+`Esc` goes back to the tree. All of them are in [Keys](#keys).
 
 When nothing needs to change, `Y` only saves the state. With `--yes`, the
 preview is printed and applied without asking.
@@ -214,17 +370,48 @@ preview is printed and applied without asking.
 | `update` | Drive changed and the local copy still matches the previous state | Replace atomically |
 | `unchanged` | Drive and local content match | Skip |
 | `conflict` | Local content changed or cannot be matched safely | Preserve and skip |
-| `removed from Drive` | A tracked, unchanged local file was removed from Drive | Move to recovery |
+| `removed from Drive` | A downloaded, unchanged local file was removed from Drive | Set aside (see below) |
 | `local only` | The local item is unknown to GDrive Pull | Preserve and skip |
+| `keep both` | A conflict whose Drive version is saved next to the local file | Download as `name (Drive).ext` |
 | `skipped` | The Drive format is unsupported, or a shortcut loops back to a parent folder | Skip |
 
-Tracked files removed from Drive are moved to:
+GDrive Pull never permanently deletes local content on its own.
 
-```text
-<managed-destination>/.gdrivepull-recovery/<timestamp>/
+The Drive copies saved by keep both (`name (Drive).ext`, or `(Drive 2)`... when
+taken) are not tracked: compare them with your file, keep the one you want, and
+the next run sees the result. Two Drive files with the same name in a folder
+are conflicts too; keep both saves each of them.
+
+### Removed from Drive
+
+When a file you downloaded is removed from Drive (from the web, your phone or
+the `x` key), the next download of its folder does not delete your copy: it
+sets it aside, so the download folder stays a mirror of Drive and nothing is
+lost. A file you changed locally is never set aside: it stays as a conflict.
+
+The **Removed from Drive** tab, the last one, lists these files with the date
+they were set aside and their place in the download folder; the tab shows how
+many there are. There:
+
+| Key | Action |
+| --- | --- |
+| `r` | Put the file back at its place in the download folder, never over another file. GDrive Pull leaves it alone from then on: it shows as local only |
+| `x` | Delete the file from your disk, for good, after `y` |
+| `shift+x` | Delete every set-aside file, after typing `empty` |
+| `o` | Open the folder that holds them in your file manager |
+
+On disk they live in `.gdrivepull-recovery/<date>/` inside the download folder
+(hidden, so it never mixes with your Drive content). This is not the Drive
+trash: these files are only on your disk. From the command line:
+
+```bash
+./run-gdrivepull.sh --removed                                 # list them
+./run-gdrivepull.sh --empty-removed                           # delete them all, after typing "empty"
+./run-gdrivepull.sh --empty-removed --older-than 30 --yes     # e.g. from cron
 ```
 
-GDrive Pull never permanently deletes local content.
+These commands work on the download folder (`--download-path`) and need no
+sign-in.
 
 Files are downloaded in parallel (`--jobs`, 4 by default), each thread with its
 own Drive connection. The progress bar shows the files done, the amount
@@ -298,7 +485,7 @@ The download folder contains:
 
 The state file also keeps the last selection, for `--again`.
 
-The `.gdrivepull-recovery/` directory is created only when tracked local
+The `.gdrivepull-recovery/` directory (Removed from Drive) is created only when tracked local
 content removed from Drive needs to be preserved.
 
 ## Troubleshooting
