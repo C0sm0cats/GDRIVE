@@ -1,35 +1,48 @@
 # GDrive Pull
 
 GDrive Pull is an interactive, read-only Google Drive downloader for Linux and
-other POSIX environments. It lets you select files and folders from a colored,
-collapsible terminal tree, previews every local change, and protects existing
-data from silent overwrites or deletions.
+other POSIX environments. You pick files and folders in a colored terminal
+tree, review a preview of every local change, then confirm. Local edits are
+never overwritten and nothing is deleted.
+
+![GDrive Pull in the terminal: the Drive tree with folder totals, file sizes, dates and export formats, two selected items and the key bar](docs/screenshot.svg)
 
 ## Features
 
-- Colored Textual interface with expandable folders and multi-selection
-- Recursive downloads that preserve the complete Drive directory structure
-- Selection of individual files, nested folders, or an entire Drive tree
-- Explicit preview with `NEW`, `UPDATE`, `UNCHANGED`, `CONFLICT`,
-  `REMOVED_REMOTE`, `LOCAL_ONLY`, and `SKIPPED` statuses
-- Atomic file replacement through temporary `.part` files
-- Google-native document export to local formats
-- Drive shortcuts followed to their target files and folders
+- Textual tree of your Drive: folders first, with their file count and size;
+  files with their size, modification date and export format
+- Multi-selection of files and folders at any depth; a selected folder
+  includes everything below it
+- `/` filter by name or path, `o` opens the item in Google Drive, `?` shows
+  the key help
+- Fast loading: one batched API call per tree level, with retries on Drive
+  rate limits; the plan reuses the loaded tree instead of listing it again
+- Preview before any change: new, update, unchanged, conflict, removed from
+  Drive, local only, skipped
+- Atomic downloads through temporary `.part` files, removed if a download fails
+  or is interrupted
+- Google Docs, Sheets, Slides, Drawings and Apps Script exported to local
+  formats
 - Local change detection through checksums and a managed state file
-- Recovery of tracked files removed from Drive instead of permanent deletion
-- Preservation of unknown local files and folders
-- Read-only Google Drive OAuth scope
+- Files removed from Drive go to a recovery folder instead of being deleted
+- Unknown local files and folders are preserved
+- Drive shortcuts followed to their target files and folders
+- Live progress with a ✓ / ✗ line per file and a final summary
+- Compact browser sign-in with a clickable link, read-only Drive OAuth scope
 
 ## Repository contents
-
-The published repository contains four files:
 
 ```text
 GDRIVE/
 ├── LICENSE
 ├── README.md
 ├── gdrivepull.py
-└── run-gdrivepull.sh
+├── run-gdrivepull.sh
+├── docs/
+│   ├── make_screenshot.py
+│   └── screenshot.svg
+└── tests/
+    └── test_gdrivepull.py
 ```
 
 Runtime files such as OAuth credentials, tokens, settings, and the virtual
@@ -72,7 +85,10 @@ Never commit `credentials.json` or `token.json`.
 git clone https://github.com/C0sm0cats/GDRIVE.git
 cd GDRIVE
 chmod +x run-gdrivepull.sh
+./run-gdrivepull.sh --help
 ```
+
+The first run of the runner creates `.venv` and installs the dependencies.
 
 ## First run
 
@@ -80,10 +96,9 @@ chmod +x run-gdrivepull.sh
 ./run-gdrivepull.sh
 ```
 
-The first run opens a destination setup interface. Choose:
-
-- a parent directory;
-- the name of the managed download folder.
+The first run opens a destination setup screen. Pick a parent directory in the
+tree on the left (or type it), then name the managed download folder. Press
+`Ctrl+S` to save the destination or `Esc` to cancel.
 
 The final managed folder must be:
 
@@ -92,46 +107,72 @@ The final managed folder must be:
 - an existing GDrive Pull folder containing
   `.gdrivepull-managed-state.json`.
 
-Press `Ctrl+S` to save the destination or `Esc` to cancel.
-
 A non-empty folder without that state file is refused to prevent accidental
 adoption or overwriting of unrelated data.
 
 The selected absolute path is stored locally in `settings.json`, next to the
 runner. The managed state remains inside the selected destination.
 
+Then GDrive Pull signs in to Google Drive. Your browser opens the Google
+sign-in page; if it does not, the terminal shows a clickable link. The session
+is kept in `token.json` and renewed automatically; when it has expired or been
+revoked, the browser sign-in comes back.
+
+## Options
+
+| Option | Effect |
+| --- | --- |
+| `--configure` | Choose or change the managed local destination |
+| `--folder-id ID` | Browse this Drive folder instead of the root of My Drive |
+| `--yes` | Apply the preview without asking for confirmation |
+| `--verbose` | Show sign-in, token and API details, and list unchanged items in the preview |
+
 ## Interactive selector
 
-The Google Drive selector supports keyboard and mouse navigation.
+The tree supports keyboard and mouse navigation. Press `?` for the same key
+help, or run `./run-gdrivepull.sh --help`.
 
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Move through the tree |
-| `Left` / `Right` | Navigate folder levels |
+| `Left` / `Right` | Collapse / expand a folder, or go to the parent folder / first child |
 | `Enter` | Expand or collapse a folder |
 | `Space` | Select or unselect an item |
-| `A` | Select all |
+| `A` | Select all (only the matching items while a filter is active) |
 | `C` | Clear the selection |
+| `E` | Expand or collapse everything below the cursor |
+| `/` | Filter by name or path: `Enter` keeps the filter, `Esc` clears it |
+| `O` | Open the item in Google Drive |
 | `D` | Continue to the download preview |
-| `Esc` | Cancel |
+| `?` | Key help |
+| `Q` / `Esc` | Quit |
 
-Folders are displayed in cyan and files in green and white. Selecting a parent
-folder includes its complete subtree and avoids duplicate child selections.
+Folders show their number of files and their total size; files show their size,
+their modification date (time only for today), and the local format of
+Google-native files (`→ .docx`). Items that cannot be downloaded, such as Google
+Forms, are greyed out. Selecting a parent folder includes its complete subtree
+and replaces the child selections. The line under the tree counts the selected
+items, the files they contain and their size.
+
+The filter keeps the matching items, their parent folders, and everything
+below a matching folder. Selections hidden by the filter are kept.
 
 ## Preview and synchronization behavior
 
-Before changing local files, GDrive Pull displays the complete operation plan
-and asks for confirmation.
+Before changing local files, GDrive Pull compares the selection with the
+destination and prints the plan, then asks for confirmation. Unchanged items
+are counted but only listed with `--verbose`. When nothing needs to change,
+GDrive Pull says so and exits without asking.
 
-| Status | Meaning | Default action |
+| Status | Meaning | Action |
 | --- | --- | --- |
-| `NEW` | The item does not exist locally | Download or create |
-| `UPDATE` | Drive changed and the local copy still matches the previous state | Replace atomically |
-| `UNCHANGED` | Drive and local content match | Skip |
-| `CONFLICT` | Local content changed or cannot be matched safely | Preserve and skip |
-| `REMOVED_REMOTE` | A tracked, unchanged local file was removed from Drive | Move to recovery |
-| `LOCAL_ONLY` | The local item is unknown to GDrive Pull | Preserve and skip |
-| `SKIPPED` | The Drive format is unsupported | Skip |
+| `new` | The item does not exist locally | Download or create |
+| `update` | Drive changed and the local copy still matches the previous state | Replace atomically |
+| `unchanged` | Drive and local content match | Skip |
+| `conflict` | Local content changed or cannot be matched safely | Preserve and skip |
+| `removed from Drive` | A tracked, unchanged local file was removed from Drive | Move to recovery |
+| `local only` | The local item is unknown to GDrive Pull | Preserve and skip |
+| `skipped` | The Drive format is unsupported, or a shortcut loops back to a parent folder | Skip |
 
 Tracked files removed from Drive are moved to:
 
@@ -139,7 +180,11 @@ Tracked files removed from Drive are moved to:
 <managed-destination>/.gdrivepull-recovery/<timestamp>/
 ```
 
-GDrive Pull never permanently deletes unknown local content.
+GDrive Pull never permanently deletes local content.
+
+Downloads show a progress bar and one line per file. If a download fails, the
+file keeps its previous content and the run ends with an error count. The state
+is saved even after `Ctrl+C`, so the next run picks up where it stopped.
 
 ## Google-native file exports
 
@@ -172,6 +217,8 @@ ID can be used as the remote root:
 ./run-gdrivepull.sh --folder-id DRIVE_FOLDER_ID
 ```
 
+The folder ID is the last part of the folder URL in Google Drive.
+
 ## Local files
 
 These files and directories are used or created locally and must not be
@@ -192,6 +239,27 @@ The managed destination contains:
 
 The `.gdrivepull-recovery/` directory is created only when tracked local
 content removed from Drive needs to be preserved.
+
+## Troubleshooting
+
+- **Missing `credentials.json`**: GDrive Pull says where to put it; see
+  [Google API setup](#google-api-setup).
+- **Sign-in keeps failing**: remove `token.json` and run again.
+- **A file stays in `conflict`**: it was changed locally or already existed
+  with different content. Move or rename the local copy, then run again.
+- **More details**: run with `--verbose`.
+
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+The README screenshot is generated from the real selector with demo files:
+
+```bash
+.venv/bin/python docs/make_screenshot.py
+```
 
 ## License
 
