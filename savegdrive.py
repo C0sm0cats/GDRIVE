@@ -2227,6 +2227,16 @@ class DriveSelectorApp(App):
         items = self.drive_targets()
         if not items:
             return
+        if self.view.root_id != TRASH:
+            allowed = [item for item in items if can(item, "canTrash")]
+            if not allowed:
+                self.notify(
+                    f"You cannot move {self.describe(items)} to the Drive trash: shared with you read only.",
+                    severity="warning",
+                )
+                return
+            skipped = len(items) - len(allowed)
+            items = allowed
         ids = [item["id"] for item in items]
         what = self.describe(items)
         if self.view.root_id == TRASH:
@@ -2235,8 +2245,9 @@ class DriveSelectorApp(App):
                 lambda service: delete_items(service, ids), f"Deleted {what} forever.",
             )
         else:
+            note = f" ({plural(skipped, 'item')} shared with you read only stay.)" if skipped else ""
             self.drive_change(
-                f"Move {what} to the Google Drive trash? You can restore it from the Trash view.", None,
+                f"Move {what} to the Google Drive trash? You can restore it from the Trash view.{note}", None,
                 lambda service: trash_items(service, ids), f"Moved {what} to the Drive trash.",
             )
 
@@ -2886,8 +2897,12 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             )
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
     for entry in plan:
+        parent_id = remote_folders.get(entry["relative_path"].parent)
         if entry["status"] == "UPLOAD_NEW":
-            entry["parent_id"] = remote_folders.get(entry["relative_path"].parent)
+            entry["parent_id"] = parent_id
+        elif entry["kind"] == "FILE" and entry.get("item") is not None:
+            # Could a renamed copy of yours (keep both) go up next to it?
+            entry["copy_goes_up"] = parent_id is not None and not is_readonly_path(entry["relative_path"])
     return plan
 
 
@@ -3084,6 +3099,8 @@ def plan_notes(plan):
             "Keep both: your version is renamed 'name (local).ext' and sent to Drive at the next sync; "
             "Drive's version takes its place. Delete the one you do not want, the sync follows."
         )
+    if any(entry["status"] == "KEEP_BOTH" and not entry.get("copy_goes_up", True) for entry in plan):
+        notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
         notes.append("Two Drive files with the same name in a folder: rename one on Drive (o opens it).")
     if "TRASH_REMOTE" in statuses:
@@ -3272,7 +3289,14 @@ class PreviewScreen(Screen):
         if not can_keep_both(entry):
             self.notify("Keep both applies to a file changed on both sides.", severity="warning")
             return
-        set_keep_both(self.plan, [entry], entry["status"] == "CONFLICT")
+        keep = entry["status"] == "CONFLICT"
+        set_keep_both(self.plan, [entry], keep)
+        if keep and not entry.get("copy_goes_up", True):
+            self.notify(
+                f"{entry['local_copy'].name} cannot go up: this folder is read only on Drive. "
+                "It stays on your disk only.",
+                severity="warning",
+            )
         self.refresh_plan()
 
     def action_keep_both_all(self):

@@ -744,6 +744,22 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
+    def test_keep_both_in_a_read_only_folder_says_so(self):
+        self.drive.items["docs"]["capabilities"] = {"canAddChildren": False}
+        self.run_sync()
+        (self.root / "Docs/b.txt").write_bytes(b"edited locally")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = [{"item": node["item"], "relative_parent": node["relative_parent"]}
+                      for node in nodes if node["parent"] is None]
+        plan = savegdrive.build_plan(
+            self.drive, selections, savegdrive.build_local_scopes(selections, browsed), self.root,
+            savegdrive.load_state(self.root), cache,
+        )
+        savegdrive.set_keep_both(plan, plan, True)
+        self.assertTrue(any("stay on your disk only" in note for note in savegdrive.plan_notes(plan)))
+
     def test_existing_identical_file_is_adopted(self):
         (self.root / "notes.txt").write_bytes(b"notes")
         statuses, _ = self.run_sync()
@@ -1095,6 +1111,22 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("r")
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
+
+    async def test_read_only_items_are_not_offered_to_the_drive_trash(self):
+        drive = demo_drive()
+        drive.items["n"]["capabilities"] = {"canTrash": False}
+        drive.items["photos"]["capabilities"] = {"canTrash": False}
+        app = self.make_app(drive)
+        async with app.run_test() as pilot:
+            await pilot.press("end", "x")  # notes.txt, read only: no question
+            self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("home", "down", "space", "down", "space", "down", "space", "x")
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            self.assertIn("2 items shared with you read only stay", str(app.screen.message))
+            await pilot.press("y")
+            await self.wait(app, pilot)
+        self.assertTrue(drive.items["docs"]["trashed"])
+        self.assertNotIn("trashed", drive.items["photos"])
 
     async def test_unfold_the_whole_view(self):
         app = self.make_app()
