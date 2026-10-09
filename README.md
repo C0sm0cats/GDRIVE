@@ -165,11 +165,19 @@ Some rules keep it safe:
   ones) need you to type `delete`; with `--yes` they are refused unless you add
   `--allow-deletions`. That is what an unplugged disk or an emptied folder
   looks like.
-- **Local only**: new files at the top of Shared with me or in the Trash view
-  have nowhere to go on Drive; they are left as they are.
+- **Your rights on Drive count**: a file shared with you read only is never
+  sent back (a local change is a conflict) nor trashed (deleted here, it comes
+  back); a new file in a folder you cannot add to stays local only, like new
+  files at the top of Shared with me or in the Trash view.
+- **Empty folders are synced too**: created, deleted or emptied on one side,
+  the other side follows.
 
 Renaming or moving a file on one side shows as a deletion and a new file: the
-content arrives at its new place, the old one goes to the trash.
+content arrives at its new place, the old one goes to the trash. On Drive, the
+file then starts a new version history and loses its sharing.
+
+Only files whose size or date changed since the last sync are read again to
+compare them, so a sync of a large, mostly unchanged folder stays quick.
 
 ## Options
 

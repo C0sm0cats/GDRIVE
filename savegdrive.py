@@ -73,7 +73,8 @@ FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 LIST_FIELDS = (
     "nextPageToken,"
-    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,explicitlyTrashed)"
+    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,explicitlyTrashed,"
+    "capabilities(canEdit,canAddChildren,canTrash))"
 )
 API_BATCH_SIZE = 50  # Drive accepts 100 calls per batch, but throttles large ones
 API_RETRIES = 5
@@ -412,7 +413,8 @@ def reachable_folders(cache, folder_ids):
 
 CHANGE_FIELDS = (
     "nextPageToken,newStartPageToken,changes(fileId,removed,"
-    "file(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,trashed))"
+    "file(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,trashed,"
+    "capabilities(canEdit,canAddChildren,canTrash)))"
 )
 
 
@@ -517,7 +519,7 @@ def resolve_file_shortcut(service, item):
         service.files()
         .get(
             fileId=effective_id(item),
-            fields="id,mimeType,size,modifiedTime,md5Checksum,webViewLink",
+            fields="id,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)",
             supportsAllDrives=True,
         )
         .execute(num_retries=API_RETRIES)
@@ -2344,7 +2346,10 @@ class DriveSelectorApp(App):
         self.exit(None)
 
 
-ITEM_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId"
+ITEM_FIELDS = (
+    "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId,"
+    "capabilities(canEdit,canAddChildren,canTrash)"
+)
 
 
 def remember_selection(state, selections, scopes, roots=()):
@@ -2455,6 +2460,7 @@ def load_state(destination_root):
             state.get("files"), dict
         ):
             raise ValueError("unsupported state format")
+        state.setdefault("folders", {})  # synced folders, by local path: their Drive id
         return state
     except (OSError, ValueError, json.JSONDecodeError) as error:
         warn(f"Ignoring invalid state file {state_path}: {error}")
@@ -2533,9 +2539,18 @@ def is_readonly_path(relative_path):
     return bool(parts) and (parts[0] == TRASH_DIR or (parts[0] == SHARED_WITH_ME_DIR and len(parts) == 2))
 
 
+def can(item, capability):
+    """Does Drive let you do this to the item (canEdit, canAddChildren, canTrash)? Unknown: yes."""
+    return item.get("capabilities", {}).get(capability, True)
+
+
 def sends_back(item):
-    """Can a local change of this Drive file go back up? Not for exports (Docs...) and shortcuts."""
-    return item["mimeType"] != SHORTCUT_MIME_TYPE and effective_mime_type(item) not in EXPORT_FORMATS
+    """Can a local change of this Drive file go back up? Not for exports (Docs...), shortcuts, read-only files."""
+    return (
+        item["mimeType"] != SHORTCUT_MIME_TYPE
+        and effective_mime_type(item) not in EXPORT_FORMATS
+        and can(item, "canEdit")
+    )
 
 
 def tracked_record(state, item, relative_path):
@@ -2554,13 +2569,13 @@ def classify_file(service, item, relative_path, destination, state):
     readonly = is_readonly_path(relative_path) or item.get("readonly")
 
     if not destination.exists():
-        if record and signature == record.get("remote_signature") and not readonly:
+        if record and signature == record.get("remote_signature") and not readonly and can(item, "canTrash"):
             return "TRASH_REMOTE", None  # synced before, deleted here
         return "NEW", None
     if not destination.is_file():
         return "CONFLICT", None
 
-    current_sha256 = file_hash(destination)
+    current_sha256 = local_hash(destination, record)
     if record:
         local_changed = current_sha256 != record.get("local_sha256")
         remote_changed = signature != record.get("remote_signature")
@@ -2635,7 +2650,8 @@ def collect_plan(
             status == "NEW"
             and item["mimeType"] != SHORTCUT_MIME_TYPE
             and not is_readonly_path(relative_path)
-            and tracked_below(state, relative_path)
+            and can(item, "canTrash")
+            and (tracked_below(state, relative_path) or relative_path.as_posix() in state.get("folders", {}))
             and remote_subtree_unchanged(service, folder_id, relative_path, state, cache)
         ):
             status = "TRASH_REMOTE"  # synced before, the whole folder was deleted here
@@ -2742,9 +2758,10 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         entry["relative_path"] for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "TRASH_REMOTE"
     ]
     tracked = tracked_files_by_path(state)
+    synced_folders = {Path(path) for path in state.get("folders", {})}
     tracked_directories = {
         parent for tracked_path in tracked for parent in tracked_path.parents
-    }
+    } | synced_folders
     planned_local_paths = {
         entry["relative_path"]
         for entry in plan
@@ -2765,9 +2782,11 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         tracked_entry = tracked.get(relative_path) if kind == "FILE" else None
         tracked_key, current_sha256 = None, None
 
-        if tracked_entry:
+        if kind == "FOLDER" and relative_path in synced_folders:
+            status = "TRASH_LOCAL"  # an empty folder synced before, deleted on Drive
+        elif tracked_entry:
             tracked_key, record = tracked_entry
-            current_sha256 = file_hash(destination)
+            current_sha256 = local_hash(destination, record)
             if current_sha256 == record.get("local_sha256"):
                 status = "TRASH_LOCAL"  # synced before, deleted on Drive
             elif can_send(relative_path):
@@ -2815,8 +2834,12 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 continue  # deleted here; Drive's copy goes to the Drive trash
 
             if child.is_dir():
-                if relative_path in remote_directories or relative_path in tracked_directories:
+                if relative_path in remote_directories:
                     scan_directory(relative_path)
+                elif relative_path in tracked_directories:
+                    scan_directory(relative_path)
+                    if relative_path in synced_folders and not any(child.rglob("*")):
+                        add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
                 else:
                     add_local_entry(relative_path, "FOLDER")
                     if relative_path in new_folders:
@@ -2857,7 +2880,10 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
     remote_folders = dict(roots if roots is not None else {Path(): "root"})
     for entry in plan:
         if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE":
-            remote_folders[entry["relative_path"]] = effective_id(entry["item"])
+            # None: a folder you may not add to (shared read only): new files there stay local
+            remote_folders[entry["relative_path"]] = (
+                effective_id(entry["item"]) if can(entry["item"], "canAddChildren") else None
+            )
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
     for entry in plan:
         if entry["status"] == "UPLOAD_NEW":
@@ -3050,7 +3076,8 @@ def plan_notes(plan):
     if "CONFLICT" in statuses:
         notes.append(
             "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
-            "A Google Doc, Sheet or Slides changed here is a conflict too: exports never go back to Drive."
+            "A file you cannot edit on Drive (a Google Doc export, a file shared read only) and changed here is a "
+            "conflict too: it never goes back to Drive."
         )
     if "KEEP_BOTH" in statuses:
         notes.append(
@@ -3064,7 +3091,10 @@ def plan_notes(plan):
     if "TRASH_LOCAL" in statuses:
         notes.append("Deleted on Drive since the last sync: your copies go to your system trash.")
     if "LOCAL_ONLY" in statuses:
-        notes.append("Local only: nothing on Drive to send them to (top of Shared with me, Trash); left as they are.")
+        notes.append(
+            "Local only: Drive has nowhere to put them (top of Shared with me, Trash, or a folder shared with you "
+            "read only); left as they are."
+        )
     return notes
 
 
@@ -3330,9 +3360,23 @@ def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: N
         raise
 
 
+def local_hash(path, record):
+    """SHA-256 of a local file; reuses the last sync's when its size and date have not changed (like rsync)."""
+    if record:
+        stat = path.stat()
+        if record.get("local_size") == stat.st_size and record.get("local_mtime_ns") == stat.st_mtime_ns:
+            return record["local_sha256"]
+    return file_hash(path)
+
+
 def state_record(entry, local_sha256):
     item = entry["item"]
-    return {
+    try:
+        stat = entry["destination"].stat()
+        local = {"local_size": stat.st_size, "local_mtime_ns": stat.st_mtime_ns}
+    except OSError:
+        local = {}
+    return local | {
         "remote_id": effective_id(item),
         "path": entry["relative_path"].as_posix(),
         "name": item["name"],
@@ -3343,7 +3387,7 @@ def state_record(entry, local_sha256):
     }
 
 
-UPLOAD_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink"
+UPLOAD_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)"
 
 
 def upload_file(service, path, file_id=None, name=None, parent_id=None, stop=None, on_bytes=lambda count: None):
@@ -3394,13 +3438,16 @@ def trash_local(path):
 
 
 def forget_below(state, relative_path):
-    """Drop the records of relative_path and of everything below it."""
+    """Drop the records of relative_path and of everything below it, files and folders."""
     prefix = relative_path.as_posix()
     for key in [
         key for key, record in state["files"].items()
         if record.get("path") == prefix or record.get("path", "").startswith(prefix + "/")
     ]:
         del state["files"][key]
+    folders = state.setdefault("folders", {})
+    for path in [path for path in folders if path == prefix or path.startswith(prefix + "/")]:
+        del folders[path]
 
 
 def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
@@ -3436,11 +3483,14 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             try:
                 entry["destination"].mkdir(parents=True, exist_ok=True)
                 results["FOLDER_NEW"] += 1
+                state.setdefault("folders", {})[relative] = effective_id(entry["item"])
             except OSError as error:
                 results["FOLDER_ERROR"] += 1
                 report("[red]✗[/]", f"{relative}/: {error}")
         elif status in {"UNCHANGED", "CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
             results[f"FOLDER_{status}"] += 1
+            if status == "UNCHANGED" and entry.get("item") is not None:
+                state.setdefault("folders", {})[relative] = effective_id(entry["item"])
     for entry in sorted(
         (entry for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "UPLOAD_NEW"),
         key=lambda entry: len(entry["relative_path"].parts),
@@ -3452,6 +3502,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 raise OSError("its parent folder could not be created on Drive")
             folder = create_remote_folder(service, relative.name, parent_id)
             folder_ids[relative] = folder["id"]
+            state.setdefault("folders", {})[relative.as_posix()] = folder["id"]
             results["FOLDER_UPLOAD_NEW"] += 1
             report("[bright_green]↑[/]", f"{relative.as_posix()}/")
         except (HttpError, OSError) as error:
@@ -3466,11 +3517,11 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         status = entry["status"]
         if status == "UNCHANGED":
             local_sha256 = entry.get("local_sha256") or file_hash(entry["destination"])
-            record(entry, entry["item"], local_sha256)
             try:
                 set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
             except OSError:
                 pass
+            record(entry, entry["item"], local_sha256)  # after the date: the next run reuses this hash
             results["FILE_UNCHANGED"] += 1
         elif status in {"CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
             results[f"FILE_{status}"] += 1

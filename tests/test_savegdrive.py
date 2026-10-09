@@ -111,7 +111,7 @@ class FakeDrive:
         return FakeBatch(self, callback)
 
     def public(self, item):
-        fields = ("id", "name", "mimeType", "size", "modifiedTime", "md5Checksum", "shortcutDetails")
+        fields = ("id", "name", "mimeType", "size", "modifiedTime", "md5Checksum", "shortcutDetails", "capabilities")
         return {key: item[key] for key in fields if key in item}
 
     def is_trashed(self, item):
@@ -476,6 +476,58 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
         self.assertFalse((self.root / "Photos").exists())  # left empty: removed
+
+    def test_read_only_items_are_never_sent_or_trashed(self):
+        self.drive.items["docs"]["capabilities"] = {"canAddChildren": False, "canTrash": True, "canEdit": True}
+        for key in ["a", "b"]:
+            self.drive.items[key]["capabilities"] = {"canEdit": False, "canTrash": False}
+        self.run_sync()
+        (self.root / "Docs/a.txt").write_bytes(b"edited here")  # cannot edit on Drive
+        (self.root / "Docs/b.txt").unlink()  # cannot trash on Drive
+        (self.root / "Docs/new.txt").write_bytes(b"new")  # cannot add to Docs
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")
+        self.assertEqual(statuses["Docs/b.txt"], "NEW")  # comes back instead of an error
+        self.assertEqual(statuses["Docs/new.txt"], "LOCAL_ONLY")
+        self.assertEqual(results["FILE_ERROR"], 0)
+        self.assertEqual(self.drive.uploads, [])
+
+    def test_unchanged_files_are_not_hashed_again(self):
+        self.run_sync()
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        hashed = []
+        real_hash = savegdrive.file_hash
+
+        def counting_hash(path, algorithm="sha256"):
+            hashed.append(path.relative_to(self.root).as_posix())
+            return real_hash(path, algorithm)
+
+        with mock.patch.object(savegdrive, "file_hash", counting_hash):
+            statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.assertEqual(hashed, ["Docs/b.txt", "Docs/b.txt"])  # the plan, then the state after sending
+
+    def test_empty_folders_are_synced(self):
+        self.run_sync()
+        (self.root / "Empty here").mkdir()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Empty here"], "UPLOAD_NEW")
+        folder_id = next(key for key, item in self.drive.items.items() if item["name"] == "Empty here")
+        statuses, _ = self.run_sync()
+        self.assertNotIn("Empty here", [path for path, status in statuses.items() if status != "UNCHANGED"])
+
+        del self.drive.items[folder_id]  # deleted on Drive: not sent back up
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Empty here"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Empty here").exists())
+
+        self.drive.items["empty"] = {"id": "empty", "name": "Empty there", "mimeType": FOLDER, "parent": "root"}
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Empty there"], "NEW")
+        (self.root / "Empty there").rmdir()  # deleted here: to the Drive trash, not downloaded again
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Empty there"], "TRASH_REMOTE")
+        self.assertTrue(self.drive.items["empty"]["trashed"])
 
     def test_mass_deletion_needs_a_check(self):
         for i in range(30):
