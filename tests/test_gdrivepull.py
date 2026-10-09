@@ -51,17 +51,60 @@ class FakeBatch:
             self.callback(request_id, response, error)
 
 
+class FakeChanges:
+    def __init__(self, drive):
+        self.drive = drive
+
+    def getStartPageToken(self, **kwargs):
+        return FakeRequest(lambda: {"startPageToken": str(len(self.drive.change_log))})
+
+    def list(self, pageToken, **kwargs):
+        def run():
+            if pageToken == "expired":
+                raise http_error(410)
+            changes = self.drive.change_log[int(pageToken):]
+            return {"changes": changes, "newStartPageToken": str(len(self.drive.change_log))}
+
+        return FakeRequest(run)
+
+
+class FakeDrives:
+    def __init__(self, drive):
+        self.drive = drive
+
+    def list(self, **kwargs):
+        return FakeRequest(lambda: {"drives": self.drive.shared_drives})
+
+
 class FakeDrive:
     """In-memory Drive: items are dicts with id, name, mimeType, parent and optional content."""
 
-    def __init__(self, items, page_size=1000):
+    def __init__(self, items, page_size=1000, shared_drives=()):
         self.items = {item["id"]: dict(item) for item in items}
         self.page_size = page_size
         self.batches = []
         self.failures = {}  # folder id -> errors raised by its next listings
+        self.change_log = []
+        self.shared_drives = list(shared_drives)
 
     def files(self):
         return self
+
+    def changes(self):
+        return FakeChanges(self)
+
+    def drives(self):
+        return FakeDrives(self)
+
+    def change(self, item_id):
+        """Record a change of item_id, as Drive's changes feed would."""
+        item = self.items.get(item_id)
+        if item is None:
+            self.change_log.append({"fileId": item_id, "removed": True})
+        else:
+            self.change_log.append(
+                {"fileId": item_id, "removed": False, "file": dict(self.public(item), parents=[item["parent"]])}
+            )
 
     def new_batch_http_request(self, callback):
         return FakeBatch(self, callback)
@@ -71,13 +114,16 @@ class FakeDrive:
         return {key: item[key] for key in fields if key in item}
 
     def list(self, q, pageToken=None, **kwargs):
-        folder_id = q.split("'")[1]
+        folder_id = gdrivepull.SHARED_WITH_ME if q.startswith("sharedWithMe") else q.split("'")[1]
 
         def run():
             failures = self.failures.get(folder_id)
             if failures:
                 raise failures.pop(0)
-            children = [self.public(item) for item in self.items.values() if item.get("parent") == folder_id]
+            if folder_id == gdrivepull.SHARED_WITH_ME:
+                children = [self.public(item) for item in self.items.values() if item.get("shared")]
+            else:
+                children = [self.public(item) for item in self.items.values() if item.get("parent") == folder_id]
             start = int(pageToken or 0)
             page = children[start:start + self.page_size]
             response = {"files": page}
@@ -89,6 +135,8 @@ class FakeDrive:
 
     def get(self, fileId, **kwargs):
         def run():
+            if fileId == "root":
+                return {"id": "root"}
             if fileId not in self.items:
                 raise http_error(404)
             return self.public(self.items[fileId])
@@ -324,17 +372,79 @@ class SyncTest(unittest.TestCase):
             gdrivepull.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
         scopes = gdrivepull.build_local_scopes(selections, browsed)
         state = gdrivepull.load_state(self.root)
-        gdrivepull.remember_selection(state, "root", selections, scopes)
+        gdrivepull.remember_selection(state, selections, scopes)
         gdrivepull.save_state(self.root, state)
 
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
         del self.drive.items["photos"]
         with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            again, again_scopes = gdrivepull.last_selection(self.drive, gdrivepull.load_state(self.root))
+            again, again_scopes = gdrivepull.last_selection(self.drive, gdrivepull.load_state(self.root), {})
         self.assertEqual([entry["item"]["name"] for entry in again], ["a.txt"])
         self.assertEqual(again[0]["item"]["md5Checksum"], self.drive.items["a"]["md5Checksum"])
         self.assertEqual(again_scopes, [Path("Photos")])  # gone from Drive: still scanned locally
-        self.assertIsNone(gdrivepull.last_selection(self.drive, {"files": {}}))
+        self.assertIsNone(gdrivepull.last_selection(self.drive, {"files": {}}, {}))
+
+    def test_again_with_whole_view_takes_new_items(self):
+        state = {"last_selection": {"roots": [{"id": "root", "base": "."}], "items": [], "scopes": ["."]}}
+        self.drive.items["new"] = file_item("new", "new.txt", "root", b"new")
+        selections, scopes = gdrivepull.last_selection(self.drive, state, {})
+        self.assertEqual(
+            sorted(gdrivepull.selected_path(entry).as_posix() for entry in selections),
+            ["Docs", "Photos", "new.txt", "notes.txt"],
+        )
+        self.assertEqual(scopes, [Path()])
+
+    def test_changes_replay_matches_a_fresh_listing(self):
+        cache = {}
+        token = gdrivepull.start_page_token(self.drive)
+        gdrivepull.prefetch_folders(self.drive, ["root"], cache)
+        gdrivepull.save_snapshot(self.root, token, cache, ["root"])
+
+        self.drive.items["a"].update(file_item("a", "a renamed.txt", "docs", b"alpha v2"))
+        self.drive.change("a")
+        del self.drive.items["b"]
+        self.drive.change("b")
+        self.drive.items["c"] = file_item("c", "c.txt", "photos", b"charlie")
+        self.drive.change("c")
+        self.drive.items["p"]["parent"] = "docs"  # moved
+        self.drive.change("p")
+        self.drive.items["x"] = file_item("x", "elsewhere.txt", "unknown-folder", b"x")
+        self.drive.change("x")
+
+        replayed, new_token = gdrivepull.apply_changes(self.drive, gdrivepull.load_snapshot(self.root))
+        fresh = {}
+        gdrivepull.prefetch_folders(self.drive, ["root"], fresh)
+        self.assertEqual(replayed, fresh)
+        self.assertEqual(new_token, "5")
+        self.assertIsNone(gdrivepull.apply_changes(self.drive, {"token": "expired", "folders": {}}))
+
+    def test_shared_views_get_their_own_folders(self):
+        self.drive.items["s"] = file_item("s", "from Ann.pdf", "nobody", b"pdf", shared=True)
+        self.drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")
+        self.drive.shared_drives = [{"id": "team", "name": "Team"}]
+        views = gdrivepull.drive_views(self.drive, "root")
+        self.assertEqual([view.name for view in views], ["My Drive", "Shared with me", "Team"])
+        cache = {}
+        selections = []
+        for view in views:
+            gdrivepull.load_view(self.drive, view, cache)
+            for entry in view.children_of.get(None, []):
+                gdrivepull.add_selected_item(selections, entry["item"], entry["relative_parent"])
+        browsed = {}
+        for view in views:
+            browsed.update(view.browsed)
+        scopes = gdrivepull.build_local_scopes(selections, browsed, [view.base for view in views])
+        self.assertEqual(scopes, [Path(), Path("Shared with me"), Path("Shared drives/Team")])
+        state = gdrivepull.load_state(self.root)
+        plan = gdrivepull.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        paths = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(paths["Shared with me/from Ann.pdf"], "NEW")
+        self.assertEqual(paths["Shared drives/Team/plan.txt"], "NEW")
+        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
+            gdrivepull.apply_plan(self.drive, plan, self.root, state)
+        # A later My Drive-only run does not report the view folders as local only.
+        _, results = self.run_sync()
+        self.assertEqual(results["FOLDER_LOCAL_ONLY"], 0)
 
     def test_destination_option(self):
         target = Path(self.temp.name) / "Once"
@@ -369,9 +479,17 @@ class SyncTest(unittest.TestCase):
 
 
 class SelectorTest(unittest.IsolatedAsyncioTestCase):
-    def make_app(self):
-        nodes, _ = gdrivepull.collect_drive_tree(demo_drive(), "root", {})
-        return gdrivepull.DriveSelectorApp(nodes, "My Drive", Path("/tmp/GDrive"))
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = gdrivepull.initialize_managed_destination(Path(self.temp.name) / "GDrive")
+
+    def make_app(self, drive=None, views=None):
+        drive = drive or demo_drive()
+        cache = {}
+        views = views or [gdrivepull.DriveView("My Drive", "root")]
+        gdrivepull.load_view(drive, views[0], cache)
+        return gdrivepull.DriveSelectorApp(views, self.root, gdrivepull.load_state(self.root), drive, None, cache)
 
     def selected(self, app):
         return [gdrivepull.selected_path(entry).as_posix() for entry in app.selections]
@@ -389,7 +507,47 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("left")  # back to Docs
             self.assertEqual(tree.cursor_node.data["display_path"], "Docs")
             await pilot.press("d")
-        self.assertEqual([gdrivepull.selected_path(entry).as_posix() for entry in app.return_value], ["Docs"])
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, gdrivepull.PreviewScreen)
+            table = app.screen.query_one("DataTable")
+            self.assertEqual(table.row_count, 5)  # Docs/, a, b, Report, and Survey skipped
+            await pilot.press("v", "v")  # everything, then each status: new
+            self.assertEqual(table.row_count, 4)
+            await pilot.press("escape")  # back to the tree, selection kept
+            self.assertNotIsInstance(app.screen, gdrivepull.PreviewScreen)
+            self.assertEqual(self.selected(app), ["Docs"])
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("y")
+        result = app.return_value
+        self.assertEqual([gdrivepull.selected_path(entry).as_posix() for entry in result["selections"]], ["Docs"])
+        self.assertEqual(result["destination"], self.root)
+        self.assertEqual(len(result["plan"]), 5)
+
+    async def test_views_load_on_tab(self):
+        drive = demo_drive()
+        drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")
+        drive.shared_drives = [{"id": "team", "name": "Team"}]
+        views = gdrivepull.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        async with app.run_test() as pilot:
+            await pilot.press("down", "space", "tab")  # Docs, then Shared with me (empty)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIs(app.view, views[1])
+            await pilot.press("tab")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            tree = app.query_one(Tree)
+            self.assertEqual([node.data["display_path"] for node in tree.root.children], ["plan.txt"])
+            await pilot.press("down", "space")
+            self.assertEqual(self.selected(app), ["Docs", "Shared drives/Team/plan.txt"])
+            self.assertIn("Team (1)", str(app.query_one("#views").render()))
+            await pilot.press("shift+tab", "shift+tab")
+            self.assertIs(app.view, views[0])
+            await pilot.press("q")
 
     async def test_filter_select_all_and_clear(self):
         app = self.make_app()
@@ -414,7 +572,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("a", "escape", "c")
             self.assertEqual(self.selected(app), [])
             await pilot.press("escape")
-        self.assertEqual(app.return_value, [])
+        self.assertIsNone(app.return_value)
 
     async def test_columns_are_aligned(self):
         app = self.make_app()

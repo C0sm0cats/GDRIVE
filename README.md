@@ -14,16 +14,20 @@ never overwritten and nothing is deleted.
   format
 - Marks from earlier downloads: ✓ up to date, ↻ changed on Drive, ✎ changed
   locally
-- Multi-selection of files and folders at any depth; a selected folder
-  includes everything below it
+- My Drive, Shared with me and every shared drive as views, switched with
+  `Tab`
+- Multi-selection of files and folders at any depth, across views; a
+  selected folder includes everything below it
 - `/` filter by name or path, `o` opens the item in Google Drive, `f` changes
   the download folder for the session, `?` shows the key help
-- `--again` downloads the previous selection without the tree; with `--yes`
-  it runs unattended, for example from cron
+- `--again` downloads the previous selection without the tree, replaying only
+  the Drive changes since the last run; with `--yes` it runs unattended, for
+  example from cron
 - Fast loading: one batched API call per tree level, with retries on Drive
   rate limits; the plan reuses the loaded tree instead of listing it again
-- Preview before any change: new, update, unchanged, conflict, removed from
-  Drive, local only, skipped
+- Preview in the interface before any change: new, update, unchanged,
+  conflict, removed from Drive, local only, skipped; `Esc` goes back to the
+  tree to adjust the selection
 - Atomic downloads through temporary `.part` files, removed if a download fails
   or is interrupted
 - Google Docs, Sheets, Slides, Drawings and Apps Script exported to local
@@ -139,6 +143,7 @@ help, or run `./run-gdrivepull.sh --help`.
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Move through the tree |
+| `Tab` / `Shift+Tab` | Next / previous view: My Drive, Shared with me, each shared drive |
 | `Left` / `Right` | Collapse / expand a folder, or go to the parent folder / first child |
 | `Enter` | Expand or collapse a folder |
 | `Space` | Select or unselect an item |
@@ -148,7 +153,7 @@ help, or run `./run-gdrivepull.sh --help`.
 | `/` | Filter by name or path: `Enter` keeps the filter, `Esc` clears it |
 | `O` | Open the item in Google Drive |
 | `F` | Change the download folder for this session: pick a parent directory, name the folder, `Ctrl+S` to apply, `Esc` to cancel |
-| `D` | Continue to the download preview |
+| `D` | Compare with the download folder and show the preview |
 | `?` | Key help |
 | `Q` / `Esc` | Quit |
 
@@ -170,15 +175,38 @@ read from the managed state without hashing any file:
 
 Changing the folder with `F` updates the marks for the new destination.
 
+### Views
+
+`Tab` switches between My Drive, Shared with me (the items others shared with
+you) and each shared drive you are a member of. A view is loaded the first time
+it is shown; the tabs show how many items are selected in each. Selections are
+kept across views and downloaded together:
+
+```text
+<download folder>/                     My Drive
+<download folder>/Shared with me/      Shared with me
+<download folder>/Shared drives/Team/  the shared drive "Team"
+```
+
+With `--folder-id`, only that folder is shown.
+
 The filter keeps the matching items, their parent folders, and everything
 below a matching folder. Selections hidden by the filter are kept.
 
 ## Preview and synchronization behavior
 
-Before changing local files, GDrive Pull compares the selection with the
-destination and prints the plan, then asks for confirmation. Unchanged items
-are counted but only listed with `--verbose`. When nothing needs to change,
-GDrive Pull says so and exits without asking.
+`D` compares the selection with the download folder and opens the preview:
+the plan, a summary by status, and notes about conflicts and recovery.
+Nothing has changed on disk yet.
+
+| Key | Action |
+| --- | --- |
+| `Y` | Download |
+| `V` | Show the changes (default), everything, or one status at a time |
+| `Esc` / `N` | Back to the tree, selection kept |
+
+When nothing needs to change, `Y` only saves the state. With `--yes`, the
+preview is printed and applied without asking.
 
 | Status | Meaning | Action |
 | --- | --- | --- |
@@ -214,9 +242,18 @@ destination. To download it again without the tree:
 ./run-gdrivepull.sh --again --yes    # no prompt, e.g. from cron
 ```
 
+Each run also saves the folder listings it used and a Drive changes token in
+`.gdrivepull-remote-cache.json`, in the download folder. `--again` replays the
+Drive changes since then instead of listing every folder again, so it stays fast
+on a large Drive; if the token has expired, the folders are listed again.
+
 Selected items are looked up again on Drive, so renamed or updated files are
-picked up. A selected item that is no longer on Drive is reported, and its
-local files are handled like other files removed from Drive.
+picked up. When a whole view was selected (every item at its top level), new
+items in it are downloaded too. A selected item that is no longer on Drive is
+reported, and its local files are handled like other files removed from Drive.
+
+`--again` shows the same preview; with `--yes`, or without a terminal, it is
+printed instead.
 
 ## Google-native file exports
 
@@ -252,10 +289,11 @@ credentials.json
 token.json
 ```
 
-The managed destination contains:
+The download folder contains:
 
 ```text
 .gdrivepull-managed-state.json
+.gdrivepull-remote-cache.json
 ```
 
 The state file also keeps the last selection, for `--again`.

@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import gdrivepull  # noqa: E402
 
-COLUMNS, ROWS = 110, 21
+COLUMNS, ROWS = 124, 23
 OUT = os.path.join(ROOT, "docs", "screenshot.svg")
 FOLDER = gdrivepull.FOLDER_MIME_TYPE
 
@@ -111,10 +111,14 @@ def plain_svg(svg):
 
 async def render():
     nodes = demo_nodes()
-    app = gdrivepull.DriveSelectorApp(nodes, "My Drive", Path.home() / "GDrive")
+    my_drive = gdrivepull.DriveView("My Drive", "root")
+    my_drive.load(nodes, {})
+    views = [my_drive, gdrivepull.DriveView("Shared with me", gdrivepull.SHARED_WITH_ME),
+             gdrivepull.DriveView("Team", "team"), gdrivepull.DriveView("Family", "family")]
+    app = gdrivepull.DriveSelectorApp(views, Path.home() / "GDrive")
     # Marks as after an earlier download: Taxes up to date, one file changed on Drive, one edited locally.
     by_name = {entry["item"]["name"]: entry["index"] for entry in nodes}
-    app.marks = {by_name["2025 return.pdf"]: "synced", by_name["Receipts.zip"]: "synced",
+    my_drive.marks = {by_name["2025 return.pdf"]: "synced", by_name["Receipts.zip"]: "synced",
                  by_name["Taxes"]: "synced", by_name["Budget 2026"]: "changed",
                  by_name["Lease agreement.pdf"]: "edited", by_name["Documents"]: "edited"}
     async with app.run_test(size=(COLUMNS, ROWS)) as pilot:

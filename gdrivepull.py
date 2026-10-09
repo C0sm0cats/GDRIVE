@@ -31,6 +31,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
+    DataTable,
     DirectoryTree,
     Footer,
     Header,
@@ -48,12 +49,25 @@ TOKEN_PATH = SCRIPT_DIR / "token.json"
 CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 STATE_FILE_NAME = ".gdrivepull-managed-state.json"
 RECOVERY_DIR_NAME = ".gdrivepull-recovery"
+REMOTE_CACHE_NAME = ".gdrivepull-remote-cache.json"
+RESERVED_NAMES = {
+    STATE_FILE_NAME,
+    f"{STATE_FILE_NAME}.tmp",
+    RECOVERY_DIR_NAME,
+    REMOTE_CACHE_NAME,
+    f"{REMOTE_CACHE_NAME}.tmp",
+}
+RESERVED_PATHS = {Path(name) for name in RESERVED_NAMES}
+SHARED_WITH_ME = "sharedWithMe"  # pseudo folder id: the items others shared with you
+SHARED_WITH_ME_DIR = "Shared with me"
+SHARED_DRIVES_DIR = "Shared drives"
+VIEW_DIRS = {SHARED_WITH_ME_DIR, SHARED_DRIVES_DIR}
 STATE_VERSION = 1
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 LIST_FIELDS = (
     "nextPageToken,"
-    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink)"
+    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId)"
 )
 API_BATCH_SIZE = 50  # Drive accepts 100 calls per batch, but throttles large ones
 API_RETRIES = 5
@@ -253,16 +267,33 @@ def is_retryable(error):
     return error.status_code == 403 and "ratelimit" in str(error).casefold()
 
 
+FOLDER_DRIVES = {}  # folder id -> shared drive id: shared drive folders are listed within their drive
+
+
 def list_request(service, folder_id, page_token=None):
+    options = {}
+    if folder_id == SHARED_WITH_ME:
+        query = "sharedWithMe and trashed = false"
+    else:
+        query = f"'{folder_id}' in parents and trashed = false"
+        if folder_id in FOLDER_DRIVES:
+            options = {"corpora": "drive", "driveId": FOLDER_DRIVES[folder_id]}
     return service.files().list(
-        q=f"'{folder_id}' in parents and trashed = false",
+        q=query,
         spaces="drive",
         fields=LIST_FIELDS,
         pageSize=1000,
         pageToken=page_token,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
+        **options,
     )
+
+
+def note_drives(items):
+    for item in items:
+        if item.get("driveId") and is_folder(item):
+            FOLDER_DRIVES[effective_id(item)] = item["driveId"]
 
 
 def list_folders(service, folder_ids, cache):
@@ -302,12 +333,142 @@ def list_folders(service, folder_ids, cache):
             pending = retry + pending
 
     for folder_id, items in found.items():
+        note_drives(items)
         cache[folder_id] = sort_items(items)
 
 
 def list_children(service, folder_id, cache):
     list_folders(service, [folder_id], cache)
     return cache[folder_id]
+
+
+def prefetch_folders(service, folder_ids, cache):
+    """List every folder below folder_ids, one batched call per level, so planning needs no listing."""
+    seen = set()
+    level = list(folder_ids)
+    while level:
+        seen.update(level)
+        list_folders(service, level, cache)
+        level = list(dict.fromkeys(
+            effective_id(item)
+            for folder_id in level
+            for item in cache[folder_id]
+            if is_folder(item) and effective_id(item) not in seen
+        ))
+
+
+def reachable_folders(cache, folder_ids):
+    seen = set()
+    stack = [folder_id for folder_id in folder_ids if folder_id in cache]
+    while stack:
+        folder_id = stack.pop()
+        if folder_id in seen:
+            continue
+        seen.add(folder_id)
+        stack.extend(
+            effective_id(item) for item in cache[folder_id]
+            if is_folder(item) and effective_id(item) in cache
+        )
+    return seen
+
+
+# --- Remote snapshot: --again replays Drive changes instead of listing every folder -------------
+
+CHANGE_FIELDS = (
+    "nextPageToken,newStartPageToken,changes(fileId,removed,"
+    "file(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,trashed))"
+)
+
+
+def start_page_token(service):
+    return (
+        service.changes()
+        .getStartPageToken(supportsAllDrives=True)
+        .execute(num_retries=API_RETRIES)["startPageToken"]
+    )
+
+
+def save_snapshot(destination_root, token, cache, folder_ids):
+    folders = reachable_folders(cache, folder_ids)
+    snapshot = {
+        "version": 1,
+        "token": token,
+        "folders": {folder_id: cache[folder_id] for folder_id in folders},
+        "drives": {folder_id: FOLDER_DRIVES[folder_id] for folder_id in folders if folder_id in FOLDER_DRIVES},
+    }
+    path = destination_root / REMOTE_CACHE_NAME
+    temporary_path = destination_root / f"{REMOTE_CACHE_NAME}.tmp"
+    temporary_path.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary_path, path)
+
+
+def load_snapshot(destination_root):
+    try:
+        snapshot = json.loads((destination_root / REMOTE_CACHE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if snapshot.get("version") != 1 or not snapshot.get("token") or not isinstance(snapshot.get("folders"), dict):
+        return None
+    return snapshot
+
+
+def apply_changes(service, snapshot):
+    """The snapshot's folder listings updated with the Drive changes since it was saved, and the new token.
+
+    None when the token is no longer valid: the caller lists the folders again.
+    """
+    cache = {folder_id: list(items) for folder_id, items in snapshot["folders"].items()}
+    FOLDER_DRIVES.update(snapshot.get("drives", {}))
+    where = {}  # item id -> folders listing it
+    for folder_id, items in cache.items():
+        for item in items:
+            where.setdefault(item["id"], set()).add(folder_id)
+
+    page_token, changed, count = snapshot["token"], set(), 0
+    while True:
+        try:
+            response = (
+                service.changes()
+                .list(
+                    pageToken=page_token,
+                    fields=CHANGE_FIELDS,
+                    pageSize=1000,
+                    spaces="drive",
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                )
+                .execute(num_retries=API_RETRIES)
+            )
+        except HttpError as error:
+            if error.status_code in {400, 404, 410}:
+                debug(f"Saved Drive changes token rejected ({error.status_code}), listing folders again")
+                return None
+            raise
+        for change in response.get("changes", []):
+            count += 1
+            file_id = change["fileId"]
+            for folder_id in where.pop(file_id, ()):
+                cache[folder_id] = [item for item in cache[folder_id] if item["id"] != file_id]
+                changed.add(folder_id)
+            item = change.get("file")
+            if change.get("removed") or not item or item.get("trashed"):
+                continue
+            parents = item.pop("parents", [])
+            item.pop("trashed", None)
+            note_drives([item])
+            for folder_id in parents:
+                if folder_id in cache:
+                    cache[folder_id].append(item)
+                    where.setdefault(file_id, set()).add(folder_id)
+                    changed.add(folder_id)
+        if "newStartPageToken" in response:
+            break
+        page_token = response["nextPageToken"]
+
+    for folder_id in changed:
+        cache[folder_id] = sort_items(cache[folder_id])
+    debug(f"Applied {plural(count, 'Drive change')} to {plural(len(cache), 'saved folder')}")
+    return cache, response["newStartPageToken"]
 
 
 def resolve_file_shortcut(service, item):
@@ -340,14 +501,14 @@ def folder_name(service, folder_id):
     return folder["name"]
 
 
-def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folders, items: None):
+def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folders, items: None, base=Path()):
     """Load the whole tree below root_folder_id, one batched listing per level.
 
     Returns the nodes (parents always before their children) and the root items by local path.
     """
     nodes = []
     browsed_directories = {}
-    level = [(root_folder_id, None, Path(), [], frozenset({root_folder_id}))]
+    level = [(root_folder_id, None, base, [], frozenset({root_folder_id}))]
 
     while level:
         list_folders(service, [folder_id for folder_id, *_ in level], cache)
@@ -425,6 +586,11 @@ def display_date(item):
     return moment.strftime("%Y-%m-%d")
 
 
+def short_path(path):
+    home = Path.home()
+    return f"~/{path.relative_to(home)}" if path.is_relative_to(home) and path != home else str(path)
+
+
 def plural(count, word):
     return f"{count} {word}{'' if count == 1 else 's'}"
 
@@ -473,34 +639,38 @@ def add_selected_item(selections, item, relative_parent):
     return True
 
 
+def scope_covers(parent, scope):
+    if parent == Path():
+        # My Drive's root does not cover the Shared with me / Shared drives folders.
+        return not scope.parts or scope.parts[0] not in VIEW_DIRS
+    return parent == scope or parent in scope.parents
+
+
 def compact_scopes(scopes):
     compacted = []
     for scope in sorted(set(scopes), key=lambda path: (len(path.parts), path.as_posix())):
-        if any(
-            parent == Path()
-            or parent == scope
-            or parent in scope.parents
-            for parent in compacted
-        ):
+        if any(scope_covers(parent, scope) for parent in compacted):
             continue
         compacted.append(scope)
     return compacted
 
 
-def build_local_scopes(selections, browsed_directories):
+def fully_selected(root_items, base, selections):
+    return bool(root_items) and all(
+        path_selection_state(base / local_name(item), selections) in {"x", "*"}
+        for item in root_items
+    )
+
+
+def build_local_scopes(selections, browsed_directories, bases=(Path(),)):
     scopes = [
         selected_path(entry)
         for entry in selections
         if is_folder(entry["item"])
     ]
-
-    root_items = browsed_directories.get(Path(), [])
-    if root_items and all(
-        path_selection_state(Path(local_name(item)), selections) in {"x", "*"}
-        for item in root_items
-    ):
-        scopes.append(Path())
-
+    for base in bases:
+        if fully_selected(browsed_directories.get(base, []), base, selections):
+            scopes.append(base)
     return compact_scopes(scopes)
 
 
@@ -749,6 +919,7 @@ class DestinationSetupScreen(Screen):
 
 KEY_HELP = [
     ("↑ ↓", "move"),
+    ("tab", "next view: My Drive, Shared with me, each shared drive (shift+tab: previous)"),
     ("← →", "collapse / expand a folder, or go to the parent folder / first child"),
     ("enter", "expand or collapse a folder"),
     ("space", "select / unselect (a selected folder includes everything below it)"),
@@ -758,7 +929,7 @@ KEY_HELP = [
     ("/", "filter by name or path: enter keeps the filter, esc clears it"),
     ("o", "open the item in Google Drive"),
     ("f", "change the download folder for this session"),
-    ("d", "continue to the download preview"),
+    ("d", "preview: y downloads, v shows other statuses, esc comes back to the tree"),
     ("?", "this help"),
     ("q esc", "quit"),
 ]
@@ -904,11 +1075,70 @@ class DriveTree(Tree):
     ]
 
 
+class DriveView:
+    """One root shown in the tree: My Drive, Shared with me, or a shared drive."""
+
+    def __init__(self, name, root_id, base=Path()):
+        self.name = name
+        self.root_id = root_id
+        self.base = base
+        self.nodes = None  # loaded on first display
+        self.browsed = {}
+        self.children_of = {}
+        self.totals = {}
+        self.marks = {}
+        self.name_column = 0
+        self.expanded = set()
+        self.error = None
+
+    def load(self, nodes, browsed):
+        self.nodes = nodes
+        self.browsed = browsed
+        self.children_of = {}
+        for node in nodes:
+            self.children_of.setdefault(node["parent"], []).append(node)
+        self.totals = folder_totals(nodes)
+        self.name_column = name_column(nodes)
+
+
+def drive_views(service, folder_id):
+    """My Drive, Shared with me and every shared drive, or only the folder given with --folder-id."""
+    if folder_id != "root":
+        return [DriveView(folder_name(service, folder_id), folder_id)]
+    root_id = (
+        service.files().get(fileId="root", fields="id").execute(num_retries=API_RETRIES)["id"]
+    )
+    views = [DriveView("My Drive", root_id), DriveView(SHARED_WITH_ME_DIR, SHARED_WITH_ME, Path(SHARED_WITH_ME_DIR))]
+    page_token = None
+    while True:
+        response = (
+            service.drives()
+            .list(pageSize=100, pageToken=page_token, fields="nextPageToken,drives(id,name)")
+            .execute(num_retries=API_RETRIES)
+        )
+        for drive in response.get("drives", []):
+            FOLDER_DRIVES[drive["id"]] = drive["id"]
+            views.append(DriveView(drive["name"], drive["id"], Path(SHARED_DRIVES_DIR) / safe_name(drive["name"])))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return views
+
+
+def load_view(service, view, cache, on_progress=lambda folders, items: None):
+    nodes, browsed = collect_drive_tree(service, view.root_id, cache, on_progress, view.base)
+    view.load(nodes, browsed)
+
+
 class DriveSelectorApp(App):
     TITLE = APP_NAME
     ENABLE_COMMAND_PALETTE = False
 
     CSS = SHARED_CSS + """
+    #views {
+        height: 1;
+        margin: 1 2 0 2;
+    }
+
     #drive-tree {
         height: 1fr;
         margin: 1 2 0 2;
@@ -940,6 +1170,8 @@ class DriveSelectorApp(App):
     """
 
     BINDINGS = [
+        Binding("tab", "next_view", "View", priority=True),
+        Binding("shift+tab", "previous_view", "Previous view", show=False, priority=True),
         Binding("a", "select_all", "Select all"),
         Binding("c", "clear_selection", "Unselect all"),
         Binding("slash", "start_filter", "Filter"),
@@ -951,31 +1183,60 @@ class DriveSelectorApp(App):
         Binding("q", "quit_selector", "Quit", show=False),
     ]
 
-    def __init__(self, nodes, root_label="My Drive", destination=None, state=None):
+    def __init__(self, views, destination=None, state=None, service=None, make_service=None, cache=None,
+                 skip_preview=False):
         super().__init__()
-        self.nodes = nodes
-        self.root_label = root_label
+        self.views = views
+        self.view = views[0]
         self.destination = destination
-        self.marks = local_marks(nodes, destination, state)
-        self.name_column = name_column(nodes)
-        self.children_of = {}
-        for node in nodes:
-            self.children_of.setdefault(node["parent"], []).append(node)
-        self.totals = folder_totals(nodes)
+        self.state = state
+        self.service = service
+        self.make_service = make_service or (lambda: service)
+        self.cache = {} if cache is None else cache
+        self.skip_preview = skip_preview
+        for view in views:
+            if view.nodes is not None:
+                view.marks = local_marks(view.nodes, destination, state)
         self.selections = []
         self.tree_nodes = {}
         self.populated = set()
-        self.expanded = set()
         self.filter_terms = []
         self.filter_ancestors = set()
         self.filter_visible = None
+        self.busy = False
+
+    # The current view's data.
+
+    @property
+    def nodes(self):
+        return self.view.nodes or []
+
+    @property
+    def children_of(self):
+        return self.view.children_of
+
+    @property
+    def totals(self):
+        return self.view.totals
+
+    @property
+    def marks(self):
+        return self.view.marks
+
+    @property
+    def expanded(self):
+        return self.view.expanded
+
+    @property
+    def name_column(self):
+        return self.view.name_column
 
     def compose(self) -> ComposeResult:
         yield Header(icon="")
-        yield DriveTree(
-            Text(self.root_label, style="bold bright_blue"),
-            id="drive-tree",
-        )
+        views = Static(id="views")
+        views.display = len(self.views) > 1
+        yield views
+        yield DriveTree(Text(self.view.name, style="bold bright_blue"), id="drive-tree")
         filter_input = Input(placeholder="filter by name or path", id="filter")
         filter_input.display = False
         yield filter_input
@@ -985,10 +1246,69 @@ class DriveSelectorApp(App):
     def on_mount(self):
         self.update_sub_title()
         tree = self.query_one("#drive-tree", Tree)
-        self.populate(tree.root)
-        tree.root.expand()
         tree.focus()
+        self.show_view(self.view)
+
+    # Views.
+
+    def show_view(self, view):
+        self.view = view
+        if self.filter_terms or self.query_one("#filter", Input).display:
+            self.clear_filter(rebuild=False)
+        tree = self.query_one("#drive-tree", Tree)
+        if view.nodes is None:
+            tree.clear()
+            tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  loading…", "dim")))
+            if view.error is None:
+                self.run_worker(lambda: self.load_in_background(view), thread=True, group="views")
+            else:
+                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), (f"  {view.error}", "red")))
+        else:
+            tree.root.set_label(Text(view.name, style="bold bright_blue"))
+            self.rebuild()
+            if not view.nodes:
+                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  empty", "dim")))
+        self.update_views()
         self.update_selection_summary()
+
+    def load_in_background(self, view):
+        try:
+            load_view(self.make_service(), view, self.cache)
+            view.marks = local_marks(view.nodes, self.destination, self.state)
+        except (HttpError, OSError) as error:
+            view.error = error_text(error)
+        self.call_from_thread(self.view_loaded, view)
+
+    def view_loaded(self, view):
+        if view is self.view:
+            self.show_view(view)
+
+    def update_views(self):
+        text = Text()
+        for view in self.views:
+            selected = sum(
+                1 for entry in self.selections
+                if entry.get("view") is view
+            )
+            label = f" {view.name}" + (f" ({selected})" if selected else "") + " "
+            if view is self.view:
+                text.append(label, style="bold #07111f on #38bdf8")
+            else:
+                text.append(label, style="#93c5fd")
+            text.append(" ")
+        self.query_one("#views", Static).update(text)
+
+    def switch_view(self, step):
+        if len(self.views) < 2 or self.busy:
+            return
+        index = (self.views.index(self.view) + step) % len(self.views)
+        self.show_view(self.views[index])
+
+    def action_next_view(self):
+        self.switch_view(1)
+
+    def action_previous_view(self):
+        self.switch_view(-1)
 
     # Tree building: children are added when their folder is first expanded.
 
@@ -1031,15 +1351,14 @@ class DriveSelectorApp(App):
         self.populated = set()
         self.populate(tree.root)
         tree.root.expand()
-        if self.filter_terms:
-            to_expand = self.filter_ancestors
-        else:
-            to_expand = self.expanded
+        to_expand = self.filter_ancestors if self.filter_terms else self.expanded
         for entry in self.nodes:  # parents come first, so each one is already in the tree
             index = entry["index"]
             if index in to_expand and index in self.tree_nodes:
                 self.expand(self.tree_nodes[index])
-        target = None if current is None else self.tree_nodes.get(current["index"])
+        target = None
+        if current is not None and current in self.nodes:
+            target = self.tree_nodes.get(current["index"])
         if target is not None:
             self.call_after_refresh(tree.move_cursor, target)
         self.update_selection_summary()
@@ -1068,15 +1387,13 @@ class DriveSelectorApp(App):
                         matched.add(entry["index"])
             self.filter_visible = visible
             self.filter_ancestors = ancestors
-        self.rebuild()
+        if self.view.nodes is not None:
+            self.rebuild()
 
     # Labels and summary.
 
     def update_sub_title(self):
-        if self.destination is not None:
-            self.sub_title = f"{self.root_label} → {self.destination}"
-        else:
-            self.sub_title = self.root_label
+        self.sub_title = "" if self.destination is None else f"downloads to {short_path(self.destination)}"
 
     def node_label(self, entry):
         item = entry["item"]
@@ -1125,21 +1442,18 @@ class DriveSelectorApp(App):
         for tree_node in self.tree_nodes.values():
             tree_node.set_label(self.node_label(tree_node.data))
         self.update_selection_summary()
+        self.update_views()
 
-    def update_selection_summary(self):
+    def update_selection_summary(self, status=None):
+        text = Text()
+        if status is not None:
+            text.append(status, style="dim")
+            self.query_one("#selection-summary", Static).update(text)
+            return
         folders = sum(is_folder(entry["item"]) for entry in self.selections)
         files = len(self.selections) - folders
-        total_files, total_bytes = 0, 0
-        for entry in self.selections:
-            index = entry.get("index")
-            if is_folder(entry["item"]):
-                count, size = self.totals.get(index, (0, 0))
-            else:
-                count, size = 1, int(entry["item"].get("size") or 0)
-            total_files += count
-            total_bytes += size
-
-        text = Text()
+        total_files = sum(entry["totals"][0] for entry in self.selections)
+        total_bytes = sum(entry["totals"][1] for entry in self.selections)
         if self.selections:
             text.append(f"{len(self.selections)} selected", style="bold bright_green")
             parts = []
@@ -1193,10 +1507,15 @@ class DriveSelectorApp(App):
 
     def add_entry(self, entry):
         if add_selected_item(self.selections, entry["item"], entry["relative_parent"]):
-            # Keep the node index, so the summary can use the folder totals.
+            # Keep the view and totals, for the tab counts and the summary.
+            if is_folder(entry["item"]):
+                totals = tuple(self.totals.get(entry["index"], (0, 0)))
+            else:
+                totals = (1, int(entry["item"].get("size") or 0))
             for selected in self.selections:
                 if selected["item"] is entry["item"]:
-                    selected["index"] = entry["index"]
+                    selected["view"] = self.view
+                    selected["totals"] = totals
 
     def action_toggle_current(self):
         self.toggle_entry(self.current_entry())
@@ -1249,6 +1568,8 @@ class DriveSelectorApp(App):
                 stack.extend(current.children)
 
     def action_select_all(self):
+        if self.view.nodes is None:
+            return
         if self.filter_terms:
             targets = [
                 entry for entry in self.nodes
@@ -1264,11 +1585,7 @@ class DriveSelectorApp(App):
                 if selected_path(entry) not in paths
                 and not any(path in selected_path(entry).parents for path in paths)
             ]
-        elif self.filter_terms:
-            for entry in targets:
-                self.add_entry(entry)
         else:
-            self.selections.clear()
             for entry in targets:
                 self.add_entry(entry)
         self.refresh_node_labels()
@@ -1292,11 +1609,17 @@ class DriveSelectorApp(App):
             event.input.display = False
         self.query_one("#drive-tree", Tree).focus()
 
-    def clear_filter(self):
+    def clear_filter(self, rebuild=True):
         filter_input = self.query_one("#filter", Input)
         filter_input.display = False
         self.query_one("#drive-tree", Tree).focus()
-        if filter_input.value:
+        if not rebuild:
+            with filter_input.prevent(Input.Changed):
+                filter_input.value = ""
+            self.filter_terms = []
+            self.filter_visible = None
+            self.filter_ancestors = set()
+        elif filter_input.value:
             filter_input.value = ""  # Input.Changed rebuilds the tree
 
     def action_open_in_drive(self):
@@ -1309,13 +1632,18 @@ class DriveSelectorApp(App):
             self.notify("Could not open a browser.", severity="error")
 
     def action_change_destination(self):
+        if self.busy:
+            return
         initial = self.destination or Path(DOWNLOAD_PATH).expanduser()
 
         def changed(destination):
             if destination is None or destination == self.destination:
                 return
             self.destination = destination
-            self.marks = local_marks(self.nodes, destination, load_state(destination))
+            self.state = load_state(destination)
+            for view in self.views:
+                if view.nodes is not None:
+                    view.marks = local_marks(view.nodes, destination, self.state)
             self.update_sub_title()
             self.refresh_node_labels()
             self.notify(f"Downloading to {destination} for this session.")
@@ -1325,53 +1653,79 @@ class DriveSelectorApp(App):
     def action_help(self):
         self.push_screen(HelpScreen())
 
+    # Download: compare with the destination, then preview.
+
+    def local_scopes(self):
+        browsed = {}
+        for view in self.views:
+            browsed.update(view.browsed)
+        return build_local_scopes(self.selections, browsed, [view.base for view in self.views if view.nodes])
+
     def action_confirm(self):
+        if self.busy:
+            return
         if not self.selections:
             self.notify("Select at least one item.", severity="warning")
             return
-        self.exit(list(self.selections))
+        self.busy = True
+        self.update_selection_summary("Comparing with local files…")
+        selections, scopes, destination = list(self.selections), self.local_scopes(), self.destination
+        self.run_worker(lambda: self.plan_in_background(selections, scopes, destination), thread=True)
+
+    def plan_in_background(self, selections, scopes, destination):
+        checked = 0
+
+        def on_item():
+            nonlocal checked
+            checked += 1
+            if checked % 25 == 0:
+                self.call_from_thread(self.update_selection_summary, f"Comparing with local files… {checked}")
+
+        try:
+            state = load_state(destination)
+            plan = build_plan(self.make_service(), selections, scopes, destination, state, self.cache, on_item)
+        except (HttpError, OSError) as error:
+            self.call_from_thread(self.plan_failed, error_text(error))
+            return
+        result = {"plan": plan, "selections": selections, "scopes": scopes,
+                  "destination": destination, "state": state}
+        self.call_from_thread(self.plan_ready, result)
+
+    def plan_failed(self, message):
+        self.busy = False
+        self.update_selection_summary()
+        self.notify(f"Could not compare: {message}", severity="error")
+
+    def plan_ready(self, result):
+        self.busy = False
+        self.update_selection_summary()
+        if self.skip_preview:
+            self.exit(result)
+            return
+
+        def answered(confirmed):
+            if confirmed:
+                self.exit(result)
+
+        self.push_screen(PreviewScreen(result["plan"], result["destination"]), answered)
 
     def action_cancel(self):
         if self.query_one("#filter", Input).display:
             self.clear_filter()
             return
-        self.exit([])
+        self.exit(None)
 
     def action_quit_selector(self):
-        self.exit([])
+        self.exit(None)
 
 
-def browse_and_select(service, root_folder_id, cache, destination):
-    """Returns the selections, their local scopes, and the destination (f can change it)."""
-    with console.status("[dim]Loading the Drive tree…[/]") as status:
-        root_label = folder_name(service, root_folder_id)
-
-        def on_progress(folders, items):
-            status.update(
-                f"[dim]Loading the Drive tree… {plural(folders, 'folder')}, {plural(items, 'item')}[/]"
-            )
-
-        nodes, browsed_directories = collect_drive_tree(
-            service, root_folder_id, cache, on_progress
-        )
-    debug(f"Loaded {plural(len(nodes), 'item')} in {plural(len(cache), 'folder')}")
-    if not nodes:
-        console.print("[dim]No files or folders are visible at this location.[/]")
-        return [], [], destination
-
-    app = DriveSelectorApp(nodes, root_label, destination, load_state(destination))
-    selections = app.run()
-    if not selections:
-        return [], [], app.destination
-    return selections, build_local_scopes(selections, browsed_directories), app.destination
+ITEM_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId"
 
 
-ITEM_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed"
-
-
-def remember_selection(state, folder_id, selections, scopes):
+def remember_selection(state, selections, scopes, roots=()):
+    """Store the selection for --again; roots are views selected entirely, so new items there come too."""
     state["last_selection"] = {
-        "folder_id": folder_id,
+        "roots": [{"id": root_id, "base": base.as_posix()} for root_id, base in roots],
         "items": [
             {
                 "id": entry["item"]["id"],
@@ -1385,15 +1739,22 @@ def remember_selection(state, folder_id, selections, scopes):
     }
 
 
-def last_selection(service, state):
+def last_selection(service, state, cache):
     """The previous run's selection with fresh Drive metadata; items gone from Drive stay as local scopes."""
     saved = state.get("last_selection")
-    if not saved or not saved.get("items"):
+    if not saved or not (saved.get("items") or saved.get("roots")):
         return None
     selections = []
     scopes = [Path(scope) for scope in saved.get("scopes", [])]
+    for root in saved.get("roots", []):
+        if root["id"] == SHARED_WITH_ME:
+            cache.pop(SHARED_WITH_ME, None)  # a search, not a folder: Drive changes do not update it
+        for item in list_children(service, root["id"], cache):
+            add_selected_item(selections, item, Path(root["base"]))
     for saved_item in saved["items"]:
         relative_parent = Path(saved_item["relative_parent"])
+        if path_selection_state(Path(saved_item["path"]), selections) != " ":
+            continue  # already there through a whole view
         try:
             item = (
                 service.files()
@@ -1405,10 +1766,11 @@ def last_selection(service, state):
                 raise
             item = None
         if item is None or item.get("trashed"):
-            warn(f"{(relative_parent / saved_item['name']).as_posix()} is no longer on Drive")
+            warn(f"{saved_item['path']} is no longer on Drive")
             scopes.append(Path(saved_item["path"]))
             continue
-        selections.append({"item": item, "relative_parent": relative_parent})
+        note_drives([item])
+        add_selected_item(selections, item, relative_parent)
     return selections, compact_scopes(scopes)
 
 
@@ -1585,10 +1947,7 @@ def collect_plan(
     if mime_type == FOLDER_MIME_TYPE:
         folder_id = effective_id(item)
         status = "UNCHANGED" if destination.is_dir() else "NEW"
-        if relative_path in {
-            Path(STATE_FILE_NAME),
-            Path(RECOVERY_DIR_NAME),
-        }:
+        if relative_path in RESERVED_PATHS:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
             status = "SKIPPED"
@@ -1622,10 +1981,7 @@ def collect_plan(
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
 
-    if relative_path in {
-        Path(STATE_FILE_NAME),
-        Path(RECOVERY_DIR_NAME),
-    }:
+    if relative_path in RESERVED_PATHS:
         status = "CONFLICT"
         current_sha256 = None
     elif is_unsupported(item):
@@ -1734,12 +2090,14 @@ def add_local_only_entries(plan, destination_root, state, scopes):
 
         for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
             relative_path = child.relative_to(destination_root)
-            if relative_path.parts[0] in {
-                STATE_FILE_NAME,
-                f"{STATE_FILE_NAME}.tmp",
-                RECOVERY_DIR_NAME,
-            }:
+            if relative_path.parts[0] in RESERVED_NAMES:
                 continue
+            if (
+                relative_directory == Path()
+                and child.name in VIEW_DIRS
+                and relative_path not in remote_directories
+            ):
+                continue  # the Shared with me / Shared drives views have their own scopes
             if child.name.endswith(".gdrivepull.part"):
                 continue
 
@@ -1762,6 +2120,11 @@ def add_local_only_entries(plan, destination_root, state, scopes):
 
 
 def build_plan(service, selections, scopes, destination_root, state, cache, on_item=lambda: None):
+    prefetch_folders(
+        service,
+        [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
+        cache,
+    )
     plan = []
     for selection in selections:
         before = len(plan)
@@ -1832,14 +2195,160 @@ def print_plan(plan, destination_root):
     console.print(f"[bold]Preview[/]  {plan_summary(plan)}")
     if hidden:
         console.print(f"[dim]{plural(hidden, 'unchanged item')} not listed (--verbose lists them).[/]")
-    statuses = {entry["status"] for entry in plan}
-    if "CONFLICT" in statuses:
-        console.print("[dim]Conflicts are preserved and skipped.[/]")
-    if "LOCAL_ONLY" in statuses:
-        console.print("[dim]Local-only items are preserved and skipped.[/]")
-    if "REMOVED_REMOTE" in statuses:
-        console.print(f"[dim]Files removed from Drive are moved to {RECOVERY_DIR_NAME}/.[/]")
+    for note in plan_notes(plan):
+        console.print(f"[dim]{note}[/]")
     console.print(f"[dim]Destination:[/] {escape(str(destination_root))}")
+
+
+def plan_notes(plan):
+    statuses = {entry["status"] for entry in plan}
+    notes = []
+    if "CONFLICT" in statuses:
+        notes.append("Conflicts are preserved and skipped.")
+    if "LOCAL_ONLY" in statuses:
+        notes.append("Local-only items are preserved and skipped.")
+    if "REMOVED_REMOTE" in statuses:
+        notes.append(f"Files removed from Drive are moved to {RECOVERY_DIR_NAME}/.")
+    return notes
+
+
+PREVIEW_VIEWS = [
+    ("Changes", lambda entry: entry["status"] != "UNCHANGED"),
+    ("Everything", lambda entry: True),
+] + [
+    (label.capitalize(), lambda entry, status=status: entry["status"] == status)
+    for status, (_, label) in STATUS_STYLES.items()
+]
+
+
+class PreviewScreen(Screen):
+    """The plan before anything changes: y downloads, esc goes back (or cancels)."""
+
+    SUB_TITLE = "Preview"
+
+    DEFAULT_CSS = """
+    #preview-summary {
+        height: auto;
+        margin: 1 2 0 2;
+    }
+
+    #preview-table {
+        height: 1fr;
+        margin: 1 2 0 2;
+        border: round #38bdf8;
+        background: #081525;
+    }
+
+    #preview-table > .datatable--cursor {
+        background: #164e63;
+        color: #ffffff;
+    }
+
+    #preview-table > .datatable--header {
+        background: #0f2742;
+        color: #93c5fd;
+    }
+
+    #preview-notes {
+        height: auto;
+        margin: 0 2;
+        padding: 0 1;
+        color: #94a3b8;
+    }
+    """
+
+    BINDINGS = [
+        Binding("y", "confirm", "Download"),
+        Binding("v", "next_filter", "Show"),
+        Binding("escape,n", "back", "Back"),
+    ]
+
+    def __init__(self, plan, destination):
+        super().__init__()
+        self.plan = plan
+        self.destination = destination
+        self.filters = [
+            (name, keep) for name, keep in PREVIEW_VIEWS
+            if any(keep(entry) for entry in plan)
+        ] or PREVIEW_VIEWS[:1]
+        self.filter_index = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header(icon="")
+        yield Static(id="preview-summary")
+        yield DataTable(id="preview-table", cursor_type="row", zebra_stripes=False)
+        yield Static(id="preview-notes")
+        yield Footer()
+
+    def on_mount(self):
+        self.sub_title = f"preview · downloads to {short_path(self.destination)}"
+        table = self.query_one(DataTable)
+        table.add_column("STATUS", key="status")
+        table.add_column("ITEM", key="item")
+        table.add_column("SIZE", key="size")
+        notes = Text()
+        for note in plan_notes(self.plan):
+            notes.append(note + "\n")
+        if not has_actions(self.plan):
+            notes.append("Everything is up to date: y saves the state and quits.", style="bold green")
+        notes.rstrip()
+        self.query_one("#preview-notes", Static).update(notes)
+        self.fill()
+        table.focus()
+
+    def fill(self):
+        name, keep = self.filters[self.filter_index]
+        rows = [entry for entry in self.plan if keep(entry)]
+        summary = Text.from_markup(f"[bold]Preview[/]  {plan_summary(self.plan)}")
+        summary.append("\nShowing: ", style="dim")
+        summary.append(name, style="bold #f59e0b")
+        summary.append(f" ({plural(len(rows), 'item')})", style="dim")
+        if len(self.filters) > 1:
+            summary.append("   v: next", style="dim")
+        self.query_one("#preview-summary", Static).update(summary)
+
+        table = self.query_one(DataTable)
+        table.clear()
+        for entry in rows:
+            style, label = STATUS_STYLES[entry["status"]]
+            path = entry["relative_path"].as_posix()
+            item = entry.get("item")
+            size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
+            table.add_row(
+                Text(label, style=style),
+                Text(path + "/", style="cyan") if entry["kind"] == "FOLDER" else Text(path),
+                Text(size if size != "-" else "", style="dim", justify="right"),
+            )
+
+    def action_next_filter(self):
+        self.filter_index = (self.filter_index + 1) % len(self.filters)
+        self.fill()
+
+    def action_confirm(self):
+        self.dismiss(True)
+
+    def action_back(self):
+        self.dismiss(False)
+
+
+class StandalonePreviewScreen(PreviewScreen):
+    BINDINGS = [Binding("escape,n,q", "back", "Cancel")]
+
+
+class PreviewApp(App):
+    """The preview on its own, for --again."""
+
+    TITLE = APP_NAME
+    ENABLE_COMMAND_PALETTE = False
+    CSS = SHARED_CSS
+
+    def __init__(self, plan, destination):
+        super().__init__()
+        self.plan = plan
+        self.destination = destination
+
+    def on_mount(self):
+        self.push_screen(StandalonePreviewScreen(self.plan, self.destination), self.exit)
 
 
 def set_remote_mtime(destination, item):
@@ -2130,63 +2639,92 @@ def main():
             raise SystemExit(1)
 
         creds = authenticate()
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        cache = {}
+
+        def make_service():
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        service = make_service()
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
         if args.again:
             state = load_state(destination_root)
-            saved = state.get("last_selection") or {}
-            folder_id = saved.get("folder_id", args.folder_id)
-            with console.status("[dim]Checking the previous selection…[/]"):
-                again = last_selection(service, state)
-            if again is None:
+            if not state.get("last_selection"):
                 console.print(
                     f"[red]✗[/] No previous selection in {escape(str(destination_root))}: "
                     "run once without --again."
                 )
                 raise SystemExit(1)
-            selections, local_scopes = again
+            with console.status("[dim]Checking Drive changes…[/]"):
+                snapshot = load_snapshot(destination_root)
+                replayed = apply_changes(service, snapshot) if snapshot else None
+                if replayed:
+                    cache, token = replayed
+                else:
+                    cache, token = {}, start_page_token(service)
+                selections, local_scopes = last_selection(service, state, cache)
             names = ", ".join(escape(entry["item"]["name"]) for entry in selections[:5])
             more = f" and {len(selections) - 5} more" if len(selections) > 5 else ""
             console.print(f"[bold]Again[/]  {names}{more} [dim]→ {escape(str(destination_root))}[/]")
-        else:
-            folder_id = args.folder_id
-            selections, local_scopes, destination_root = browse_and_select(
-                service, folder_id, cache, destination_root
-            )
-            if not selections:
-                console.print("[dim]Nothing selected.[/]")
-                return
-            state = load_state(destination_root)
+            roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
+            with console.status("[dim]Comparing with local files…[/]") as status:
+                checked = 0
 
-        with console.status("[dim]Comparing with local files…[/]") as status:
-            checked = 0
+                def on_item():
+                    nonlocal checked
+                    checked += 1
+                    if checked % 25 == 0:
+                        status.update(f"[dim]Comparing with local files… {checked}[/]")
 
-            def on_item():
-                nonlocal checked
-                checked += 1
-                status.update(f"[dim]Comparing with local files… {checked}[/]")
-
-            plan = build_plan(
-                service, selections, local_scopes, destination_root, state, cache, on_item
-            )
-        print_plan(plan, destination_root)
-        remember_selection(state, folder_id, selections, local_scopes)
-
-        if not has_actions(plan):
-            apply_plan(service, plan, destination_root, state)
-            console.print("[green]✓[/] Everything is up to date.")
-            return
-
-        if not args.yes:
-            answer = console.input("\nProceed? [y/N] ").strip().lower()
-            if answer not in {"y", "yes"}:
+                plan = build_plan(service, selections, local_scopes, destination_root, state, cache, on_item)
+            if args.yes or not interactive:
+                print_plan(plan, destination_root)
+                if not args.yes and has_actions(plan):
+                    answer = console.input("\nProceed? [y/N] ").strip().lower()
+                    if answer not in {"y", "yes"}:
+                        console.print("[dim]Cancelled. No files were changed.[/]")
+                        return
+            elif not PreviewApp(plan, destination_root).run():
                 console.print("[dim]Cancelled. No files were changed.[/]")
                 return
+        else:
+            token = start_page_token(service)
+            cache = {}
+            with console.status("[dim]Loading the Drive tree…[/]") as status:
+                views = drive_views(service, args.folder_id)
 
-        results = apply_plan(
-            service, plan, destination_root, state, args.jobs,
-            lambda: build("drive", "v3", credentials=creds, cache_discovery=False),
+                def on_progress(folders, items):
+                    status.update(
+                        f"[dim]Loading the Drive tree… {plural(folders, 'folder')}, {plural(items, 'item')}[/]"
+                    )
+
+                load_view(service, views[0], cache, on_progress)
+            debug(f"Loaded {plural(len(views[0].nodes), 'item')} in {plural(len(cache), 'folder')}")
+            result = DriveSelectorApp(
+                views, destination_root, load_state(destination_root), service, make_service, cache,
+                skip_preview=args.yes,
+            ).run()
+            if not result:
+                console.print("[dim]Nothing downloaded.[/]")
+                return
+            plan, selections, local_scopes = result["plan"], result["selections"], result["scopes"]
+            destination_root, state = result["destination"], result["state"]
+            roots = [
+                (view.root_id, view.base) for view in views
+                if view.nodes and fully_selected(view.browsed.get(view.base, []), view.base, selections)
+            ]
+            if args.yes:
+                print_plan(plan, destination_root)
+
+        remember_selection(state, selections, local_scopes, roots)
+        results = apply_plan(service, plan, destination_root, state, args.jobs, make_service)
+        save_snapshot(
+            destination_root, token, cache,
+            [root_id for root_id, _ in roots]
+            + [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
         )
+        if not has_actions(plan):
+            console.print("[green]✓[/] Everything is up to date.")
+            return
         print_results(results)
         if results["FILE_ERROR"] or results["FOLDER_ERROR"]:
             raise SystemExit(1)
