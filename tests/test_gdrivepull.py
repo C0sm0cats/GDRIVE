@@ -88,7 +88,12 @@ class FakeDrive:
         return FakeRequest(run)
 
     def get(self, fileId, **kwargs):
-        return FakeRequest(lambda: self.public(self.items[fileId]))
+        def run():
+            if fileId not in self.items:
+                raise http_error(404)
+            return self.public(self.items[fileId])
+
+        return FakeRequest(run)
 
     def get_media(self, fileId, **kwargs):
         return self.items[fileId]["content"]
@@ -97,7 +102,7 @@ class FakeDrive:
         return self.items[fileId]["content"]
 
 
-def fake_fetch(service, item, file_handle):
+def fake_fetch(service, item, file_handle, stop=None):
     file_handle.write(service.items[gdrivepull.effective_id(item)]["content"])
 
 
@@ -233,7 +238,7 @@ class SyncTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.drive = demo_drive()
 
-    def run_sync(self):
+    def run_sync(self, jobs=1):
         cache = {}
         nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
         selections = []
@@ -245,7 +250,7 @@ class SyncTest(unittest.TestCase):
         plan = gdrivepull.build_plan(self.drive, selections, scopes, self.root, state, cache)
         statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
         with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
-            results = gdrivepull.apply_plan(self.drive, plan, self.root, state)
+            results = gdrivepull.apply_plan(self.drive, plan, self.root, state, jobs, lambda: self.drive)
         return statuses, results
 
     def test_first_run_then_unchanged(self):
@@ -279,13 +284,72 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(len(recovered), 1)
         self.assertEqual(results["FILE_REMOVED_REMOTE"], 1)
 
+    def test_parallel_downloads(self):
+        for i in range(20):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", f"file {i}".encode())
+        statuses, results = self.run_sync(jobs=4)
+        self.assertEqual(results["FILE_NEW"], 25)
+        self.assertEqual((self.root / "Photos/m7.txt").read_bytes(), b"file 7")
+        state = gdrivepull.load_state(self.root)
+        self.assertEqual(len(state["files"]), 25)
+
+    def test_marks(self):
+        self.run_sync()
+        nodes, _ = gdrivepull.collect_drive_tree(self.drive, "root", {})
+        by_path = {node["display_path"]: node["index"] for node in nodes}
+
+        def marks():
+            state = gdrivepull.load_state(self.root)
+            found = gdrivepull.local_marks(nodes, self.root, state)
+            return {path: found.get(index) for path, index in by_path.items()}
+
+        self.assertEqual(marks()["Docs/a.txt"], "synced")
+        self.assertEqual(marks()["Docs"], "synced")
+        self.assertIsNone(marks()["Docs/Survey"])
+        os.utime(self.root / "Docs/b.txt", (0, 0))  # edited locally
+        self.assertEqual(marks()["Docs/b.txt"], "edited")
+        self.assertEqual(marks()["Docs"], "edited")
+        nodes[by_path["Photos/beach.jpg"]]["item"]["md5Checksum"] = "new"  # changed on Drive
+        self.assertEqual(marks()["Photos/beach.jpg"], "changed")
+        self.assertEqual(marks()["Photos"], "changed")
+        (self.root / "notes.txt").unlink()
+        self.assertIsNone(marks()["notes.txt"])
+
+    def test_again(self):
+        cache = {}
+        nodes, browsed = gdrivepull.collect_drive_tree(self.drive, "root", cache)
+        by_path = {node["display_path"]: node for node in nodes}
+        selections = []
+        for path in ("Photos", "Docs/a.txt"):
+            gdrivepull.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
+        scopes = gdrivepull.build_local_scopes(selections, browsed)
+        state = gdrivepull.load_state(self.root)
+        gdrivepull.remember_selection(state, "root", selections, scopes)
+        gdrivepull.save_state(self.root, state)
+
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        del self.drive.items["photos"]
+        with mock.patch.object(gdrivepull, "console", Console(file=io.StringIO())):
+            again, again_scopes = gdrivepull.last_selection(self.drive, gdrivepull.load_state(self.root))
+        self.assertEqual([entry["item"]["name"] for entry in again], ["a.txt"])
+        self.assertEqual(again[0]["item"]["md5Checksum"], self.drive.items["a"]["md5Checksum"])
+        self.assertEqual(again_scopes, [Path("Photos")])  # gone from Drive: still scanned locally
+        self.assertIsNone(gdrivepull.last_selection(self.drive, {"files": {}}))
+
+    def test_destination_option(self):
+        target = Path(self.temp.name) / "Once"
+        self.assertEqual(gdrivepull.resolve_destination(str(target)), target)
+        self.assertTrue(gdrivepull.has_valid_state(target))
+        with self.assertRaises(OSError):
+            gdrivepull.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
+
     def test_existing_identical_file_is_adopted(self):
         (self.root / "notes.txt").write_bytes(b"notes")
         statuses, _ = self.run_sync()
         self.assertEqual(statuses["notes.txt"], "UNCHANGED")
 
     def test_interrupted_download_leaves_no_part_file(self):
-        def interrupted(service, item, file_handle):
+        def interrupted(service, item, file_handle, stop=None):
             file_handle.write(b"partial")
             raise KeyboardInterrupt
 
@@ -351,6 +415,31 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.selected(app), [])
             await pilot.press("escape")
         self.assertEqual(app.return_value, [])
+
+    async def test_columns_are_aligned(self):
+        app = self.make_app()
+        async with app.run_test(size=(120, 20)) as pilot:
+            app.action_expand_all()
+            await pilot.pause()
+            tree = app.query_one(Tree)
+            lines = ["".join(segment.text for segment in tree.render_line(y)) for y in range(9)]
+        columns = {line.index(" 5 B") for line in lines if " 5 B" in line}
+        self.assertEqual(len(columns), 1, lines)
+
+    async def test_session_destination(self):
+        app = self.make_app()
+        with tempfile.TemporaryDirectory() as temp:
+            async with app.run_test() as pilot:
+                await pilot.press("f")
+                self.assertIsInstance(app.screen, gdrivepull.DestinationSetupScreen)
+                app.screen.query_one("#parent-path", Input).value = temp
+                app.screen.query_one("#folder-name", Input).value = "Session"
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                self.assertEqual(app.destination, Path(temp).resolve() / "Session")
+                self.assertTrue(gdrivepull.has_valid_state(app.destination))
+                self.assertIn("Session", app.sub_title)
+                await pilot.press("q")
 
     async def test_help_and_expand_all(self):
         app = self.make_app()

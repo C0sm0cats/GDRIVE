@@ -4,6 +4,7 @@ Run from the repository root:  .venv/bin/python docs/make_screenshot.py
 It runs the real selector headless (Textual's test driver) and exports its screen as SVG.
 """
 import asyncio
+import html
 import os
 import re
 import sys
@@ -62,6 +63,22 @@ def demo_nodes():
     return nodes
 
 
+def one_text_per_cell(match):
+    """Place each character at its own cell, like a terminal: viewers that ignore textLength stay aligned."""
+    attributes, content = match.groups()
+    position = dict(re.findall(r'(x|textLength)="([\d.]+)"', attributes))
+    chars = html.unescape(content)
+    if "textLength" not in position or len(chars) < 2:
+        return match.group(0)
+    common = re.sub(r'\s*(x|textLength)="[^"]*"', "", attributes)
+    left, cell = float(position["x"]), float(position["textLength"]) / len(chars)
+    return "".join(
+        f'<text {common} x="{left + i * cell:.1f}">{html.escape(char)}</text>'
+        for i, char in enumerate(chars)
+        if not char.isspace()
+    )
+
+
 def plain_svg(svg):
     """Turn Textual's SVG into one without <style>, web fonts or clip paths, with a fixed size.
 
@@ -87,12 +104,19 @@ def plain_svg(svg):
     svg = re.sub(r'\s*clip-path="[^"]*"', "", svg)
     svg = re.sub(r'class="([^"]*)"', lambda match: rules.get(match.group(1), ""), svg)
     svg = re.sub(r"<!--.*?-->", "", svg, flags=re.S)
+    svg = re.sub(r"<text ([^>]*)>([^<]*)</text>", one_text_per_cell, svg)
     width, height = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', svg).groups()
     return svg.replace("<svg ", f'<svg width="{width}" height="{height}" ', 1)
 
 
 async def render():
-    app = gdrivepull.DriveSelectorApp(demo_nodes(), "My Drive", Path.home() / "GDrive")
+    nodes = demo_nodes()
+    app = gdrivepull.DriveSelectorApp(nodes, "My Drive", Path.home() / "GDrive")
+    # Marks as after an earlier download: Taxes up to date, one file changed on Drive, one edited locally.
+    by_name = {entry["item"]["name"]: entry["index"] for entry in nodes}
+    app.marks = {by_name["2025 return.pdf"]: "synced", by_name["Receipts.zip"]: "synced",
+                 by_name["Taxes"]: "synced", by_name["Budget 2026"]: "changed",
+                 by_name["Lease agreement.pdf"]: "edited", by_name["Documents"]: "edited"}
     async with app.run_test(size=(COLUMNS, ROWS)) as pilot:
         # Documents and Taxes open, Photos and a document selected, cursor on the lease.
         by_name = {entry["item"]["name"]: entry for entry in app.nodes}

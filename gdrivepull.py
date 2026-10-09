@@ -5,9 +5,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     DirectoryTree,
@@ -41,7 +43,7 @@ from textual.widgets import (
 APP_NAME = "GDrive Pull"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 SCRIPT_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = SCRIPT_DIR / "settings.json"
+DOWNLOAD_PATH = "~/GDrive"
 TOKEN_PATH = SCRIPT_DIR / "token.json"
 CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 STATE_FILE_NAME = ".gdrivepull-managed-state.json"
@@ -192,37 +194,6 @@ def authenticate():
 
 
 # --- Settings and managed destination --------------------------------------
-
-def read_configured_destination():
-    if not SETTINGS_PATH.exists():
-        return None
-    try:
-        settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-        download_path = settings.get("download_path")
-        if not isinstance(download_path, str) or not download_path:
-            raise ValueError("missing download_path")
-        destination = Path(download_path)
-        if not destination.is_absolute():
-            raise ValueError("download_path must be absolute")
-        return destination
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        warn(f"Ignoring invalid settings file: {error}")
-        return None
-
-
-def write_configured_destination(destination):
-    temporary_path = SETTINGS_PATH.with_suffix(".json.tmp")
-    temporary_path.write_text(
-        json.dumps(
-            {"download_path": str(destination)},
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_path, SETTINGS_PATH)
-
 
 def has_valid_state(destination):
     state_path = destination / STATE_FILE_NAME
@@ -580,12 +551,12 @@ Footer {
 """
 
 
-class DestinationSetupApp(App):
-    TITLE = APP_NAME
-    SUB_TITLE = "Destination setup"
-    ENABLE_COMMAND_PALETTE = False
+class DestinationSetupScreen(Screen):
+    """Pick the download folder for this session (f in the tree)."""
 
-    CSS = SHARED_CSS + """
+    SUB_TITLE = "Download folder for this session"
+
+    DEFAULT_CSS = """
     #setup-body {
         height: 1fr;
         padding: 1 2;
@@ -698,6 +669,7 @@ class DestinationSetupApp(App):
 
     def on_mount(self):
         self.update_final_path()
+        self.query_one("#directory-tree").focus()
 
     @on(DirectoryTree.DirectorySelected)
     def directory_selected(self, event):
@@ -762,31 +734,15 @@ class DestinationSetupApp(App):
         try:
             destination = self.destination_from_inputs()
             destination = initialize_managed_destination(destination)
-            write_configured_destination(destination)
         except (OSError, ValueError) as error:
             status.update(
                 Text(str(error), style="bold bright_red")
             )
             return
-        self.exit(destination)
+        self.dismiss(destination)
 
     def action_cancel(self):
-        self.exit(None)
-
-
-def configure_destination(force_configuration=False):
-    configured = read_configured_destination()
-    if (
-        configured is not None
-        and not force_configuration
-        and has_valid_state(configured)
-    ):
-        return configured
-
-    if configured is not None and not has_valid_state(configured):
-        warn(f"The configured destination has no valid {STATE_FILE_NAME}: {configured}")
-    initial_destination = configured or (Path.home() / "GDrive")
-    return DestinationSetupApp(initial_destination).run()
+        self.dismiss(None)
 
 
 # --- Drive selector --------------------------------------------------------
@@ -801,11 +757,96 @@ KEY_HELP = [
     ("e", "expand or collapse everything below the cursor"),
     ("/", "filter by name or path: enter keeps the filter, esc clears it"),
     ("o", "open the item in Google Drive"),
+    ("f", "change the download folder for this session"),
     ("d", "continue to the download preview"),
     ("?", "this help"),
     ("q esc", "quit"),
 ]
 KEY_HELP_NOTE = "Nothing changes on disk before the preview is confirmed."
+MARKS = {
+    "synced": ("✓", "green", "downloaded and up to date"),
+    "changed": ("↻", "bright_cyan", "changed on Drive, or new files in the folder"),
+    "edited": ("✎", "yellow", "changed locally (kept as a conflict)"),
+}
+
+
+def help_lines():
+    lines = [f"  {key:<8}{description}" for key, description in KEY_HELP]
+    lines += ["", "marks (from the last downloads):"]
+    lines += [f"  {symbol:<8}{description}" for symbol, _, description in MARKS.values()]
+    return lines + ["", "  " + KEY_HELP_NOTE]
+
+
+def mtime_matches(path_stat, modified_time):
+    if not modified_time:
+        return False
+    timestamp = datetime.fromisoformat(modified_time.replace("Z", "+00:00")).timestamp()
+    return abs(path_stat.st_mtime - timestamp) < 2
+
+
+NAME_COLUMN_MAX = 64  # cells from the tree's left edge to the end of the names
+
+
+def label_start(node, children_of):
+    """Cells before a node's label: tree guides, plus the expand arrow of folders with children."""
+    depth = len(node["relative_parent"].parts) + 1
+    return depth * 4 + (2 if node["index"] in children_of else 0)
+
+
+def name_column(nodes):
+    children_of = {node["parent"] for node in nodes}
+    widest = 0
+    for node in nodes:
+        prefix = 4 + (2 if node["item"]["mimeType"] == SHORTCUT_MIME_TYPE else 0)  # checkbox, mark
+        widest = max(widest, label_start(node, children_of) + prefix + Text(node["item"]["name"]).cell_len)
+    return min(widest, NAME_COLUMN_MAX)
+
+
+def local_marks(nodes, destination, state):
+    """Mark files already downloaded (from the managed state, without hashing) and sum them up per folder."""
+    if destination is None or state is None:
+        return {}
+    tracked = tracked_files_by_path(state)
+    marks = {}
+    counts = {}  # folder index -> Counter of its files' marks ("" = not downloaded yet)
+    for node in reversed(nodes):
+        item = node["item"]
+        index = node["index"]
+        if is_folder(item):
+            folder = counts.get(index, Counter())
+            if folder["edited"]:
+                marks[index] = "edited"
+            elif folder["changed"] or (folder["synced"] and folder[""]):
+                marks[index] = "changed"
+            elif folder["synced"]:
+                marks[index] = "synced"
+            own = folder
+        else:
+            own = Counter()
+            if is_unsupported(item) or item["mimeType"] == SHORTCUT_MIME_TYPE:
+                pass  # no local copy, or no metadata to compare before the preview resolves it
+            else:
+                mark = ""
+                relative_path = selected_path(node)
+                record = tracked.get(relative_path, (None, {}))[1]
+                if record.get("remote_id") == effective_id(item):
+                    try:
+                        path_stat = (destination / relative_path).stat()
+                    except OSError:
+                        path_stat = None
+                    if path_stat is not None:
+                        if remote_signature(item) != record.get("remote_signature"):
+                            mark = "changed"
+                        elif not mtime_matches(path_stat, record.get("modified_time")):
+                            mark = "edited"
+                        else:
+                            mark = "synced"
+                if mark:
+                    marks[index] = mark
+                own[mark] += 1
+        if node["parent"] is not None:
+            counts.setdefault(node["parent"], Counter()).update(own)
+    return marks
 
 
 def drive_url(item):
@@ -839,6 +880,11 @@ class HelpScreen(ModalScreen):
         text.append("Keys\n\n", style="bold bright_cyan")
         for key, description in KEY_HELP:
             text.append(f"{key:<8}", style="bold bright_white")
+            text.append(f"{description}\n")
+        text.append("\nMarks", style="bold bright_cyan")
+        text.append(" (from the last downloads)\n\n", style="dim")
+        for symbol, style, description in MARKS.values():
+            text.append(f"{symbol:<8}", style=f"bold {style}")
             text.append(f"{description}\n")
         text.append(f"\n{KEY_HELP_NOTE}", style="dim")
         yield Static(text, id="help")
@@ -898,17 +944,20 @@ class DriveSelectorApp(App):
         Binding("c", "clear_selection", "Unselect all"),
         Binding("slash", "start_filter", "Filter"),
         Binding("o", "open_in_drive", "Open in Drive", show=False),
+        Binding("f", "change_destination", "Folder"),
         Binding("d", "confirm", "Download"),
         Binding("question_mark", "help", "Help"),
         Binding("escape", "cancel", "Quit"),
         Binding("q", "quit_selector", "Quit", show=False),
     ]
 
-    def __init__(self, nodes, root_label="My Drive", destination=None):
+    def __init__(self, nodes, root_label="My Drive", destination=None, state=None):
         super().__init__()
         self.nodes = nodes
         self.root_label = root_label
         self.destination = destination
+        self.marks = local_marks(nodes, destination, state)
+        self.name_column = name_column(nodes)
         self.children_of = {}
         for node in nodes:
             self.children_of.setdefault(node["parent"], []).append(node)
@@ -922,7 +971,7 @@ class DriveSelectorApp(App):
         self.filter_visible = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(icon="")
         yield DriveTree(
             Text(self.root_label, style="bold bright_blue"),
             id="drive-tree",
@@ -934,8 +983,7 @@ class DriveSelectorApp(App):
         yield Footer()
 
     def on_mount(self):
-        if self.destination is not None:
-            self.sub_title = f"{self.root_label} → {self.destination}"
+        self.update_sub_title()
         tree = self.query_one("#drive-tree", Tree)
         self.populate(tree.root)
         tree.root.expand()
@@ -1024,40 +1072,53 @@ class DriveSelectorApp(App):
 
     # Labels and summary.
 
+    def update_sub_title(self):
+        if self.destination is not None:
+            self.sub_title = f"{self.root_label} → {self.destination}"
+        else:
+            self.sub_title = self.root_label
+
     def node_label(self, entry):
         item = entry["item"]
         state = path_selection_state(selected_path(entry), self.selections)
-        checkbox = {"x": "☑", "*": "◩"}.get(state, "☐")
         label = Text()
         label.append(
-            f"{checkbox} ",
+            {"x": "☑ ", "*": "◩ "}.get(state, "☐ "),
             style="bold bright_green" if state != " " else "bright_black",
         )
+        mark = self.marks.get(entry["index"])
+        if mark:
+            symbol, style, _ = MARKS[mark]
+            label.append(f"{symbol} ", style=style)
+        else:
+            label.append("  ")
         if item["mimeType"] == SHORTCUT_MIME_TYPE:
             label.append("↪ ", style="bright_magenta")
-        if is_folder(item):
-            label.append(item["name"], style="bold cyan")
-            files, size = self.totals.get(entry["index"], (0, 0))
-            details = plural(files, "file")
-            if size:
-                details += f" · {human_size(size)}"
-            label.append(f"   {details}", style="dim")
-            return label
 
-        unsupported = is_unsupported(item)
-        label.append(item["name"], style="bright_black" if unsupported else "bright_white")
+        folder = is_folder(item)
+        unsupported = not folder and is_unsupported(item)
+        name_style = "bold cyan" if folder else "bright_black" if unsupported else "bright_white"
+        width = self.name_column - label_start(entry, self.children_of) - label.cell_len
+        name = Text(item["name"], style=name_style)
+        name.truncate(max(width, 4), overflow="ellipsis", pad=True)
+        label.append_text(name)
+
         mime_type = effective_mime_type(item)
-        details = []
-        if mime_type in EXPORT_FORMATS:
-            details.append(f"→ {EXPORT_FORMATS[mime_type][1]}")
-        elif unsupported:
-            details.append("not downloadable")
-        if item.get("size"):
-            details.append(display_size(item))
-        if display_date(item):
-            details.append(display_date(item))
-        if details:
-            label.append("   " + " · ".join(details), style="dim")
+        if folder:
+            files, size = self.totals.get(entry["index"], (0, 0))
+            size_text, date_text, info = human_size(size) if size else "", "", plural(files, "file")
+        else:
+            size_text = display_size(item) if item.get("size") else ""
+            date_text = display_date(item)
+            if mime_type in EXPORT_FORMATS:
+                info = f"→ {EXPORT_FORMATS[mime_type][1]}"
+            elif unsupported:
+                info = "not downloadable"
+            else:
+                info = ""
+        label.append(f"  {size_text:>7}  {date_text:<10}  ", style="dim")
+        label.append(info, style="dim")
+        label.rstrip()
         return label
 
     def refresh_node_labels(self):
@@ -1247,6 +1308,20 @@ class DriveSelectorApp(App):
         else:
             self.notify("Could not open a browser.", severity="error")
 
+    def action_change_destination(self):
+        initial = self.destination or Path(DOWNLOAD_PATH).expanduser()
+
+        def changed(destination):
+            if destination is None or destination == self.destination:
+                return
+            self.destination = destination
+            self.marks = local_marks(self.nodes, destination, load_state(destination))
+            self.update_sub_title()
+            self.refresh_node_labels()
+            self.notify(f"Downloading to {destination} for this session.")
+
+        self.push_screen(DestinationSetupScreen(initial), changed)
+
     def action_help(self):
         self.push_screen(HelpScreen())
 
@@ -1266,7 +1341,8 @@ class DriveSelectorApp(App):
         self.exit([])
 
 
-def browse_and_select(service, root_folder_id, cache, destination=None):
+def browse_and_select(service, root_folder_id, cache, destination):
+    """Returns the selections, their local scopes, and the destination (f can change it)."""
     with console.status("[dim]Loading the Drive tree…[/]") as status:
         root_label = folder_name(service, root_folder_id)
 
@@ -1281,14 +1357,59 @@ def browse_and_select(service, root_folder_id, cache, destination=None):
     debug(f"Loaded {plural(len(nodes), 'item')} in {plural(len(cache), 'folder')}")
     if not nodes:
         console.print("[dim]No files or folders are visible at this location.[/]")
-        return [], []
+        return [], [], destination
 
-    selections = DriveSelectorApp(nodes, root_label, destination).run()
+    app = DriveSelectorApp(nodes, root_label, destination, load_state(destination))
+    selections = app.run()
     if not selections:
-        return [], []
-    return selections, build_local_scopes(
-        selections, browsed_directories
-    )
+        return [], [], app.destination
+    return selections, build_local_scopes(selections, browsed_directories), app.destination
+
+
+ITEM_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed"
+
+
+def remember_selection(state, folder_id, selections, scopes):
+    state["last_selection"] = {
+        "folder_id": folder_id,
+        "items": [
+            {
+                "id": entry["item"]["id"],
+                "name": entry["item"]["name"],
+                "relative_parent": entry["relative_parent"].as_posix(),
+                "path": selected_path(entry).as_posix(),
+            }
+            for entry in selections
+        ],
+        "scopes": [scope.as_posix() for scope in scopes],
+    }
+
+
+def last_selection(service, state):
+    """The previous run's selection with fresh Drive metadata; items gone from Drive stay as local scopes."""
+    saved = state.get("last_selection")
+    if not saved or not saved.get("items"):
+        return None
+    selections = []
+    scopes = [Path(scope) for scope in saved.get("scopes", [])]
+    for saved_item in saved["items"]:
+        relative_parent = Path(saved_item["relative_parent"])
+        try:
+            item = (
+                service.files()
+                .get(fileId=saved_item["id"], fields=ITEM_FIELDS, supportsAllDrives=True)
+                .execute(num_retries=API_RETRIES)
+            )
+        except HttpError as error:
+            if error.status_code != 404:
+                raise
+            item = None
+        if item is None or item.get("trashed"):
+            warn(f"{(relative_parent / saved_item['name']).as_posix()} is no longer on Drive")
+            scopes.append(Path(saved_item["path"]))
+            continue
+        selections.append({"item": item, "relative_parent": relative_parent})
+    return selections, compact_scopes(scopes)
 
 
 # --- Planning --------------------------------------------------------------
@@ -1383,13 +1504,30 @@ def download_request(service, item):
     )
 
 
-def fetch_media(service, item, file_handle):
+class Stopped(Exception):
+    """Raised in download threads after Ctrl+C."""
+
+
+def fetch_media(service, item, file_handle, stop=None):
     downloader = MediaIoBaseDownload(
         file_handle, download_request(service, item), chunksize=8 * 1024 * 1024
     )
     done = False
     while not done:
+        if stop is not None and stop.is_set():
+            raise Stopped()
         _, done = downloader.next_chunk(num_retries=API_RETRIES)
+
+
+class CountingWriter:
+    def __init__(self, file_handle, on_bytes):
+        self.file_handle = file_handle
+        self.on_bytes = on_bytes
+
+    def write(self, data):
+        written = self.file_handle.write(data)
+        self.on_bytes(len(data))
+        return written
 
 
 def remote_export_hash(service, item):
@@ -1714,7 +1852,7 @@ def set_remote_mtime(destination, item):
     os.utime(destination, (timestamp, timestamp))
 
 
-def download_file_atomically(service, entry):
+def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: None):
     destination = entry["destination"]
     temporary = destination.with_name(
         f".{destination.name}.gdrivepull.part"
@@ -1723,7 +1861,7 @@ def download_file_atomically(service, entry):
 
     try:
         with temporary.open("wb") as file_handle:
-            fetch_media(service, entry["item"], file_handle)
+            fetch_media(service, entry["item"], CountingWriter(file_handle, on_bytes), stop)
         set_remote_mtime(temporary, entry["item"])
         os.replace(temporary, destination)
     except BaseException:
@@ -1762,93 +1900,130 @@ def unused_recovery_target(recovery_root, relative_path):
         counter += 1
 
 
-def apply_plan(service, plan, destination_root, state):
+def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
+    """Apply the confirmed plan; downloads run in jobs threads, each with its own Drive client."""
     results = Counter()
     recovery_root = (
         destination_root
         / RECOVERY_DIR_NAME
         / datetime.now().strftime("%Y%m%d-%H%M%S")
     )
-    downloads = sum(
-        entry["kind"] == "FILE" and entry["status"] in {"NEW", "UPDATE"} and entry.get("item") is not None
-        for entry in plan
-    )
+    downloads = []
     progress = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[transfer]}[/]"),
         console=console,
         transient=True,
     )
-    task = progress.add_task("Downloading", total=downloads)
 
     def report(mark, text):
         progress.console.print(f"{mark} {escape(text)}")
 
+    for entry in plan:
+        status = entry["status"]
+        relative = entry["relative_path"].as_posix()
+        if entry.get("item") is None:
+            if status == "REMOVED_REMOTE":
+                try:
+                    recovery_target = unused_recovery_target(
+                        recovery_root, entry["relative_path"]
+                    )
+                    recovery_target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(entry["destination"], recovery_target)
+                    report(
+                        "[magenta]→[/]",
+                        f"{relative} moved to {recovery_target.relative_to(destination_root)}",
+                    )
+                    if entry.get("state_key"):
+                        state["files"].pop(entry["state_key"], None)
+                    results["FILE_REMOVED_REMOTE"] += 1
+                except OSError as error:
+                    results[f"{entry['kind']}_ERROR"] += 1
+                    report("[red]✗[/]", f"{relative}: could not move to recovery: {error}")
+            else:
+                results[f"{entry['kind']}_{status}"] += 1
+            continue
+
+        if entry["kind"] == "FOLDER":
+            if status == "NEW":
+                try:
+                    entry["destination"].mkdir(parents=True, exist_ok=True)
+                except OSError as error:
+                    results["FOLDER_ERROR"] += 1
+                    report("[red]✗[/]", f"{relative}/: {error}")
+                    continue
+            results[f"FOLDER_{status}"] += 1
+            continue
+
+        if status == "UNCHANGED":
+            local_sha256 = entry.get("local_sha256") or file_hash(entry["destination"])
+            state["files"][state_key(entry["item"], entry["relative_path"])] = state_record(entry, local_sha256)
+            try:
+                set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
+            except OSError:
+                pass
+            results["FILE_UNCHANGED"] += 1
+        elif status in {"CONFLICT", "SKIPPED"}:
+            results[f"FILE_{status}"] += 1
+        else:
+            downloads.append(entry)
+
+    if not downloads:
+        save_state(destination_root, state)
+        return results
+
+    stop = threading.Event()
+    lock = threading.Lock()
+    clients = threading.local()
+    started = time.monotonic()
+    transferred = 0
+    task = progress.add_task("Downloading", total=len(downloads), transfer="")
+
+    def on_bytes(count):
+        nonlocal transferred
+        with lock:
+            transferred += count
+            done = transferred
+        speed = done / max(time.monotonic() - started, 0.001)
+        progress.update(task, transfer=f"{human_size(done)} · {human_size(speed)}/s")
+
+    def download(entry):
+        if make_service is None:
+            client = service
+        else:
+            if not hasattr(clients, "service"):
+                clients.service = make_service()
+            client = clients.service
+        download_file_atomically(client, entry, stop, on_bytes)
+        return file_hash(entry["destination"])
+
+    executor = ThreadPoolExecutor(max_workers=max(1, jobs))
     try:
         with progress:
-            for entry in plan:
-                status = entry["status"]
+            futures = {executor.submit(download, entry): entry for entry in downloads}
+            for future in as_completed(futures):
+                entry = futures[future]
                 relative = entry["relative_path"].as_posix()
-                if entry.get("item") is None:
-                    if status == "REMOVED_REMOTE":
-                        try:
-                            recovery_target = unused_recovery_target(
-                                recovery_root, entry["relative_path"]
-                            )
-                            recovery_target.parent.mkdir(parents=True, exist_ok=True)
-                            os.replace(entry["destination"], recovery_target)
-                            report(
-                                "[magenta]→[/]",
-                                f"{relative} moved to {recovery_target.relative_to(destination_root)}",
-                            )
-                            if entry.get("state_key"):
-                                state["files"].pop(entry["state_key"], None)
-                            results["FILE_REMOVED_REMOTE"] += 1
-                        except OSError as error:
-                            results[f"{entry['kind']}_ERROR"] += 1
-                            report("[red]✗[/]", f"{relative}: could not move to recovery: {error}")
-                    else:
-                        results[f"{entry['kind']}_{status}"] += 1
-                    continue
-
-                if entry["kind"] == "FOLDER":
-                    if status == "NEW":
-                        try:
-                            entry["destination"].mkdir(parents=True, exist_ok=True)
-                        except OSError as error:
-                            results["FOLDER_ERROR"] += 1
-                            report("[red]✗[/]", f"{relative}/: {error}")
-                            continue
-                    results[f"FOLDER_{status}"] += 1
-                    continue
-
-                item_state_key = state_key(entry["item"], entry["relative_path"])
-                if status == "UNCHANGED":
-                    local_sha256 = entry.get("local_sha256") or file_hash(
-                        entry["destination"]
-                    )
-                    state["files"][item_state_key] = state_record(entry, local_sha256)
-                    results["FILE_UNCHANGED"] += 1
-                    continue
-                if status in {"CONFLICT", "SKIPPED"}:
-                    results[f"FILE_{status}"] += 1
-                    continue
-
-                progress.update(task, description=escape(entry["item"]["name"]))
                 try:
-                    download_file_atomically(service, entry)
-                    local_sha256 = file_hash(entry["destination"])
-                    state["files"][item_state_key] = state_record(entry, local_sha256)
-                    results[f"FILE_{status}"] += 1
-                    mark = "[green]✓[/]" if status == "NEW" else "[cyan]↻[/]"
-                    report(mark, relative)
+                    local_sha256 = future.result()
                 except (HttpError, OSError) as error:
                     results["FILE_ERROR"] += 1
                     report("[red]✗[/]", f"{relative}: {error_text(error)}")
+                else:
+                    state["files"][state_key(entry["item"], entry["relative_path"])] = state_record(
+                        entry, local_sha256
+                    )
+                    results[f"FILE_{entry['status']}"] += 1
+                    report("[green]✓[/]" if entry["status"] == "NEW" else "[cyan]↻[/]", relative)
                 progress.advance(task)
+    except BaseException:
+        stop.set()  # running downloads stop at their next chunk and remove their partial file
+        raise
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
         save_state(destination_root, state)
     return results
 
@@ -1884,6 +2059,15 @@ def print_results(results):
 
 # --- Main ------------------------------------------------------------------
 
+def resolve_destination(path_text):
+    """The download folder: new (created), empty, or already managed by GDrive Pull."""
+    destination = Path(path_text).expanduser()
+    if not destination.is_absolute():
+        destination = Path.cwd() / destination
+    destination = destination.parent.resolve() / destination.name
+    return initialize_managed_destination(destination)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gdrivepull",
@@ -1893,15 +2077,14 @@ def main():
             "are never overwritten and nothing is deleted (files removed from Drive go to\n"
             f"{RECOVERY_DIR_NAME}/). Drive access is read-only."
         ),
-        epilog="keys (in the tree):\n" + "\n".join(
-            [f"  {key:<8}{description}" for key, description in KEY_HELP] + ["", "  " + KEY_HELP_NOTE]
-        ),
+        epilog="keys (in the tree):\n" + "\n".join(help_lines()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--configure",
-        action="store_true",
-        help="Choose or change the managed local destination.",
+        "--download-path",
+        metavar="PATH",
+        default=DOWNLOAD_PATH,
+        help="Download folder (default: %(default)s); new, empty or already managed by GDrive Pull.",
     )
     parser.add_argument(
         "--folder-id",
@@ -1910,9 +2093,22 @@ def main():
         help="Drive folder to browse (default: My Drive root).",
     )
     parser.add_argument(
+        "--again",
+        action="store_true",
+        help="Download the previous selection again, without the tree (with --yes: no prompt at all).",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Apply the preview without asking for confirmation.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=4,
+        choices=range(1, 17),
+        metavar="N",
+        help="Files downloaded at the same time, 1 to 16 (default: 4).",
     )
     parser.add_argument(
         "--verbose",
@@ -1924,23 +2120,44 @@ def main():
     VERBOSE = args.verbose
 
     try:
-        destination_root = configure_destination(args.configure)
-        if destination_root is None:
-            console.print("[dim]Destination setup cancelled.[/]")
-            return
+        try:
+            destination_root = resolve_destination(args.download_path)
+        except (OSError, ValueError) as error:
+            console.print(
+                f"[red]✗[/] {escape(args.download_path)}: {escape(str(error))}\n"
+                "  [dim]Choose another folder with --download-path PATH.[/]"
+            )
+            raise SystemExit(1)
 
-        service = build(
-            "drive", "v3", credentials=authenticate(), cache_discovery=False
-        )
+        creds = authenticate()
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
         cache = {}
-        selections, local_scopes = browse_and_select(
-            service, args.folder_id, cache, destination_root
-        )
-        if not selections:
-            console.print("[dim]Nothing selected.[/]")
-            return
+        if args.again:
+            state = load_state(destination_root)
+            saved = state.get("last_selection") or {}
+            folder_id = saved.get("folder_id", args.folder_id)
+            with console.status("[dim]Checking the previous selection…[/]"):
+                again = last_selection(service, state)
+            if again is None:
+                console.print(
+                    f"[red]✗[/] No previous selection in {escape(str(destination_root))}: "
+                    "run once without --again."
+                )
+                raise SystemExit(1)
+            selections, local_scopes = again
+            names = ", ".join(escape(entry["item"]["name"]) for entry in selections[:5])
+            more = f" and {len(selections) - 5} more" if len(selections) > 5 else ""
+            console.print(f"[bold]Again[/]  {names}{more} [dim]→ {escape(str(destination_root))}[/]")
+        else:
+            folder_id = args.folder_id
+            selections, local_scopes, destination_root = browse_and_select(
+                service, folder_id, cache, destination_root
+            )
+            if not selections:
+                console.print("[dim]Nothing selected.[/]")
+                return
+            state = load_state(destination_root)
 
-        state = load_state(destination_root)
         with console.status("[dim]Comparing with local files…[/]") as status:
             checked = 0
 
@@ -1953,6 +2170,7 @@ def main():
                 service, selections, local_scopes, destination_root, state, cache, on_item
             )
         print_plan(plan, destination_root)
+        remember_selection(state, folder_id, selections, local_scopes)
 
         if not has_actions(plan):
             apply_plan(service, plan, destination_root, state)
@@ -1965,7 +2183,10 @@ def main():
                 console.print("[dim]Cancelled. No files were changed.[/]")
                 return
 
-        results = apply_plan(service, plan, destination_root, state)
+        results = apply_plan(
+            service, plan, destination_root, state, args.jobs,
+            lambda: build("drive", "v3", credentials=creds, cache_discovery=False),
+        )
         print_results(results)
         if results["FILE_ERROR"] or results["FOLDER_ERROR"]:
             raise SystemExit(1)

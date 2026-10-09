@@ -9,12 +9,17 @@ never overwritten and nothing is deleted.
 
 ## Features
 
-- Textual tree of your Drive: folders first, with their file count and size;
-  files with their size, modification date and export format
+- Textual tree of your Drive in aligned columns: folders first, with their
+  file count and size; files with their size, modification date and export
+  format
+- Marks from earlier downloads: ✓ up to date, ↻ changed on Drive, ✎ changed
+  locally
 - Multi-selection of files and folders at any depth; a selected folder
   includes everything below it
-- `/` filter by name or path, `o` opens the item in Google Drive, `?` shows
-  the key help
+- `/` filter by name or path, `o` opens the item in Google Drive, `f` changes
+  the download folder for the session, `?` shows the key help
+- `--again` downloads the previous selection without the tree; with `--yes`
+  it runs unattended, for example from cron
 - Fast loading: one batched API call per tree level, with retries on Drive
   rate limits; the plan reuses the loaded tree instead of listing it again
 - Preview before any change: new, update, unchanged, conflict, removed from
@@ -27,7 +32,8 @@ never overwritten and nothing is deleted.
 - Files removed from Drive go to a recovery folder instead of being deleted
 - Unknown local files and folders are preserved
 - Drive shortcuts followed to their target files and folders
-- Live progress with a ✓ / ✗ line per file and a final summary
+- Parallel downloads (4 at a time by default), with a progress bar, the
+  amount downloaded and the speed, a ✓ / ✗ line per file and a final summary
 - Compact browser sign-in with a clickable link, read-only Drive OAuth scope
 
 ## Repository contents
@@ -45,7 +51,7 @@ GDRIVE/
     └── test_gdrivepull.py
 ```
 
-Runtime files such as OAuth credentials, tokens, settings, and the virtual
+Runtime files such as OAuth credentials, tokens, and the virtual
 environment are local files and must never be committed.
 
 ## Requirements
@@ -96,11 +102,9 @@ The first run of the runner creates `.venv` and installs the dependencies.
 ./run-gdrivepull.sh
 ```
 
-The first run opens a destination setup screen. Pick a parent directory in the
-tree on the left (or type it), then name the managed download folder. Press
-`Ctrl+S` to save the destination or `Esc` to cancel.
-
-The final managed folder must be:
+Files are downloaded into `~/GDrive` by default; use `--download-path PATH` for
+another folder, or press `F` in the tree to change it for the session. The
+folder is created if it does not exist. It must be:
 
 - new;
 - empty; or
@@ -108,12 +112,10 @@ The final managed folder must be:
   `.gdrivepull-managed-state.json`.
 
 A non-empty folder without that state file is refused to prevent accidental
-adoption or overwriting of unrelated data.
+adoption or overwriting of unrelated data. The managed state stays inside the
+download folder.
 
-The selected absolute path is stored locally in `settings.json`, next to the
-runner. The managed state remains inside the selected destination.
-
-Then GDrive Pull signs in to Google Drive. Your browser opens the Google
+GDrive Pull then signs in to Google Drive. Your browser opens the Google
 sign-in page; if it does not, the terminal shows a clickable link. The session
 is kept in `token.json` and renewed automatically; when it has expired or been
 revoked, the browser sign-in comes back.
@@ -122,9 +124,11 @@ revoked, the browser sign-in comes back.
 
 | Option | Effect |
 | --- | --- |
-| `--configure` | Choose or change the managed local destination |
+| `--download-path PATH` | Download folder (default: `~/GDrive`); new, empty or already managed |
 | `--folder-id ID` | Browse this Drive folder instead of the root of My Drive |
+| `--again` | Download the previous selection again, without the tree |
 | `--yes` | Apply the preview without asking for confirmation |
+| `--jobs N` | Files downloaded at the same time, 1 to 16 (default: 4) |
 | `--verbose` | Show sign-in, token and API details, and list unchanged items in the preview |
 
 ## Interactive selector
@@ -143,16 +147,28 @@ help, or run `./run-gdrivepull.sh --help`.
 | `E` | Expand or collapse everything below the cursor |
 | `/` | Filter by name or path: `Enter` keeps the filter, `Esc` clears it |
 | `O` | Open the item in Google Drive |
+| `F` | Change the download folder for this session: pick a parent directory, name the folder, `Ctrl+S` to apply, `Esc` to cancel |
 | `D` | Continue to the download preview |
 | `?` | Key help |
 | `Q` / `Esc` | Quit |
 
 Folders show their number of files and their total size; files show their size,
 their modification date (time only for today), and the local format of
-Google-native files (`→ .docx`). Items that cannot be downloaded, such as Google
+Google-native files (`→ .docx`). These details are aligned in columns. Items that cannot be downloaded, such as Google
 Forms, are greyed out. Selecting a parent folder includes its complete subtree
 and replaces the child selections. The line under the tree counts the selected
 items, the files they contain and their size.
+
+A mark before the name shows what earlier downloads left in the destination,
+read from the managed state without hashing any file:
+
+| Mark | Meaning |
+| --- | --- |
+| `✓` | Downloaded and up to date (for a folder: every file in it) |
+| `↻` | Changed on Drive since the download, or a folder with new files |
+| `✎` | Changed locally since the download; the preview will keep it as a conflict |
+
+Changing the folder with `F` updates the marks for the new destination.
 
 The filter keeps the matching items, their parent folders, and everything
 below a matching folder. Selections hidden by the filter are kept.
@@ -182,9 +198,25 @@ Tracked files removed from Drive are moved to:
 
 GDrive Pull never permanently deletes local content.
 
-Downloads show a progress bar and one line per file. If a download fails, the
+Files are downloaded in parallel (`--jobs`, 4 by default), each thread with its
+own Drive connection. The progress bar shows the files done, the amount
+downloaded and the speed, with one line per file. If a download fails, the
 file keeps its previous content and the run ends with an error count. The state
 is saved even after `Ctrl+C`, so the next run picks up where it stopped.
+
+## Downloading the same selection again
+
+Each confirmed run stores its selection in the managed state of the
+destination. To download it again without the tree:
+
+```bash
+./run-gdrivepull.sh --again          # preview, then confirm
+./run-gdrivepull.sh --again --yes    # no prompt, e.g. from cron
+```
+
+Selected items are looked up again on Drive, so renamed or updated files are
+picked up. A selected item that is no longer on Drive is reported, and its
+local files are handled like other files removed from Drive.
 
 ## Google-native file exports
 
@@ -197,16 +229,6 @@ Google-native files are exported as follows:
 | Google Slides | `.pptx` |
 | Google Drawings | `.pdf` |
 | Google Apps Script | `.json` |
-
-## Changing the destination
-
-Run:
-
-```bash
-./run-gdrivepull.sh --configure
-```
-
-The previous destination and its managed state remain untouched.
 
 ## Optional Drive folder
 
@@ -228,7 +250,6 @@ published:
 .venv/
 credentials.json
 token.json
-settings.json
 ```
 
 The managed destination contains:
@@ -236,6 +257,8 @@ The managed destination contains:
 ```text
 .gdrivepull-managed-state.json
 ```
+
+The state file also keeps the last selection, for `--again`.
 
 The `.gdrivepull-recovery/` directory is created only when tracked local
 content removed from Drive needs to be preserved.
