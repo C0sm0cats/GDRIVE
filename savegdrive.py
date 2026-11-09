@@ -3983,13 +3983,25 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             remote_folders.setdefault(Path(saved_item["relative_parent"]), saved_item["parent_id"])
     scopes = compact_scopes([*scopes, *moved_scopes(state, selections)])
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
+    # The Drive folder of a file picked alone, from the tree: its local folder is not scanned.
+    picked_parents = {
+        selection["relative_parent"]: selection["parent_id"]
+        for selection in selections
+        if not is_folder(selection["item"]) and selection.get("parent_id")
+    }
     for entry in plan:
-        parent_id = remote_folders.get(entry["relative_path"].parent)
+        parent = entry["relative_path"].parent
+        parent_id = remote_folders.get(parent)
         if entry["status"] == "UPLOAD_NEW":
             entry["parent_id"] = parent_id
         elif entry["kind"] == "FILE" and entry.get("item") is not None:
-            # Could a renamed copy of yours (keep both) go up next to it?
-            entry["copy_goes_up"] = parent_id is not None and not is_readonly_path(entry["relative_path"])
+            # Could a renamed copy of yours (keep both) go up next to it? At the next sync if its folder is
+            # scanned; else (a file picked alone) only with --again, which then picks the copy too.
+            sendable = (parent_id or picked_parents.get(parent)) is not None and not is_readonly_path(
+                entry["relative_path"]
+            )
+            entry["copy_goes_up"] = sendable and path_is_in_scope(parent, scopes)
+            entry["copy_on_again"] = sendable and not entry["copy_goes_up"]
     return plan
 
 
@@ -4228,7 +4240,15 @@ def plan_notes(plan):
             "Keep both: your version is renamed 'name (local).ext' and sent to Drive at the next sync; "
             "Drive's version takes its place. Delete the one you do not want, the sync follows."
         )
-    if any(entry["status"] == "KEEP_BOTH" and not entry.get("copy_goes_up", True) for entry in plan):
+    if any(entry["status"] == "KEEP_BOTH" and entry.get("copy_on_again") for entry in plan):
+        notes.append(
+            "Some kept versions are next to files picked alone, in folders not selected: they go to Drive "
+            "with --again, or when you select their folder."
+        )
+    if any(
+        entry["status"] == "KEEP_BOTH" and not entry.get("copy_goes_up", True) and not entry.get("copy_on_again")
+        for entry in plan
+    ):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
         notes.append(
@@ -4520,7 +4540,14 @@ class PreviewScreen(Screen):
             return
         keep = entry["status"] == "CONFLICT"
         set_keep_both(self.plan, [entry], keep)
-        if keep and not entry.get("copy_goes_up", True):
+        if keep and entry.get("copy_on_again"):
+            self.notify(
+                f"{printable(entry['local_copy'].name)} goes to Drive with --again, or when you select its folder: "
+                "this folder is not in your selection.",
+                severity="warning",
+                markup=False,
+            )
+        elif keep and not entry.get("copy_goes_up", True):
             self.notify(
                 f"{printable(entry['local_copy'].name)} cannot go up: this folder is read only on Drive. "
                 "It stays on your disk only.",
@@ -5071,6 +5098,8 @@ def run_transfers(service, make_service, transfers, folder_ids, state, results, 
                                   folder_ids.get(entry["relative_path"].parent, entry.get("parent_id")))
                 if status == "KEEP_BOTH":
                     report("[bold]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
+                    if entry.get("copy_on_again"):
+                        select_kept_copy(state, entry["relative_path"].parent / entry["local_copy"].name)
                 else:
                     report(TRANSFER_MARKS[status], relative)
             progress.advance(task)
@@ -5220,6 +5249,14 @@ def print_results(results):
 
 
 # --- Main ------------------------------------------------------------------
+
+def select_kept_copy(state, relative_path):
+    """Your version kept next to a file picked alone, outside the scanned folders: added to the selection, so
+    --again sends it (then picks it, through reselect_sent)."""
+    saved = state.get("last_selection")
+    if saved is not None and relative_path.as_posix() not in saved.setdefault("scopes", []):
+        saved["scopes"].append(relative_path.as_posix())
+
 
 def reselect_sent(state, relative_path, item, parent_id):
     """A picked item gone from Drive, sent again from here: picked again under its new id, so the next

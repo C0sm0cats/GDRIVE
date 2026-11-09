@@ -2987,6 +2987,50 @@ class SyncTest(unittest.TestCase):
         savegdrive.set_keep_both(plan, plan, True)
         self.assertTrue(any("stay on your disk only" in note for note in savegdrive.plan_notes(plan)))
 
+    def test_keep_both_of_a_file_picked_alone_goes_up_with_again(self):
+        # bugs 25: a file picked alone, changed on both sides, kept both ways. Its folder is not scanned, so the
+        # preview must not promise the next sync sends "(local)", nor call a writable folder read only; --again
+        # then sends it.
+        for path, parent_id, item_id in (("notes.txt", "root", "n"), ("Docs/a.txt", "docs", "a")):
+            with self.subTest(path=path):
+                cache = {}
+                nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", cache)
+                node = next(node for node in nodes if node["display_path"] == path)
+                # Picked in the tree: sendable_parent_id gives its Drive folder.
+                selections = [{"item": node["item"], "relative_parent": node["relative_parent"],
+                               "parent_id": parent_id}]
+                state = savegdrive.load_state(self.root)
+                plan = savegdrive.build_plan(self.drive, selections, [], self.root, state, cache, roots={})
+                savegdrive.remember_selection(state, selections, [])
+                self.apply(plan, state)
+                mine = f"edited here: {path}".encode()
+                (self.root / path).write_bytes(mine)
+                self.drive.items[item_id].update(file_item(item_id, Path(path).name, parent_id, b"edited on Drive"))
+
+                cache = {}
+                nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", cache)
+                node = next(node for node in nodes if node["display_path"] == path)
+                selections = [{"item": node["item"], "relative_parent": node["relative_parent"],
+                               "parent_id": parent_id}]
+                state = savegdrive.load_state(self.root)
+                plan = savegdrive.build_plan(self.drive, selections, [], self.root, state, cache, roots={})
+                self.assertEqual([entry["status"] for entry in plan], ["CONFLICT"])
+                savegdrive.set_keep_both(plan, plan, True)
+                notes = savegdrive.plan_notes(plan)
+                self.assertFalse(any("read only on Drive" in note for note in notes), notes)
+                self.assertTrue(any("--again" in note for note in notes), notes)
+                savegdrive.remember_selection(state, selections, [])
+                self.apply(plan, state)
+                copy = Path(path).parent / f"{Path(path).stem} (local).txt"
+                self.assertEqual((self.root / copy).read_bytes(), mine)
+
+                statuses = self.sync_picked(again=True)
+                self.assertEqual(statuses[copy.as_posix()], "UPLOAD_NEW")
+                sent = [item for item in self.drive.items.values() if item.get("content") == mine]
+                self.assertEqual([(item["name"], item["parent"]) for item in sent], [(copy.name, parent_id)])
+                statuses = self.sync_picked(again=True)  # sent once, then in sync
+                self.assertEqual(statuses[copy.as_posix()], "UNCHANGED")
+
     def test_existing_identical_file_is_adopted(self):
         (self.root / "notes.txt").write_bytes(b"notes")
         statuses, _ = self.run_sync()
