@@ -138,12 +138,26 @@ DRIVE_ROOT = None
 
 def printable(text):
     """text with its control characters (ESC, line breaks...) shown as \\xNN rather than sent to the terminal:
-    Drive names are chosen by whoever shares a file. Rich and Textual only drop BEL, BS, VT, FF and CR."""
+    Drive names are chosen by whoever shares a file. Rich and Textual only drop BEL, BS, VT, FF and CR.
+    A byte of a local name that is not UTF-8 (a lone surrogate, which no terminal can encode) shows as \\xNN too."""
     if text.isprintable():
         return text
     return "".join(
-        f"\\x{ord(char):02x}" if char != "\t" and unicodedata.category(char) == "Cc" else char for char in text
+        f"\\x{ord(char) - 0xDC00:02x}" if "\udc80" <= char <= "\udcff"
+        else f"\\u{ord(char):04x}" if unicodedata.category(char) == "Cs"
+        else f"\\x{ord(char):02x}" if char != "\t" and unicodedata.category(char) == "Cc"
+        else char
+        for char in text
     )
+
+
+def is_utf8_name(name):
+    """False for a local name whose bytes are not UTF-8 (Latin-1 from an old zip...): Drive cannot take it."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def debug(message):
@@ -3696,7 +3710,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             return False
         return parent in new_folders or remote_folders.get(parent) is not None
 
-    def add_local_entry(relative_path, kind, symlink=False):
+    def add_local_entry(relative_path, kind, symlink=False, not_utf8=False):
         if relative_path in planned_local_paths:
             return
         destination = destination_root / relative_path
@@ -3706,6 +3720,8 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         planned_stat = None
         if symlink:
             status = "LOCAL_ONLY"  # never followed: neither the link nor what it points to is sent or trashed
+        elif not_utf8:
+            status = "LOCAL_ONLY"  # Drive names are UTF-8: neither it nor what is in it is sent or trashed
         elif kind == "FOLDER" and relative_path in new_folders:
             status = "UPLOAD_NEW"  # gone from Drive, but what is in it goes up: created again
         elif kind == "FOLDER" and relative_path in synced_folders:
@@ -3738,6 +3754,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 "local_sha256": current_sha256,
                 "local_stat": planned_stat,
                 "symlink": symlink,
+                "not_utf8": not_utf8,
             }
         )
         planned_local_paths.add(relative_path)
@@ -3820,6 +3837,10 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 continue
             if at_or_below_trashed(relative_path):
                 continue  # deleted here; Drive's copy goes to the Drive trash
+            if not is_utf8_name(child.name):
+                if child.is_dir() or child.is_file():
+                    add_local_entry(relative_path, "FOLDER" if child.is_dir() else "FILE", not_utf8=True)
+                continue
 
             if child.is_dir():
                 remote = drive_spelling(child, relative_path, "FOLDER")
@@ -4244,6 +4265,11 @@ def plan_notes(plan):
             "Symbolic links are never followed: a link stays here only, and what it points to is not synced. "
             "A link with the name of a Drive item is a conflict: nothing syncs there until you replace the link."
         )
+    if any(entry.get("not_utf8") for entry in plan):
+        notes.append(
+            "Names that are not UTF-8 (shown with \\xNN, often from an old zip) cannot go to Drive: they stay here "
+            "only, with what is in them. Rename them to send them."
+        )
     if any(entry.get("view_name") for entry in plan):
         names = " or ".join(f"'{name}'" for name in sorted(path.as_posix() for path in VIEW_NAME_PATHS))
         notes.append(
@@ -4261,6 +4287,7 @@ def plan_notes(plan):
         )
     if any(
         entry["status"] == "LOCAL_ONLY" and not entry.get("outside_selection") and not entry.get("symlink")
+        and not entry.get("not_utf8")
         for entry in plan
     ):
         notes.append(

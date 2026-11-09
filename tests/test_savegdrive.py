@@ -1401,6 +1401,29 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertTrue((outside / ".ssh/id_rsa").exists())
 
+    def test_local_name_not_in_utf8_is_listed_not_sent_and_the_preview_prints(self):
+        # bugs 17: a name in Latin-1 (from an old zip) crashed the printed preview, and so the whole sync.
+        self.run_sync()
+        (self.root / os.fsdecode(b"Docs/caf\xe9.txt")).write_bytes(b"latin-1 name")
+        (self.root / os.fsdecode(b"r\xe9sum\xe9")).mkdir()
+        (self.root / os.fsdecode(b"r\xe9sum\xe9/notes.txt")).write_bytes(b"inside")
+        plan, state = self.preview()
+        statuses = {entry["relative_path"]: entry["status"] for entry in plan}
+        self.assertEqual(statuses[Path(os.fsdecode(b"Docs/caf\xe9.txt"))], "LOCAL_ONLY")
+        self.assertEqual(statuses[Path(os.fsdecode(b"r\xe9sum\xe9"))], "LOCAL_ONLY")
+        self.assertNotIn(Path(os.fsdecode(b"r\xe9sum\xe9/notes.txt")), statuses)
+        self.assertTrue(any("not UTF-8" in note for note in savegdrive.plan_notes(plan)))
+        output = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")  # a real terminal encodes what it prints
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200, highlight=False)):
+            savegdrive.print_plan(plan, self.root)
+        output.flush()
+        self.assertIn("caf\\xe9.txt", output.buffer.getvalue().decode())
+        names_before = {item["name"] for item in self.drive.items.values()}
+        results = self.apply(plan, state)
+        self.assertEqual((self.drive.uploads, results["FILE_ERROR"]), ([], 0))
+        self.assertEqual({item["name"] for item in self.drive.items.values()}, names_before)
+        self.assertEqual((self.root / os.fsdecode(b"Docs/caf\xe9.txt")).read_bytes(), b"latin-1 name")
+
     def test_synced_folder_replaced_by_a_symlink_is_a_conflict_not_half_synced(self):
         # bugs 39: Photos moved to another disk, a link left in its place. Before, new files there were never
         # sent and deletions on Drive never came down, but downloads and deletions here went through the link.
