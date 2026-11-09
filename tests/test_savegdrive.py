@@ -4665,7 +4665,20 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             async with app.run_test() as pilot:
                 await pilot.press("f")
-                self.assertIsInstance(app.screen, savegdrive.DestinationSetupScreen)
+                screen = app.screen
+                self.assertIsInstance(screen, savegdrive.DestinationSetupScreen)
+                # tests 53: a non-empty folder without a state file is refused, the screen stays open.
+                (Path(temp) / "Documents").mkdir()
+                (Path(temp) / "Documents" / "taxes.pdf").write_text("x")
+                original = app.destination
+                screen.query_one("#parent-path", Input).value = temp
+                screen.query_one("#folder-name", Input).value = "Documents"
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.3)
+                self.assertIs(app.screen, screen)
+                self.assertEqual(app.destination, original)
+                self.assertFalse(savegdrive.has_valid_state(Path(temp) / "Documents"))
+                self.assertEqual(sorted(path.name for path in (Path(temp) / "Documents").iterdir()), ["taxes.pdf"])
                 app.screen.query_one("#parent-path", Input).value = temp
                 app.screen.query_one("#folder-name", Input).value = "Session"
                 await pilot.press("ctrl+s")
