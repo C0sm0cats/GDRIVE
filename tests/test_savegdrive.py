@@ -109,7 +109,8 @@ class FakeDrive:
             self.change_log.append({"fileId": item_id, "removed": True})
         else:
             self.change_log.append(
-                {"fileId": item_id, "removed": False, "file": dict(self.public(item), parents=[item["parent"]])}
+                {"fileId": item_id, "removed": False,
+                 "file": dict(self.public(item), parents=[item["parent"]], trashed=self.is_trashed(item))}
             )
 
     def new_batch_http_request(self, callback):
@@ -1467,7 +1468,7 @@ class SyncTest(unittest.TestCase):
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         by_path = {node["display_path"]: node for node in nodes}
         selections = []
-        for path in ("Photos", "Docs/a.txt"):
+        for path in ("Photos", "Docs/a.txt", "notes.txt"):
             savegdrive.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
         scopes = savegdrive.build_local_scopes(selections, browsed)
         state = savegdrive.load_state(self.root)
@@ -1476,11 +1477,13 @@ class SyncTest(unittest.TestCase):
 
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
         del self.drive.items["photos"]
+        self.drive.items["n"]["trashed"] = True
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             again, again_scopes = savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
         self.assertEqual([entry["item"]["name"] for entry in again], ["a.txt"])
         self.assertEqual(again[0]["item"]["md5Checksum"], self.drive.items["a"]["md5Checksum"])
-        self.assertEqual(again_scopes, [Path("Photos")])  # gone from Drive: still scanned locally
+        # Gone from Drive or in its trash: still scanned locally.
+        self.assertEqual(again_scopes, [Path("Photos"), Path("notes.txt")])
         self.assertIsNone(savegdrive.last_selection(self.drive, {"files": {}}, {}))
 
     def test_again_stops_on_a_drive_error(self):
@@ -1542,12 +1545,15 @@ class SyncTest(unittest.TestCase):
         self.drive.change("p")
         self.drive.items["x"] = file_item("x", "elsewhere.txt", "unknown-folder", b"x")
         self.drive.change("x")
+        self.drive.items["n"]["trashed"] = True  # put in the Drive trash
+        self.drive.change("n")
 
         replayed, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
         fresh = {}
         savegdrive.prefetch_folders(self.drive, ["root"], fresh)
+        self.assertNotIn("n", [item["id"] for item in fresh["root"]])
         self.assertEqual(replayed, fresh)
-        self.assertEqual(new_token, "5")
+        self.assertEqual(new_token, "6")
         self.assertIsNone(savegdrive.apply_changes(self.drive, {"token": "expired", "folders": {}}))
 
     def test_changes_replay_skips_shared_drive_changes(self):
