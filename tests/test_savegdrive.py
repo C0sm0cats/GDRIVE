@@ -2637,6 +2637,17 @@ class UploadTest(unittest.TestCase):
             savegdrive.set_remote_mtime(path, item)
             self.assertEqual(path.stat().st_mtime, 1563098400.25)
 
+    def test_create_remote_folder_makes_a_folder_in_its_parent(self):
+        # Without parents, Drive puts the folder at the top of My Drive; without mimeType, it makes a file.
+        service = mock.Mock()
+        files = service.files.return_value
+        files.create.return_value.execute.return_value = {"id": "ideas", "name": "Ideas"}
+        item = savegdrive.create_remote_folder(service, "Ideas", "docs")
+        self.assertEqual(item["id"], "ideas")
+        kwargs = files.create.call_args.kwargs
+        self.assertEqual(kwargs["body"], {"name": "Ideas", "parents": ["docs"], "mimeType": savegdrive.FOLDER_MIME_TYPE})
+        self.assertTrue(kwargs["supportsAllDrives"])
+
     def test_upload_stops_on_ctrl_c(self):
         import threading
 
