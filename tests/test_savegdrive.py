@@ -490,6 +490,22 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
         self.assertEqual(self.drive.uploads, [])
 
+    def test_same_names_at_the_top_of_my_drive_are_conflicts(self):
+        # Two "Untitled document"s, and a folder and a file both named "notes.txt": none is dropped
+        # from the plan or synced with the other's content.
+        self.drive.items["u1"] = file_item("u1", "dup.txt", "root", b"first")
+        self.drive.items["u2"] = file_item("u2", "dup.txt", "root", b"second")
+        self.drive.items["nf"] = {"id": "nf", "name": "notes.txt", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["in"] = file_item("in", "inside.txt", "nf", b"inside")
+        plan, state = self.preview()
+        rows = sorted((entry["relative_path"].as_posix(), entry["kind"], entry["status"]) for entry in plan
+                      if entry["relative_path"].parts[0] in {"dup.txt", "notes.txt"})
+        self.assertEqual(rows, [("dup.txt", "FILE", "CONFLICT"), ("dup.txt", "FILE", "CONFLICT"),
+                                ("notes.txt", "FILE", "CONFLICT"), ("notes.txt", "FOLDER", "CONFLICT")])
+        self.apply(plan, state)
+        self.assertFalse((self.root / "dup.txt").exists())
+        self.assertFalse((self.root / "notes.txt").exists())
+
     def test_file_replaced_on_drive_under_the_same_name_comes_down(self):
         self.run_sync()
         # On Drive: a.txt deleted and sent again (new id, new content); the whole Photos folder too.

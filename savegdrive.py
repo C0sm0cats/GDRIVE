@@ -3071,28 +3071,26 @@ def mark_duplicate_targets(plan):
     nothing below them either: which one would get your new files, which one's deletions count?
 
     Names that differ only by case or Unicode normalization count as one path: some disks
-    (macOS, exFAT...) store them as one file."""
-    folder_targets = Counter(
-        same_name_key(entry["relative_path"])
+    (macOS, exFAT...) store them as one file. A folder and a file on one path count too: the
+    disk cannot hold both."""
+    targets = Counter(
+        same_name_key(entry["destination"])
+        for entry in plan
+        if entry["status"] != "SKIPPED"
+    )
+    duplicate_folders = {
+        same_name_key(entry["destination"])
         for entry in plan
         if entry["kind"] == "FOLDER" and entry["status"] != "SKIPPED"
-    )
-    duplicate_folders = {key for key, count in folder_targets.items() if count > 1}
+        and targets[same_name_key(entry["destination"])] > 1
+    }
     if duplicate_folders:
         plan[:] = [
             entry for entry in plan
-            if not any(same_name_key(parent) in duplicate_folders for parent in entry["relative_path"].parents)
+            if not any(same_name_key(parent) in duplicate_folders for parent in entry["destination"].parents)
         ]
-    file_targets = Counter(
-        same_name_key(entry["destination"])
-        for entry in plan
-        if entry["kind"] == "FILE" and entry["status"] != "SKIPPED"
-    )
     for entry in plan:
-        if (
-            entry["kind"] == "FILE" and file_targets[same_name_key(entry["destination"])] > 1
-            or entry["kind"] == "FOLDER" and same_name_key(entry["relative_path"]) in duplicate_folders
-        ):
+        if targets[same_name_key(entry["destination"])] > 1:
             entry["status"] = "CONFLICT"
             entry["duplicate"] = True
 
