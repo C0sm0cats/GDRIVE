@@ -4414,6 +4414,14 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("d")
             await app.workers.wait_for_complete()
             await pilot.pause()
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
+            await pilot.press("n")  # n also goes back, selection kept, nothing applied
+            self.assertNotIsInstance(app.screen, savegdrive.PreviewScreen)
+            self.assertIsNone(app.return_value)
+            self.assertEqual(self.selected(app), ["Docs"])
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             await pilot.press("b", "a", "c", "z")  # no conflict here; tree keys do nothing behind the preview
             self.assertEqual(self.selected(app), ["Docs"])
             self.assertEqual(app.sort, "name")
