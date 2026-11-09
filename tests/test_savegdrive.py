@@ -1271,6 +1271,25 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(counts, (11, 41))
         self.assertTrue(check)
 
+    def test_deleting_more_than_20_files_needs_a_check(self):
+        for i in range(96):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        self.run_sync()
+        for i in range(20):  # 20 of 101: not more than 20, under a quarter
+            (self.root / f"Photos/m{i}.txt").unlink()
+        _, _, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (20, 101))
+        self.assertFalse(check)
+        for i in range(20, 25):  # 25 of 101: more than 20, still under a quarter
+            (self.root / f"Photos/m{i}.txt").unlink()
+        plan, state, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (25, 101))
+        self.assertTrue(check)
+        args = mock.Mock(yes=True, allow_deletions=False)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            with self.assertRaises(SystemExit):
+                savegdrive.confirm_in_terminal(args, plan, state)
+
     def test_mass_deletion_on_drive_needs_a_check(self):
         for i in range(30):
             self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
