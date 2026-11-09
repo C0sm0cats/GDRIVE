@@ -367,7 +367,8 @@ class SyncTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.drive = demo_drive()
 
-    def run_sync(self, jobs=1):
+    def preview(self):
+        """The plan the preview shows, and the state it was computed against."""
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         selections = []
@@ -376,11 +377,16 @@ class SyncTest(unittest.TestCase):
                 savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
         scopes = savegdrive.build_local_scopes(selections, browsed)
         state = savegdrive.load_state(self.root)
-        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
-        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        return savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache), state
+
+    def apply(self, plan, state, jobs=1):
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
-            results = savegdrive.apply_plan(self.drive, plan, self.root, state, jobs, lambda: self.drive)
-        return statuses, results
+            return savegdrive.apply_plan(self.drive, plan, self.root, state, jobs, lambda: self.drive)
+
+    def run_sync(self, jobs=1):
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        return statuses, self.apply(plan, state, jobs)
 
     def test_first_run_then_unchanged(self):
         statuses, results = self.run_sync()
@@ -743,6 +749,77 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/b (local).txt"], "UPLOAD_NEW")
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
+
+    def test_local_edit_after_the_preview_is_never_overwritten(self):
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2 from Drive"))
+        self.drive.items["c"] = file_item("c", "c.txt", "docs", b"charlie from Drive")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2 from Drive"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo from here")
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertEqual(statuses["Docs/a.txt"]["status"], "UPDATE")
+        self.assertEqual(statuses["Docs/c.txt"]["status"], "NEW")
+        savegdrive.set_keep_both(plan, [statuses["Docs/b.txt"]], True)
+
+        # While the preview is open, you save a.txt and b.txt, and create c.txt here.
+        (self.root / "Docs/a.txt").write_bytes(b"TODAY'S EDITS")
+        (self.root / "Docs/b.txt").write_bytes(b"bravo from here, edited again")
+        (self.root / "Docs/c.txt").write_bytes(b"charlie made here")
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 3)
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"TODAY'S EDITS")
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo from here, edited again")
+        self.assertFalse((self.root / "Docs/b (local).txt").exists())
+        self.assertEqual((self.root / "Docs/c.txt").read_bytes(), b"charlie made here")
+
+        statuses, _ = self.run_sync()  # changed on both sides: conflicts, nothing overwritten
+        self.assertEqual({statuses[path] for path in ("Docs/a.txt", "Docs/b.txt", "Docs/c.txt")}, {"CONFLICT"})
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"TODAY'S EDITS")
+
+    def test_upload_never_replaces_a_drive_change_made_after_the_preview(self):
+        self.run_sync()
+        (self.root / "Docs/b.txt").write_bytes(b"b2 mine")
+        plan, state = self.preview()
+        self.assertEqual(next(entry for entry in plan if entry["relative_path"] == Path("Docs/b.txt"))["status"],
+                         "UPLOAD")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"COLLEAGUE EDIT",
+                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 1)
+        self.assertEqual(self.drive.items["b"]["content"], b"COLLEAGUE EDIT")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "CONFLICT")
+
+    def test_edit_saved_during_the_preview_of_an_unchanged_file_is_sent(self):
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        plan, state = self.preview()
+        self.assertEqual(next(entry for entry in plan if entry["relative_path"] == Path("Docs/b.txt"))["status"],
+                         "UNCHANGED")
+        (self.root / "Docs/b.txt").write_bytes(b"BRAVO")  # same size as the synced b"bravo"
+        self.apply(plan, state)
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.assertEqual(self.drive.items["b"]["content"], b"BRAVO")
+
+    def test_edit_saved_during_its_upload_is_sent_next_time(self):
+        self.run_sync()
+        video = self.root / "Docs/b.txt"
+        video.write_bytes(b"take 2")
+
+        def upload_then_save(service, path, **kwargs):
+            item = fake_upload(service, path, **kwargs)
+            path.write_bytes(b"take 2 + more edits saved during the upload")
+            return item
+
+        with mock.patch.object(savegdrive, "upload_file", upload_then_save):
+            statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.assertEqual(self.drive.items["b"]["content"], b"take 2")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.assertEqual(self.drive.items["b"]["content"], b"take 2 + more edits saved during the upload")
 
     def test_keep_both_in_a_read_only_folder_says_so(self):
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False}

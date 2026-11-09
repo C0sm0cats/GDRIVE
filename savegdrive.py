@@ -2697,6 +2697,7 @@ def collect_plan(
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
 
+    planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
     if relative_path in RESERVED_PATHS:
         status = "CONFLICT"
         current_sha256 = None
@@ -2716,6 +2717,7 @@ def collect_plan(
             "relative_path": relative_path,
             "destination": destination,
             "local_sha256": current_sha256,
+            "local_stat": planned_stat,
         }
     )
 
@@ -3366,7 +3368,8 @@ def set_remote_mtime(destination, item):
     os.utime(destination, (timestamp, timestamp))
 
 
-def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: None):
+def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: None, check=None):
+    """Download to a temporary file, then put it in place; check() runs just before and may refuse (OSError)."""
     destination = entry["destination"]
     temporary = destination.with_name(
         f".{destination.name}{PART_SUFFIX}"
@@ -3377,11 +3380,46 @@ def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: N
         with temporary.open("wb") as file_handle:
             fetch_media(service, entry["item"], CountingWriter(file_handle, on_bytes), stop)
         set_remote_mtime(temporary, entry["item"])
+        if check is not None:
+            check()
         os.replace(temporary, destination)
     except BaseException:
         if temporary.exists():
             temporary.unlink()
         raise
+
+
+def local_stat(path):
+    """(size, date in ns) of a local file, or None when there is none."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def unchanged_since_plan(entry):
+    """True when the local file is still what the plan saw: still absent, or the same content."""
+    destination = entry["destination"]
+    if entry.get("local_sha256") is None:
+        return not os.path.lexists(destination)
+    now = local_stat(destination)
+    if now is None:
+        return False
+    if now == entry.get("local_stat"):
+        return True
+    try:
+        return file_hash(destination) == entry["local_sha256"]
+    except OSError:
+        return False
+
+
+CHANGED_SINCE_PREVIEW = "changed here since the preview, left as is: compared again at the next sync"
+
+
+def check_unchanged_since_plan(entry):
+    if not unchanged_since_plan(entry):
+        raise OSError(CHANGED_SINCE_PREVIEW)
 
 
 def local_hash(path, record):
@@ -3540,6 +3578,10 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             continue
         status = entry["status"]
         if status == "UNCHANGED":
+            if entry.get("local_sha256") is not None and not unchanged_since_plan(entry):
+                results["FILE_ERROR"] += 1  # its old date and hash would hide the edit for good
+                report("[red]✗[/]", f"{entry['relative_path'].as_posix()}: {CHANGED_SINCE_PREVIEW}")
+                continue
             local_sha256 = entry.get("local_sha256") or file_hash(entry["destination"])
             try:
                 set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
@@ -3576,29 +3618,49 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         return clients.service
 
     def transfer(entry):
+        destination = entry["destination"]
         if entry["status"] == "KEEP_BOTH":
-            os.replace(entry["destination"], entry["local_copy"])  # your version steps aside
+            check_unchanged_since_plan(entry)
+            if os.path.lexists(entry["local_copy"]):
+                raise OSError(f"{entry['local_copy'].name} appeared here since the preview")
+            os.replace(destination, entry["local_copy"])  # your version steps aside
+
+            def still_free():
+                if os.path.lexists(destination):
+                    raise OSError(CHANGED_SINCE_PREVIEW)
+
             try:
-                download_file_atomically(client(), entry, stop, on_bytes)
+                download_file_atomically(client(), entry, stop, on_bytes, still_free)
             except BaseException:
-                os.replace(entry["local_copy"], entry["destination"])
+                if not os.path.lexists(destination):
+                    os.replace(entry["local_copy"], destination)
                 raise
-            return entry["item"], file_hash(entry["destination"])
+            return entry["item"], file_hash(destination)
         if entry["status"] in DOWNLOADS:
-            download_file_atomically(client(), entry, stop, on_bytes)
-            return entry["item"], file_hash(entry["destination"])
-        local_sha256 = file_hash(entry["destination"])
+            download_file_atomically(client(), entry, stop, on_bytes, lambda: check_unchanged_since_plan(entry))
+            return entry["item"], file_hash(destination)
+        before = local_stat(destination)  # before hashing: an edit made from now on changes it
+        local_sha256 = file_hash(destination)
         if entry["status"] == "UPLOAD":
-            item = upload_file(client(), entry["destination"], file_id=effective_id(entry["item"]),
+            current = client().files().get(
+                fileId=effective_id(entry["item"]), fields="id,mimeType,size,modifiedTime,md5Checksum",
+                supportsAllDrives=True,
+            ).execute(num_retries=API_RETRIES)
+            if remote_signature(current) != remote_signature(entry["item"]):
+                raise OSError("changed on Drive since the preview, not sent: compared again at the next sync")
+            item = upload_file(client(), destination, file_id=effective_id(entry["item"]),
                                stop=stop, on_bytes=on_bytes)
         else:
             parent_id = folder_ids.get(entry["relative_path"].parent, entry.get("parent_id"))
             if parent_id is None:
                 raise OSError("its folder could not be created on Drive")
-            item = upload_file(client(), entry["destination"], name=entry["relative_path"].name,
+            item = upload_file(client(), destination, name=entry["relative_path"].name,
                                parent_id=parent_id, stop=stop, on_bytes=on_bytes)
+        if local_stat(destination) != before:
+            entry["changed_meanwhile"] = True  # saved again while sent: keep its date, hash it again next time
+            return item, local_sha256
         try:
-            set_remote_mtime(entry["destination"], item)  # same date on both sides: the tree marks it ✓
+            set_remote_mtime(destination, item)  # same date on both sides: the tree marks it ✓
         except OSError:
             pass
         return item, local_sha256
@@ -3621,6 +3683,8 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                     if entry.get("state_key"):
                         state["files"].pop(entry["state_key"], None)
                     record(entry, item, local_sha256)
+                    if entry.get("changed_meanwhile"):
+                        state["files"][state_key(item, entry["relative_path"])].pop("local_mtime_ns", None)
                     if status == "KEEP_BOTH":
                         report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
                     else:
