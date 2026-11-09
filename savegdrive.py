@@ -1362,7 +1362,7 @@ class DestinationSetupScreen(Screen):
             )
         except (OSError, ValueError) as error:
             preview.update(
-                Text(str(error), style="bold bright_red")
+                Text.assemble((str(error), "bold bright_red"))
             )
 
     def action_save(self):
@@ -1372,7 +1372,7 @@ class DestinationSetupScreen(Screen):
             destination = initialize_managed_destination(destination)
         except (OSError, ValueError) as error:
             status.update(
-                Text(str(error), style="bold bright_red")
+                Text.assemble((str(error), "bold bright_red"))
             )
             # On a short terminal the refusal and the button sit below the form's fold.
             self.call_after_refresh(

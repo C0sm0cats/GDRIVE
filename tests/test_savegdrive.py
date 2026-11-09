@@ -5489,6 +5489,36 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("escape")
                     await pilot.press("q")
 
+    async def test_destination_errors_are_shown_in_bold_red(self):
+        # design 16: Static.update(Text(x, style=...)) dropped the style, the errors looked like plain text.
+        def assert_bold_red(widget, needle):
+            lines = widget.render_lines(widget.size.region)
+            segments = [s for line in lines for s in line if needle in s.text]
+            self.assertTrue(segments, widget.id)
+            for segment in segments:
+                self.assertTrue(segment.style.bold, segment)
+                red, green, blue = segment.style.color.get_truecolor()
+                self.assertGreater(red, 2 * max(green, blue), segment)
+
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "GDrive").mkdir()
+            (Path(temp) / "GDrive" / "file.txt").write_text("x")  # not empty, no state: refused
+            app = self.make_app()
+            async with app.run_test(size=(110, 27)) as pilot:
+                await pilot.press("f")
+                screen = app.screen
+                self.assertIsInstance(screen, savegdrive.DestinationSetupScreen)
+                screen.query_one("#parent-path", Input).value = str(Path(temp) / "Documets")  # typo
+                await pilot.pause()
+                assert_bold_red(screen.query_one("#final-path"), "No such file or directory")
+                screen.query_one("#parent-path", Input).value = temp
+                screen.query_one("#folder-name", Input).value = "GDrive"
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.3)
+                assert_bold_red(screen.query_one("#setup-status"), "already contains files")
+                await pilot.press("escape")
+                await pilot.press("q")
+
     async def test_folding_a_directory_on_the_destination_screen_keeps_the_app_open(self):
         (Path(self.temp.name) / "Documents").mkdir()
         app = self.make_app()
