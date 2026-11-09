@@ -41,6 +41,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
+from textual.widgets.data_table import ColumnKey
 from textual.widgets import (
     Button,
     DataTable,
@@ -4664,7 +4665,7 @@ class PreviewScreen(Screen):
         margin: 1 2 0 2;
     }
 
-    #preview-table {
+    PreviewTable.preview-table {
         height: 1fr;
         min-height: 6;
         margin: 1 2 0 2;
@@ -4672,12 +4673,12 @@ class PreviewScreen(Screen):
         background: #081525;
     }
 
-    #preview-table > .datatable--cursor {
+    PreviewTable.preview-table > .datatable--cursor {
         background: #164e63;
         color: #ffffff;
     }
 
-    #preview-table > .datatable--header {
+    PreviewTable.preview-table > .datatable--header {
         background: #0f2742;
         color: #93c5fd;
     }
@@ -4716,12 +4717,14 @@ class PreviewScreen(Screen):
         ] or PREVIEW_VIEWS[:1]
         self.filter_index = 0
         self.rows = None
+        # One table per tab, filled once and kept: Tab only shows another one, b changes its row in each.
+        self.tables = {}
+        self.table = None  # the one in view
 
     def compose(self) -> ComposeResult:
         yield Header(icon="")
         yield Static(id="preview-summary")
         yield Static(id="preview-filters")
-        yield PreviewTable(id="preview-table", cursor_type="row", zebra_stripes=False)
         yield Static(id="preview-notes")
         yield KeyBar(self.KEY_CONTEXT)
 
@@ -4730,7 +4733,6 @@ class PreviewScreen(Screen):
         self.rows = []
         self.update_notes()
         self.fill()
-        self.query_one(DataTable).focus()
 
     def update_notes(self):
         notes = Text()
@@ -4747,7 +4749,6 @@ class PreviewScreen(Screen):
 
     def fill(self):
         name, keep = self.filters[self.filter_index]
-        rows = [entry for entry in self.plan if keep(entry)]
         summary_widget = self.query_one("#preview-summary", Static)
         summary = Summary(Text.assemble(("Preview", "bold"), "  "), plan_summary(self.plan)).fit(
             self.app.size.width - summary_widget.styles.margin.width)
@@ -4770,49 +4771,121 @@ class PreviewScreen(Screen):
         filters = self.query_one("#preview-filters", Static)
         tab_lines = tab_row(tabs, self.app.size.width - filters.styles.margin.width, hint)
         filters.update(tab_lines)
-        # A second line of tabs takes the gap above the table (its border still sets it apart), not a table row.
-        self.query_one("#preview-table").styles.margin = (0 if "\n" in tab_lines.plain else 1, 2, 0, 2)
 
-        table = self.query_one(DataTable)
-        row = table.cursor_row
-        cells = []
-        for entry in rows:
-            style, label, _ = STATUS_STYLES[entry["status"]]
-            path = printable(entry["relative_path"].as_posix()) + ("/" if entry["kind"] == "FOLDER" else "")
-            size = entry_size(entry)
-            suffix = ""
-            if entry["status"] == "KEEP_BOTH":
-                suffix = f"  (yours → {printable(entry['local_copy'].name)})"
-            elif entry.get("duplicate"):
-                suffix = f"  {duplicate_label(entry)}"
-            elif entry.get("unreadable"):
-                suffix = f"  {UNREADABLE_LABEL}"
-            size_cell = Text(size if size != "-" else "", style="dim", justify="right")
-            cells.append((Text(label, style=style), path, suffix, size_cell))
+        row = self.table.cursor_row if self.table is not None else 0
+        table = self.tables.get(name)
+        if table is None or table.screen_width != self.app.size.width:
+            if table is not None:
+                table.remove()
+            table = self.tables[name] = PreviewTable(classes="preview-table", cursor_type="row", zebra_stripes=False)
+            table.screen_width = self.app.size.width
+            self.mount(table, before=self.query_one("#preview-notes"))
+            self.fill_table(table, [entry for entry in self.plan if keep(entry)])
+        if self.table is not None and self.table is not table:
+            self.table.display = False
+        self.table = table
+        table.display = True
+        # A second line of tabs takes the gap above the table (its border still sets it apart), not a table row.
+        table.styles.margin = (0 if "\n" in tab_lines.plain else 1, 2, 0, 2)
+        self.rows = table.entries
+        if table.entries:
+            table.move_cursor(row=min(row, len(table.entries) - 1))
+        table.focus()
+        self.call_after_refresh(self.fit_notes)
+
+    @staticmethod
+    def row_cells(entry):
+        """(STATUS, path, suffix, SIZE) of an entry's row; the ITEM cell is fit_path(path, suffix, width)."""
+        style, label, _ = STATUS_STYLES[entry["status"]]
+        path = printable(entry["relative_path"].as_posix()) + ("/" if entry["kind"] == "FOLDER" else "")
+        size = entry_size(entry)
+        suffix = ""
+        if entry["status"] == "KEEP_BOTH":
+            suffix = f"  (yours → {printable(entry['local_copy'].name)})"
+        elif entry.get("duplicate"):
+            suffix = f"  {duplicate_label(entry)}"
+        elif entry.get("unreadable"):
+            suffix = f"  {UNREADABLE_LABEL}"
+        size_cell = Text(size if size != "-" else "", style="dim", justify="right")
+        return Text(label, style=style), path, suffix, size_cell
+
+    @staticmethod
+    def item_cell(entry, path, suffix, width):
+        item = fit_path(path, suffix, width)
+        return Text(item, style="cyan") if entry["kind"] == "FOLDER" else Text(item)
+
+    def column_widths(self, table):
         # STATUS and SIZE keep their width; ITEM gets the rest, so SIZE stays in view.
-        status_width = max([len("STATUS")] + [status.cell_len for status, *_ in cells])
-        size_width = max([len("SIZE")] + [size.cell_len for *_, size in cells])
+        status_width = max([len("STATUS")] + table.status_lengths)
+        size_width = max([len("SIZE")] + table.size_lengths)
         styles = table.styles
         frame = styles.margin.width + styles.gutter.width + styles.scrollbar_size_vertical
         room = self.app.size.width - frame - 6 * table.cell_padding - status_width - size_width
-        needed = max([len("ITEM")] + [Text(path + suffix).cell_len for _, path, suffix, _ in cells])
-        item_width = max(min(needed, room), PREVIEW_ITEM_MIN)
+        needed = max([len("ITEM")] + table.item_lengths)
+        return status_width, max(min(needed, room), PREVIEW_ITEM_MIN), size_width
+
+    def fill_table(self, table, rows):
+        cells = [self.row_cells(entry) for entry in rows]
+        table.entries = rows
+        table.row_of = {id(entry): index for index, entry in enumerate(rows)}
+        table.status_lengths = [status.cell_len for status, *_ in cells]
+        table.size_lengths = [size.cell_len for *_, size in cells]
+        table.item_lengths = [Text(path + suffix).cell_len for _, path, suffix, _ in cells]
+        table.widths = status_width, item_width, size_width = self.column_widths(table)
         table.clear(columns=True)
         table.add_column("STATUS", key="status", width=status_width)
         table.add_column("ITEM", key="item", width=item_width)
         table.add_column(Text("SIZE", justify="right"), key="size", width=size_width)
-        self.rows = rows
-        for entry, (status, path, suffix, size) in zip(rows, cells):
-            item = fit_path(path, suffix, item_width)
-            table.add_row(status, Text(item, style="cyan") if entry["kind"] == "FOLDER" else Text(item), size)
-        if rows:
-            table.move_cursor(row=min(row, len(rows) - 1))
-        self.call_after_refresh(self.fit_notes)
+        for index, (entry, (status, path, suffix, size)) in enumerate(zip(rows, cells)):
+            table.add_row(status, self.item_cell(entry, path, suffix, item_width), size, key=str(index))
+
+    def update_rows(self, changed):
+        """After b: change the rows of these entries in place, in each table that keeps them. A table they
+        join or leave (a status tab), or where ITEM cuts a path before or after, is filled again when shown."""
+        for name, keep in PREVIEW_VIEWS:
+            table = self.tables.get(name)
+            if table is None:
+                continue
+            if any((id(entry) in table.row_of) != bool(keep(entry)) for entry in changed):
+                table.screen_width = None  # filled again when shown
+                continue
+            updates, cut_before = [], max(table.item_lengths, default=0) > table.widths[1]
+            for entry in changed:
+                index = table.row_of.get(id(entry))
+                if index is None:
+                    continue
+                status, path, suffix, size = self.row_cells(entry)
+                table.status_lengths[index] = status.cell_len
+                table.size_lengths[index] = size.cell_len
+                table.item_lengths[index] = Text(path + suffix).cell_len
+                updates.append((index, entry, status, path, suffix, size))
+            if not updates:
+                continue
+            widths = self.column_widths(table)
+            if widths != table.widths and (cut_before or max(table.item_lengths, default=0) > widths[1]):
+                table.screen_width = None  # cut paths are cut to the width: they all change
+                continue
+            resized = widths != table.widths
+            if resized:
+                # No path cut, before or after: the other rows stay as they are in the new widths.
+                for key, width in zip(("status", "item", "size"), widths):
+                    column = table.columns[ColumnKey(key)]
+                    # The widths are fixed: content_width only decides whether a cell measured narrower than it
+                    # has the table measure the whole column again. At 0, it does not.
+                    column.width, column.content_width = width, 0
+                table.widths = widths
+            for index, entry, status, path, suffix, size in updates:
+                table.update_cell(str(index), "status", status)
+                table.update_cell(str(index), "item", self.item_cell(entry, path, suffix, widths[1]),
+                                  update_width=resized)  # has the table take its new widths
+                table.update_cell(str(index), "size", size)
 
     def fit_notes(self):
         # Tabs on several lines come out of the notes (they scroll), never out of the table or the key bar.
         notes = self.query_one("#preview-notes")
-        table = self.query_one("#preview-table")
+        table = self.table
+        if table is None:
+            return
         used = sum(widget.outer_size.height + widget.styles.margin.height
                    for widget in self.query("Header, #preview-summary, #preview-filters, KeyBar"))
         free = self.size.height - used - table.styles.margin.height - int(table.styles.min_height.value)
@@ -4830,7 +4903,13 @@ class PreviewScreen(Screen):
         self.filter_index = (self.filter_index - 1) % len(self.filters)
         self.fill()
 
-    def refresh_plan(self):
+    def refresh_plan(self, changed=None):
+        """After keep both: the changed entries' rows (all tables are filled again when changed is None)."""
+        if changed is None:
+            for table in self.tables.values():
+                table.screen_width = None
+        else:
+            self.update_rows(changed)
         current = self.filters[self.filter_index][0]
         self.filters = [
             (name, keep) for name, keep in PREVIEW_VIEWS
@@ -4841,8 +4920,8 @@ class PreviewScreen(Screen):
         self.fill()
 
     def action_keep_both(self):
-        table = self.query_one(DataTable)
-        if not self.rows:
+        table = self.table
+        if table is None or not self.rows:
             return
         entry = self.rows[table.cursor_row]
         if entry.get("duplicate"):
@@ -4872,7 +4951,7 @@ class PreviewScreen(Screen):
                 severity="warning",
                 markup=False,
             )
-        self.refresh_plan()
+        self.refresh_plan([entry])
 
     def action_keep_both_all(self):
         conflicts = [entry for entry in self.plan if can_keep_both(entry)]

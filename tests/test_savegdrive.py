@@ -4911,10 +4911,9 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
             self.assertIn("to download", str(app.screen.query_one("#preview-summary").render()))
-            table = app.screen.query_one("DataTable")
-            self.assertEqual(table.row_count, 5)  # Docs/, a, b, Report, and Survey skipped
+            self.assertEqual(app.screen.table.row_count, 5)  # Docs/, a, b, Report, and Survey skipped
             await pilot.press("tab", "tab")  # everything, then each status: new
-            self.assertEqual(table.row_count, 4)
+            self.assertEqual(app.screen.table.row_count, 4)
             await pilot.press("escape")  # back to the tree, selection kept
             self.assertNotIsInstance(app.screen, savegdrive.PreviewScreen)
             self.assertEqual(self.selected(app), ["Docs"])
@@ -5228,13 +5227,13 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         app = savegdrive.PreviewApp(plan, self.root)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#preview-table")
+            table = app.screen.table
             self.assertLessEqual(table.virtual_size.width, table.scrollable_content_region.width)
             item = table.get_row_at(0)[1].plain
             self.assertTrue(item.startswith("…") and item.endswith("(yours → Copy (local).docx)"), item)
             await pilot.resize_terminal(220, 55)
             await pilot.pause()
-            self.assertEqual(table.get_row_at(0)[1].plain,
+            self.assertEqual(app.screen.table.get_row_at(0)[1].plain,
                              f"{path}  (yours → Copy (local).docx)")
 
     async def test_preview_keep_both_with_a_long_name_shows_file_and_copy_name(self):
@@ -5250,7 +5249,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         app = savegdrive.PreviewApp(plan, self.root)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#preview-table")
+            table = app.screen.table
             self.assertLessEqual(table.virtual_size.width, table.scrollable_content_region.width)
             item = table.get_row_at(0)[1].plain
             self.assertLessEqual(len(item), table.columns["item"].width)
@@ -5271,7 +5270,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         app = savegdrive.PreviewApp(plan, self.root)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#preview-table")
+            table = app.screen.table
             sizes = {table.get_row_at(index)[1].plain: table.get_row_at(index)[-1].plain
                      for index in range(table.row_count)}
         self.assertEqual(sizes, {"beach.jpg": "5.0 MB", "new.txt": "1.5 KB", "down.txt": "2.0 KB"})
@@ -5298,7 +5297,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 for name in names:
                     self.assertIn(f" {name} (", shown, (size, lines))
                 self.assertTrue(all(len(line) <= row.size.width for line in lines), lines)
-                self.assertGreaterEqual(app.screen.query_one("#preview-table").region.height, 6)
+                self.assertGreaterEqual(app.screen.table.region.height, 6)
                 self.assertLessEqual(app.screen.query_one(savegdrive.KeyBar).region.bottom, size[1])
             # One line wide enough: the tab hint is there too (the key bar always lists tab and shift+tab).
             self.assertEqual(len(lines), 1)
@@ -5411,7 +5410,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         app = savegdrive.PreviewApp(plan, self.root)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#preview-table")
+            table = app.screen.table
             self.assertGreaterEqual(table.region.height, 6)  # border, header and some rows
             keys = app.screen.query_one(savegdrive.KeyBar)
             self.assertLessEqual(keys.region.bottom, 24)
@@ -5426,7 +5425,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         app = savegdrive.PreviewApp(plan, self.root)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#preview-table")
+            table = app.screen.table
             await pilot.press("end")
             await pilot.pause()
             self.assertEqual(table.cursor_row, table.row_count - 1)
@@ -5435,6 +5434,60 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(table.cursor_row, 0)
             self.assertEqual(table.scroll_x, 0)
+
+    async def test_preview_tab_and_keep_both_do_not_fill_the_table_again(self):
+        # perf 7: each tab and each b cleared the table and added all its rows again (1 to 4 s at 10 000 rows).
+        plan = [{
+            "status": "NEW", "relative_path": Path(f"Photos/IMG_{n:04}.jpg"), "kind": "FILE",
+            "item": {"name": f"IMG_{n:04}.jpg", "size": "10"}, "destination": self.root / f"IMG_{n:04}.jpg",
+        } for n in range(30)]
+        for n in range(2):
+            (self.root / f"notes {n}.txt").write_text("mine")
+            plan.append({
+                "status": "CONFLICT", "relative_path": Path(f"notes {n}.txt"), "kind": "FILE",
+                "item": {"id": f"c{n}", "name": f"notes {n}.txt", "size": "10"},
+                "destination": self.root / f"notes {n}.txt",
+            })
+        added = []
+        add_row = savegdrive.PreviewTable.add_row
+
+        def counted_add_row(table, *cells, **kwargs):
+            added.append(cells)
+            return add_row(table, *cells, **kwargs)
+
+        def shown(table):
+            return ([column.width for column in table.ordered_columns],
+                    [[cell.plain for cell in table.get_row_at(row)] for row in range(table.row_count)])
+
+        async def fresh():  # the same plan in a preview just opened
+            app = savegdrive.PreviewApp(plan, self.root)
+            async with app.run_test(size=(160, 40)) as pilot:
+                await pilot.pause()
+                return shown(app.screen.table)
+
+        with mock.patch.object(savegdrive.PreviewTable, "add_row", counted_add_row):
+            app = savegdrive.PreviewApp(plan, self.root)
+            async with app.run_test(size=(160, 40)) as pilot:
+                await pilot.pause()
+                added.clear()
+                await pilot.press("tab", "shift+tab")  # Everything, then Changes again
+                await pilot.pause()
+                self.assertEqual(len(added), len(plan))  # Everything, once; Changes kept its rows
+                added.clear()
+                await pilot.press("end", "b")  # keep both on the last conflict: its row changes in place
+                await pilot.pause()
+                table = app.screen.table
+                self.assertEqual(added, [])
+                self.assertIn("(yours → notes 1 (local).txt)", table.get_row_at(table.row_count - 1)[1].plain)
+                after_keep = shown(table)
+                await pilot.press("b")  # and back to a conflict
+                await pilot.pause()
+                self.assertEqual(added, [])
+                after_undo = shown(table)
+        savegdrive.set_keep_both(plan, [plan[-1]], True)
+        self.assertEqual(after_keep, await fresh())  # the new ITEM width too: as a preview just opened
+        savegdrive.set_keep_both(plan, [plan[-1]], False)
+        self.assertEqual(after_undo, await fresh())
 
     async def test_session_destination(self):
         app = self.make_app()
