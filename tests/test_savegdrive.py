@@ -1504,6 +1504,40 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
 
+    async def test_cancelled_drive_questions_change_nothing(self):
+        drive = demo_drive()
+        drive.items["a"]["trashed"] = True
+        drive.items["n"]["trashed"] = True
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        async with app.run_test() as pilot:
+            await pilot.press("down", "down")  # Photos
+            for cancel in ("n", "escape"):
+                await pilot.press("x")
+                self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+                await pilot.press(cancel)
+                await self.wait(app, pilot)
+                self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+                self.assertNotIn("trashed", drive.items["photos"])
+
+            await pilot.press("shift+tab")  # Trash
+            await self.wait(app, pilot)
+            self.assertEqual(app.view.name, "Trash")
+            await pilot.press("down", "x")  # delete forever, asks for a word
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("escape")
+            await self.wait(app, pilot)
+            await pilot.press("T")  # empty the Drive trash, asks for a word
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("escape")
+            await self.wait(app, pilot)
+            self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("q")
+        for item_id in ("a", "n"):
+            self.assertIn(item_id, drive.items)
+            self.assertTrue(drive.items[item_id]["trashed"])
+        self.assertNotIn("trashed", drive.items["photos"])
+
     def trash_view_app(self, drive):
         drive.items["n"]["trashed"] = True  # notes.txt is in the Drive trash
         views = savegdrive.drive_views(drive, "root")
