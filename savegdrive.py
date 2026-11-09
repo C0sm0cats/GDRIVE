@@ -3080,6 +3080,7 @@ def set_keep_both(plan, entries, keep):
     version is downloaded in its place: both versions end up on both sides, and the conflict is gone.
     """
     taken = {entry["local_copy"] for entry in plan if entry["status"] == "KEEP_BOTH"}
+    taken |= {entry["destination"] for entry in plan}  # a file this plan brings down: never your copy's name
     for entry in entries:
         if not can_keep_both(entry):
             continue

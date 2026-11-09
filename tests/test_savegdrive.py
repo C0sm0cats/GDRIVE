@@ -1061,6 +1061,30 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
+    def test_keep_both_never_takes_a_name_the_plan_downloads(self):
+        self.run_sync()
+        (self.root / "Docs/a.txt").write_bytes(b"MY UNSAVED WORK")
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        self.drive.items["al"] = file_item("al", "a (local).txt", "docs", b"other computer's copy")
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                plan, state = self.preview()
+                entries = {entry["relative_path"].as_posix(): entry for entry in plan}
+                self.assertEqual(entries["Docs/a (local).txt"]["status"], "NEW")
+                savegdrive.set_keep_both(plan, [entries["Docs/a.txt"]], True)
+                self.assertEqual(entries["Docs/a.txt"]["local_copy"].name, "a (local 2).txt")
+                if jobs == 1:
+                    # Plan without the download: the name is free again on undo, still avoided on redo.
+                    savegdrive.set_keep_both(plan, [entries["Docs/a.txt"]], False)
+                    savegdrive.set_keep_both(plan, [entries["Docs/a.txt"]], True)
+                    self.assertEqual(entries["Docs/a.txt"]["local_copy"].name, "a (local 2).txt")
+                    continue
+                results = self.apply(plan, state, jobs)
+                self.assertEqual(results["FILE_ERROR"], 0)
+                self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+                self.assertEqual((self.root / "Docs/a (local).txt").read_bytes(), b"other computer's copy")
+                self.assertEqual((self.root / "Docs/a (local 2).txt").read_bytes(), b"MY UNSAVED WORK")
+
     def test_local_edit_after_the_preview_is_never_overwritten(self):
         self.run_sync()
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2 from Drive"))
