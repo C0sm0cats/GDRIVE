@@ -2146,6 +2146,27 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(self.drive.items["a"]["trashed"])
         self.assertFalse((self.root / "Docs/a.txt").exists())
 
+    def test_failed_download_is_counted_in_the_result(self):
+        # tests 54: the result above the tree and in the terminal counts the failed transfer, not just "Done".
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+
+        def failing_fetch(service, item, file_handle, stop=None):
+            if item["id"] == "a":
+                raise http_error(500)
+            fake_fetch(service, item, file_handle, stop)
+
+        plan, state = self.preview()
+        with mock.patch.object(savegdrive, "fetch_media", failing_fetch):
+            results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 1)
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha")
+        self.assertIn("1 error", savegdrive.result_notice(plan, results).plain)
+        console = Console(file=io.StringIO(), width=200)
+        with mock.patch.object(savegdrive, "console", console):
+            savegdrive.print_results(results)
+        self.assertIn("1 error", console.file.getvalue())
+
     def test_again_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
         import shutil
