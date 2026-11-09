@@ -918,8 +918,11 @@ def compact_scopes(scopes):
 
 
 def fully_selected(root_items, base, selections):
-    return bool(root_items) and all(
-        path_selection_state(base / local_name(item), selections) in {"x", "*"}
+    if not root_items:
+        return False
+    index = selection_index(selections)  # once: path_selection_state per item rescanned the selection
+    return all(
+        indexed_selection_state(base / local_name(item), index) in {"x", "*"}
         for item in root_items
     )
 

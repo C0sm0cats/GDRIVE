@@ -3211,6 +3211,21 @@ class SelectionScalingTest(unittest.TestCase):
     def test_last_selection_is_linear(self):
         self.assertLess(self.last_selection(400), self.last_selection(20) * 30)
 
+    def fully_selected_view(self, count):
+        base = Path("Shared with me")
+        items = [{"id": f"i{index}", "name": f"f{index}.txt", "mimeType": "text/plain"} for index in range(count)]
+        selections = []
+        savegdrive.add_selected_items(selections, [{"item": item, "relative_parent": base} for item in items])
+        calls, scopes = self.count_paths(lambda: savegdrive.build_local_scopes(selections, {base: items}, (Path(), base)))
+        self.assertEqual(scopes, [base])
+        partial = savegdrive.build_local_scopes(selections[1:], {base: items}, (Path(), base))
+        self.assertEqual(partial, [])
+        return calls
+
+    def test_fully_selected_view_is_linear(self):
+        # perf 14: every top item of the view selected (a, then d or y) rescanned the selection per item.
+        self.assertLess(self.fully_selected_view(400), self.fully_selected_view(20) * 30)
+
     def test_compact_scopes_is_linear(self):
         calls = [0]
         real = savegdrive.scope_covers
