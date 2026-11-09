@@ -3591,6 +3591,27 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             plan.insert(start, plan.pop())  # listed before its content
             return
         new_folders.discard(relative_path)  # nothing goes up: nothing in it was planned through can_send
+        below = plan[start:]
+        if below and all(entry["status"] == "TRASH_LOCAL" for entry in below) and holds_only(directory, below):
+            # All of it follows the deletion: one folder to the system trash, not one call (and one name
+            # search in the trash) per file. What it held is kept to check, right before, that nothing changed.
+            del plan[start:]
+            plan.append(
+                {
+                    "status": "TRASH_LOCAL",
+                    "kind": "FOLDER",
+                    "item": None,
+                    "relative_path": relative_path,
+                    "destination": directory,
+                    "state_key": None,
+                    "local_sha256": None,
+                    "local_stat": None,
+                    "contents": below,
+                    "files_below": sum(entry.get("files_below", 1) for entry in below),
+                }
+            )
+            planned_local_paths.add(relative_path)
+            return
         if relative_path in synced_folders and not any(directory.rglob("*")):
             add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
 
@@ -3963,7 +3984,9 @@ def deletion_count(plan, state):
     for entry in plan:
         if entry["status"] not in DELETIONS:
             continue
-        if entry["kind"] == "FOLDER":
+        if "files_below" in entry:
+            count += max(1, entry["files_below"])  # a whole folder deleted on Drive: its files, counted at the plan
+        elif entry["kind"] == "FOLDER":
             count += max(1, len(tracked_below(state, entry["relative_path"])))
         else:
             count += 1
@@ -4411,9 +4434,45 @@ def still_deleted_here(service, entry, state):
     return remote_signature(now) == remote_signature(item) and can(now, "canTrash")
 
 
+def holds_only(directory, entries):
+    """True when directory holds nothing but entries (their paths, or below a folder among them): no symlink,
+    no file or empty folder the plan left out. Paths are compared on disk, below directory."""
+    covered = {entry["destination"] for entry in entries}
+    folders = {entry["destination"] for entry in entries if entry["kind"] == "FOLDER"}
+
+    def unreadable(error):
+        raise error
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(directory, onerror=unreadable):
+            here = Path(dirpath)
+            if here != directory and here in folders:
+                dirnames[:] = []
+                continue
+            if here != directory and not dirnames and not filenames:
+                return False  # an empty folder the plan left out
+            for name in filenames:
+                if here / name not in covered:
+                    return False
+            for name in dirnames:
+                if (here / name).is_symlink():
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def still_deleted_on_drive_unchanged_here(entry):
-    """Right before the system trash: the local file is still the one last synced, the folder still empty."""
+    """Right before the system trash: the local file is still the one last synced, the folder still empty,
+    or for a whole folder: what it held is unchanged, and nothing else is in it."""
     destination = entry["destination"]
+    if "contents" in entry:
+        if not destination.is_dir() or destination.is_symlink():
+            return False
+        return (
+            all(still_deleted_on_drive_unchanged_here(inside) for inside in entry["contents"])
+            and holds_only(destination, entry["contents"])
+        )
     if entry["kind"] == "FOLDER":
         try:
             return destination.is_dir() and not destination.is_symlink() and not any(destination.rglob("*"))

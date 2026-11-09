@@ -1014,8 +1014,45 @@ class SyncTest(unittest.TestCase):
         for key in ["photos", "p"]:
             del self.drive.items[key]
         statuses, _ = self.run_sync()
-        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
-        self.assertFalse((self.root / "Photos").exists())  # left empty: removed
+        self.assertEqual(statuses["Photos"], "TRASH_LOCAL")  # perf 11: the whole folder, in one call
+        self.assertNotIn("Photos/beach.jpg", statuses)
+        self.assertFalse((self.root / "Photos").exists())
+
+    def test_folder_deleted_on_drive_goes_to_your_trash_in_one_call(self):
+        # perf 11: one system-trash call per file was 14 s for 10,000 files, and the trash got them in bulk.
+        self.drive.items["trip"] = {"id": "trip", "name": "Trip", "mimeType": FOLDER, "parent": "photos"}
+        for index in range(3):
+            self.drive.items[f"t{index}"] = file_item(f"t{index}", f"day{index}.jpg", "trip", b"jpg")
+        self.drive.items["empty"] = {"id": "empty", "name": "Empty", "mimeType": FOLDER, "parent": "photos"}
+        self.run_sync()
+        for key in ["photos", "p", "trip", "t0", "t1", "t2", "empty"]:
+            del self.drive.items[key]
+        plan, state = self.preview()
+        [folder] = [entry for entry in plan if entry["relative_path"].parts[:1] == ("Photos",)]
+        self.assertEqual((folder["relative_path"], folder["status"]), (Path("Photos"), "TRASH_LOCAL"))
+        self.assertEqual(savegdrive.deletion_count(plan, state)[0], 5)  # as file by file: 4 files, 1 empty folder
+        with mock.patch.object(savegdrive, "trash_local", wraps=savegdrive.trash_local) as trash_local:
+            results = self.apply(plan, state)
+        self.assertEqual(trash_local.call_args_list, [mock.call(self.root / "Photos")])
+        self.assertEqual(results["FOLDER_TRASH_LOCAL"], 1)
+        [trashed] = list(self.trash.iterdir())
+        self.assertEqual(sorted(path.relative_to(trashed).as_posix() for path in trashed.rglob("*")),
+                         ["Empty", "Trip", "Trip/day0.jpg", "Trip/day1.jpg", "Trip/day2.jpg", "beach.jpg"])
+        state = savegdrive.load_state(self.root)
+        self.assertFalse([record for record in state["files"].values() if record["path"].startswith("Photos/")])
+
+    def test_folder_deleted_on_drive_with_a_file_saved_after_the_preview_is_kept(self):
+        self.run_sync()
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        plan, state = self.preview()
+        self.assertEqual([entry["status"] for entry in plan if entry["relative_path"] == Path("Photos")],
+                         ["TRASH_LOCAL"])
+        (self.root / "Photos/new.jpg").write_bytes(b"saved while the preview is open")
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_TRASH_LOCAL"] + results["FOLDER_TRASH_LOCAL"], 0)
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / "Photos/beach.jpg").read_bytes(), b"jpeg")
 
     def test_folder_deleted_on_drive_with_changes_here_comes_back(self):
         self.run_sync()
@@ -1185,7 +1222,7 @@ class SyncTest(unittest.TestCase):
         self.drive.items["photos"]["parent"] = "docs"
         self.drive.items["n"]["parent"] = "docs"
         statuses = self.sync_picked(again=True)
-        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertEqual(statuses["Photos"], "TRASH_LOCAL")
         self.assertFalse((self.root / "Photos").exists())
         self.assertEqual((self.root / "Docs/Photos/beach.jpg").read_bytes(), b"jpeg")
         self.assertEqual(statuses["notes.txt"], "UPLOAD_NEW")  # the change made here is not lost
@@ -1256,7 +1293,7 @@ class SyncTest(unittest.TestCase):
         self.run_sync()
         self.drive.items["club"]["trashed"] = True  # x in the tree, or a colleague
         statuses, _ = self.run_sync()
-        self.assertEqual(statuses["Club/Photos 2026"], "TRASH_LOCAL")
+        self.assertEqual(statuses["Club"], "TRASH_LOCAL")
         self.assertFalse((self.root / "Club").exists())
         self.drive.items["club"]["trashed"] = False  # r in the Trash view
         statuses, _ = self.run_sync()
