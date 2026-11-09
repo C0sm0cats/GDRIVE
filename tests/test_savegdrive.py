@@ -2478,7 +2478,7 @@ class SyncTest(unittest.TestCase):
             output = self.run_main(isatty=True)
         self.assertTrue(any(item["name"] == "new.txt" for item in self.drive.items.values()))
         self.assertNotIn("✗", output)
-        self.assertEqual(labels, ["My Drive  timed out"])
+        self.assertEqual(labels, ["My Drive  timed out  (switch views to try again)"])
 
     def test_tree_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
@@ -4865,6 +4865,35 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Team (1)", str(app.query_one("#views").render()))
             await pilot.press("shift+tab", "shift+tab")
             self.assertIs(app.view, views[0])
+            await pilot.press("q")
+
+    async def test_view_that_failed_to_load_is_tried_again_when_switching_back(self):
+        # ux 34: one network error on a view's first listing left it in error for the whole session.
+        drive = demo_drive()
+        drive.items["s"] = file_item("s", "from Ann.pdf", "ann", b"pdf", shared=True)
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        list_folder, failures = drive.list, []
+
+        def flaky_list(q, **kwargs):
+            if q.startswith("sharedWithMe") and not failures:
+                failures.append(q)
+                raise TimeoutError("timed out")
+            return list_folder(q, **kwargs)
+
+        drive.list = flaky_list
+        async with app.run_test() as pilot:
+            tree = app.query_one(Tree)
+            await pilot.press("down", "space", "tab")  # Docs, then Shared with me: the listing fails once
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIs(app.view, views[1])
+            self.assertEqual(str(tree.root.label), "Shared with me  timed out  (switch views to try again)")
+            await pilot.press("shift+tab", "tab")  # My Drive, then back: listed again
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertEqual([node.data["display_path"] for node in tree.root.children], ["from Ann.pdf"])
+            self.assertEqual(self.selected(app), ["Docs"])
             await pilot.press("q")
 
     async def test_filter_select_all_and_clear(self):

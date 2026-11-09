@@ -2277,7 +2277,8 @@ class DriveSelectorApp(App):
             if view.error is None:
                 self.run_worker(lambda: self.load_in_background(view), thread=True, group="views")
             else:
-                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), (f"  {view.error}", "red")))
+                retry = ("  (switch views to try again)", "dim") if len(self.views) > 1 else ""
+                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), (f"  {view.error}", "red"), retry))
         else:
             tree.root.set_label(Text(view.name, style="bold bright_blue"))
             view.sort(self.sort)
@@ -2320,6 +2321,7 @@ class DriveSelectorApp(App):
         if len(self.views) < 2 or self.busy:
             return
         index = (self.views.index(self.view) + step) % len(self.views)
+        self.views[index].error = None  # coming back to a view that failed to load tries again
         self.show_view(self.views[index])
 
     TREE_ACTIONS = {

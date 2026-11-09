@@ -267,8 +267,9 @@ from the state without hashing any file:
 
 `Tab` switches between My Drive, Shared with me (the items others shared with
 you), each shared drive you are a member of, and Trash (what you moved to the
-Drive trash). A view is loaded the first time it is shown; the tabs show how
-many items are selected in each. Selections are kept across views and synced
+Drive trash). A view is loaded the first time it is shown, and a view that
+failed to load is tried again when you come back to it; the tabs show how many
+items are selected in each. Selections are kept across views and synced
 together:
 
 ```text
