@@ -1523,9 +1523,10 @@ class KeyBar(Widget):
     }
     """
 
-    def __init__(self, context, **kwargs):
+    def __init__(self, context, hidden=(), **kwargs):
         super().__init__(**kwargs)
         self.context = context
+        self.hidden = set(hidden)  # keys that do nothing here, such as tab with a single view
 
     def set_context(self, context):
         if context != self.context:
@@ -1539,6 +1540,8 @@ class KeyBar(Widget):
         for name, keys in groups:
             line = Text(f"{name:<{label_width}}", style="dim")
             for key, label, _ in keys:
+                if key in self.hidden:
+                    continue
                 pair = Text.assemble((key, "bold #f59e0b"), " ", (label, "#bae6fd"))
                 if line.cell_len > label_width and line.cell_len + 3 + pair.cell_len > width:
                     lines.append(line)
@@ -2156,7 +2159,8 @@ class DriveSelectorApp(App):
         filter_input.display = False
         yield filter_input
         yield Static(id="selection-summary")
-        yield KeyBar("tree", id="keys")
+        # With --folder-id there is a single view: tab and shift+tab do nothing.
+        yield KeyBar("tree", hidden={"tab", "shift+tab"} if len(self.views) == 1 else (), id="keys")
 
     def on_mount(self):
         self.update_sub_title()
@@ -2879,8 +2883,12 @@ class DriveSelectorApp(App):
             )
         else:
             note = f" ({plural(skipped, 'item')} you cannot trash on Drive stay.)" if skipped else ""
+            if any(view.root_id == TRASH for view in self.views):
+                restore = "You can restore it from the Trash view."
+            else:  # --folder-id: no Trash view in this session
+                restore = "You can restore it from the Trash view (run without --folder-id) or in Google Drive."
             self.drive_change(
-                f"Move {what} to the Google Drive trash? You can restore it from the Trash view.{note}", None,
+                f"Move {what} to the Google Drive trash? {restore}{note}", None,
                 lambda service: trash_items(service, ids), f"Moved {what} to the Drive trash.",
             )
 

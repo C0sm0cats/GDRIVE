@@ -5317,6 +5317,34 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(listings, [])  # the Drive changes only, not every folder again
             await pilot.press("q")
 
+    async def test_folder_id_trash_points_to_a_view_this_session_has(self):
+        # ux 29: with --folder-id there is no Trash view: x says where to restore, the key bar drops tab.
+        drive = demo_drive()
+        views = savegdrive.drive_views(drive, "docs")
+        self.assertEqual([view.name for view in views], ["Docs"])
+        app = self.make_app(drive, views)
+        async with app.run_test(size=(120, 30)) as pilot:
+            keys = [str(line) for line in app.query_one("#keys", savegdrive.KeyBar).lines(200)]
+            self.assertNotIn("tab", " ".join(keys).split())
+            self.assertNotIn("shift+tab", " ".join(keys).split())
+            self.assertIn("/ filter", " ".join(keys))
+            await pilot.press("down", "x")
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            self.assertIn("run without --folder-id", app.screen.message)
+            self.assertIn("Google Drive", app.screen.message)
+            await pilot.press("n")
+            await pilot.press("q")
+
+        app = self.make_app(drive, savegdrive.drive_views(drive, "root"))
+        async with app.run_test(size=(120, 30)) as pilot:
+            keys = " ".join(str(line) for line in app.query_one("#keys", savegdrive.KeyBar).lines(200)).split()
+            self.assertIn("tab", keys)
+            self.assertIn("shift+tab", keys)
+            await pilot.press("down", "x")
+            self.assertIn("You can restore it from the Trash view.", app.screen.message)
+            self.assertNotIn("--folder-id", app.screen.message)
+            await pilot.press("n", "q")
+
     async def drive_trash_restore_and_delete(self, token):
         drive = demo_drive()
         views = savegdrive.drive_views(drive, "root")
