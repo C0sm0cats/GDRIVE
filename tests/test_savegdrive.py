@@ -4840,6 +4840,20 @@ class KeyListTest(unittest.TestCase):
         self.assertEqual(" ".join(line[13:] for line in row), description)
 
 
+    def test_key_bar_dims_group_names_only(self):
+        # design 11: the base style "dim" dimmed every key of a group's first line, not those of wrapped lines.
+        console = Console(color_system="truecolor", width=200)
+        for context in savegdrive.KEYS:
+            names = {name for name, _ in savegdrive.KEYS[context][1]}
+            for width in (80, 200):
+                for line in savegdrive.KeyBar(context).lines(width):
+                    for segment in line.render(console):
+                        text = segment.text.strip()
+                        if not text:
+                            continue
+                        dim = bool(segment.style and segment.style.dim)
+                        self.assertEqual(dim, text in names, f"{context} at {width}: {text!r}")
+
 class SelectorTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)

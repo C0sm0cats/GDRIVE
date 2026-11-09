@@ -1585,7 +1585,7 @@ class KeyBar(Widget):
         label_width = max(len(name) for name, _ in groups) + 2
         lines = []
         for name, keys in groups:
-            line = Text(f"{name:<{label_width}}", style="dim")
+            line = Text.assemble((f"{name:<{label_width}}", "dim"))  # dim the group name only, not the keys
             for key, label, _ in keys:
                 if key in self.hidden:
                     continue
