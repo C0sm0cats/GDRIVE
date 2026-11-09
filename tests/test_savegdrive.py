@@ -909,6 +909,35 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Photos/beach.jpg", statuses)
         self.assertEqual(statuses["Docs/Photos/beach.jpg"], "UNCHANGED")
 
+    def test_file_picked_alone_deleted_on_drive_but_changed_here_goes_back(self):
+        # notes.txt and Docs/a.txt picked one by one in the tree, synced, then deleted on Drive and edited here.
+        cache = {}
+        views = [savegdrive.DriveView("My Drive", "root")]
+        savegdrive.load_view(self.drive, views[0], cache)
+        app = savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), self.drive, None, cache)
+        by_path = {node["display_path"]: node for node in app.nodes}
+        app.add_entry(by_path["notes.txt"])
+        app.add_entry(by_path["Docs/a.txt"])
+        state = savegdrive.load_state(self.root)
+        scopes = savegdrive.build_local_scopes(app.selections, views[0].browsed)
+        plan = savegdrive.build_plan(self.drive, app.selections, scopes, self.root, state, cache)
+        savegdrive.remember_selection(state, app.selections, scopes)
+        self.apply(plan, state)
+        for item_id, path in (("n", "notes.txt"), ("a", "Docs/a.txt")):
+            del self.drive.items[item_id]
+            self.drive.change(item_id)
+            (self.root / path).write_bytes(b"edited " + path.encode())
+        self.run_main("--again", "--yes")
+        sent = {item["content"]: item["parent"] for item in self.drive.items.values()
+                if item.get("content", b"").startswith(b"edited")}
+        self.assertEqual(sent, {b"edited notes.txt": "root", b"edited Docs/a.txt": "docs"})
+        self.run_main("--again", "--yes")  # picked again under their new ids: synced, not deleted here
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"edited notes.txt")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"edited Docs/a.txt")
+        self.assertEqual(len(self.drive.uploads), 2)
+        picked = savegdrive.load_state(self.root)["last_selection"]["items"]
+        self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs/a.txt", "notes.txt"])
+
     def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
         self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}
         self.drive.items["club_photos"] = {"id": "club_photos", "name": "Photos 2026", "mimeType": FOLDER,

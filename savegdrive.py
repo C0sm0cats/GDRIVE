@@ -2243,9 +2243,25 @@ class DriveSelectorApp(App):
         return {
             "item": entry["item"],
             "relative_parent": entry["relative_parent"],
+            "parent_id": self.sendable_parent_id(entry),
             "view": self.view,
             "totals": totals,
         }
+
+    def sendable_parent_id(self, entry):
+        """The Drive folder the entry sits in, if new files may go there (None: read only, behind a shortcut):
+        --again sends it back there when it is deleted on Drive but changed here."""
+        if entry["parent"] is None:
+            return None if self.view.root_id in {SHARED_WITH_ME, TRASH} else self.view.root_id
+        parent = self.nodes[entry["parent"]]
+        folder = parent["item"]
+        if not can(folder, "canAddChildren") or folder.get("readonly"):
+            return None
+        while parent is not None:
+            if parent["item"]["mimeType"] == SHORTCUT_MIME_TYPE:
+                return None  # below a shortcut, only downloads
+            parent = None if parent["parent"] is None else self.nodes[parent["parent"]]
+        return effective_id(folder)
 
     def add_entry(self, entry):
         # Items with the same name in the same folder share one local path: take them all, so the
@@ -2631,6 +2647,7 @@ def remember_selection(state, selections, scopes, roots=()):
                 "relative_parent": entry["relative_parent"].as_posix(),
                 "path": selected_path(entry).as_posix(),
                 "parents": entry["item"].get("parents") or [],
+                "parent_id": entry.get("parent_id"),
             }
             for entry in selections
         ],
@@ -2685,7 +2702,7 @@ def last_selection(service, state, cache):
             scopes.append(Path(saved_item["path"]))
             continue
         note_drives([item])
-        candidate = {"item": item, "relative_parent": relative_parent}
+        candidate = {"item": item, "relative_parent": relative_parent, "parent_id": saved_item.get("parent_id")}
         if not already_selected(selected_path(candidate), item.get("id"), index):
             index_selection(index, candidate)
             picked.append(candidate)
@@ -3402,6 +3419,10 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
                 and not entry.get("duplicate") and not entry.get("arrived")
                 else None
             )
+    for saved_item in (state.get("last_selection") or {}).get("items", []):
+        if saved_item.get("parent_id"):
+            # An item picked alone: if it is gone from Drive but changed here, it goes back to its folder.
+            remote_folders.setdefault(Path(saved_item["relative_parent"]), saved_item["parent_id"])
     scopes = compact_scopes([*scopes, *moved_scopes(state, selections)])
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
     for entry in plan:
@@ -4155,6 +4176,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             folder = create_remote_folder(service, relative.name, parent_id)
             folder_ids[relative] = folder["id"]
             state.setdefault("folders", {})[relative.as_posix()] = folder["id"]
+            reselect_sent(state, relative, folder, parent_id)
             results["FOLDER_UPLOAD_NEW"] += 1
             report("[bright_green]↑[/]", f"{relative.as_posix()}/")
         except DRIVE_CALL_ERRORS as error:
@@ -4283,6 +4305,9 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 else:
                     results[f"FILE_{status}"] += 1
                     remember(entry, item, local_sha256)
+                    if status == "UPLOAD_NEW":
+                        reselect_sent(state, entry["relative_path"], item,
+                                      folder_ids.get(entry["relative_path"].parent, entry.get("parent_id")))
                     if status == "KEEP_BOTH":
                         report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
                     else:
@@ -4390,6 +4415,27 @@ def print_results(results):
 
 
 # --- Main ------------------------------------------------------------------
+
+def reselect_sent(state, relative_path, item, parent_id):
+    """A picked item gone from Drive, sent again from here: picked again under its new id, so the next
+    --again syncs it instead of taking it for deleted on Drive."""
+    saved = state.get("last_selection")
+    path = relative_path.as_posix()
+    if not saved or path not in saved.get("scopes", []):
+        return
+    if any(saved_item["path"] == path and saved_item["id"] == item["id"] for saved_item in saved["items"]):
+        return
+    saved["items"].append(
+        {
+            "id": item["id"],
+            "name": item.get("name", relative_path.name),
+            "relative_parent": relative_path.parent.as_posix(),
+            "path": path,
+            "parents": [parent_id],
+            "parent_id": parent_id,
+        }
+    )
+
 
 def run_sync(args, service, make_service, plan, selections, scopes, roots, destination_root, state, cache, token):
     """Apply a confirmed plan, save the selection for --again and the Drive snapshot, print the result."""
