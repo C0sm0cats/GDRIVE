@@ -3174,6 +3174,48 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
+    def conflict_after_docs_sync(self):
+        """Docs synced and remembered for --again and s, then b.txt changed on both sides."""
+        self.sync_picked("Docs")
+        (self.root / "Docs/b.txt").write_bytes(b"edited locally")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
+        self.drive.change("b")
+
+    def test_keep_both_option_in_the_tree_s_and_again(self):
+        # tests 42: --keep-both turns every conflict into KEEP_BOTH on each path: tree, s at start, --again.
+        import asyncio
+        self.conflict_after_docs_sync()
+
+        def b_status(plan):
+            return next(entry["status"] for entry in plan if entry["relative_path"].as_posix() == "Docs/b.txt")
+
+        async def tree_and_s():
+            app = savegdrive.DriveSelectorApp([savegdrive.DriveView("My Drive", "root")], self.root,
+                                              savegdrive.load_state(self.root), self.drive, None, {},
+                                              skip_preview=True, keep_both=True)
+            savegdrive.load_view(self.drive, app.views[0], app.cache)
+            async with app.run_test() as pilot:
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertIsNotNone(app.last_sync)  # what s would sync
+                last_sync = b_status(app.last_sync["plan"])
+                await pilot.press("down", "space", "d")  # Docs, then sync without the preview
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+            return last_sync, app.return_value
+
+        last_sync, result = asyncio.run(tree_and_s())
+        self.assertEqual(last_sync, "KEEP_BOTH")
+        self.assertEqual(self.selected_paths(result), ["Docs"])
+        self.assertEqual(b_status(result["plan"]), "KEEP_BOTH")
+
+        self.run_main("--again", "--yes", "--keep-both")
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo v2")
+        self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"edited locally")
+
+    def selected_paths(self, result):
+        return [savegdrive.selected_path(entry).as_posix() for entry in result["selections"]]
+
     def test_keep_both_failed_download_puts_your_version_back(self):
         # tests 13: the download of Drive's version fails after yours stepped aside as "b (local).txt".
         self.run_sync()
