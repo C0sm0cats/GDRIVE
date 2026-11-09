@@ -4686,7 +4686,11 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             drive.items["a"]["trashed"] = True
             app.drive_changed("", {})
             await self.wait(app, pilot)
-            await pilot.press("T", *"empty", "enter")
+            await pilot.press("T", "y")  # y alone is no answer: the word must be typed
+            await self.wait(app, pilot)
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            self.assertTrue(drive.items["a"]["trashed"])
+            await pilot.press("backspace", *"empty", "enter")
             await self.wait(app, pilot)
             self.assertNotIn("a", drive.items)
             self.assertEqual(tree_names(), [])
