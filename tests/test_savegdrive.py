@@ -489,6 +489,38 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
         self.assertEqual(self.drive.uploads, [])
 
+    def test_file_replaced_on_drive_under_the_same_name_comes_down(self):
+        self.run_sync()
+        # On Drive: a.txt deleted and sent again (new id, new content); the whole Photos folder too.
+        del self.drive.items["a"]
+        self.drive.items["a2"] = file_item("a2", "a.txt", "docs", b"alpha v2")
+        del self.drive.items["photos"], self.drive.items["p"]
+        self.drive.items["photos2"] = {"id": "photos2", "name": "Photos", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["p2"] = file_item("p2", "beach.jpg", "photos2", b"jpeg retouched")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UPDATE")
+        self.assertEqual(statuses["Photos/beach.jpg"], "UPDATE")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+        self.assertEqual((self.root / "Photos/beach.jpg").read_bytes(), b"jpeg retouched")
+        paths = [record["path"] for record in savegdrive.load_state(self.root)["files"].values()]
+        self.assertEqual(paths.count("Docs/a.txt"), 1)  # the replaced file's record is gone
+        statuses, _ = self.run_sync()
+        self.assertEqual({statuses["Docs/a.txt"], statuses["Photos/beach.jpg"]}, {"UNCHANGED"})
+        # Another file takes the name on Drive; the copy here was not changed: it comes down.
+        self.drive.items["a2"]["name"] = "a-old.txt"
+        self.drive.items["b"]["name"] = "a.txt"
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UPDATE")
+        self.assertEqual(statuses["Docs/a-old.txt"], "NEW")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"bravo")
+        # Changed here too: a real conflict, the copy here is kept.
+        (self.root / "Docs/a.txt").write_bytes(b"edited here")
+        del self.drive.items["b"]
+        self.drive.items["b2"] = file_item("b2", "a.txt", "docs", b"from Drive")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"edited here")
+
     def test_broken_file_shortcut_skipped_not_whole_sync(self):
         # An editor adds a shortcut to one of their files, syncs, then deletes that file.
         self.drive.items.update({

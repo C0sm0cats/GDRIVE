@@ -2704,8 +2704,18 @@ def tracked_record(state, item, relative_path):
     return None
 
 
+def record_at_path(state, relative_path):
+    """The last sync's record of whichever Drive file was at relative_path: (key, record), or (None, None)."""
+    path = relative_path.as_posix()
+    for key, stored in state["files"].items():
+        if stored.get("path") == path:
+            return key, stored
+    return None, None
+
+
 def classify_file(service, item, relative_path, destination, state):
-    """Status of a Drive file against its local copy and the last sync, and the local SHA-256 if any."""
+    """Status of a Drive file against its local copy and the last sync, the local SHA-256 if any,
+    and the state key of the record it replaces (another Drive file synced before at this path), if any."""
     record = tracked_record(state, item, relative_path)
     signature = remote_signature(item)
     readonly = is_readonly_path(relative_path) or item.get("readonly")
@@ -2718,34 +2728,41 @@ def classify_file(service, item, relative_path, destination, state):
             and can(item, "canTrash")
             and effective_mime_type(item) not in EXPORT_FORMATS  # exports only come down: deleted here, it comes back
         ):
-            return "TRASH_REMOTE", None  # synced before, deleted here
-        return "NEW", None
+            return "TRASH_REMOTE", None, None  # synced before, deleted here
+        return "NEW", None, None
     if not destination.is_file():
-        return "CONFLICT", None
+        return "CONFLICT", None, None
 
-    current_sha256 = local_hash(destination, record)
+    replaced_key = replaced = None
+    if record is None:
+        # Another Drive file synced here before (deleted and sent again, or renamed over it)?
+        replaced_key, replaced = record_at_path(state, relative_path)
+    current_sha256 = local_hash(destination, record or replaced)
     if record:
         local_changed = current_sha256 != record.get("local_sha256")
         remote_changed = signature != record.get("remote_signature")
         if not local_changed:
-            return ("UPDATE" if remote_changed else "UNCHANGED"), current_sha256
+            return ("UPDATE" if remote_changed else "UNCHANGED"), current_sha256, None
         if remote_changed and item.get("md5Checksum") and file_hash(destination, "md5") == item["md5Checksum"]:
-            return "UNCHANGED", current_sha256  # same content both sides (a transfer whose state was not saved)
+            return "UNCHANGED", current_sha256, None  # same content both sides (a transfer whose state was not saved)
         if remote_changed or readonly or not sends_back(item):
-            return "CONFLICT", current_sha256
-        return "UPLOAD", current_sha256
+            return "CONFLICT", current_sha256, None
+        return "UPLOAD", current_sha256, None
 
     remote_md5 = item.get("md5Checksum")
     if remote_md5 and file_hash(destination, "md5") == remote_md5:
-        return "UNCHANGED", current_sha256
+        return "UNCHANGED", current_sha256, replaced_key
+
+    if replaced and current_sha256 == replaced.get("local_sha256"):
+        return "UPDATE", current_sha256, replaced_key  # only Drive changed: the new file comes down
 
     if effective_mime_type(item) in EXPORT_FORMATS:
         try:
             if remote_export_hash(service, item) == current_sha256:
-                return "UNCHANGED", current_sha256
+                return "UNCHANGED", current_sha256, replaced_key
         except HttpError as error:
             warn(f"Could not compare {relative_path.as_posix()}: {error_text(error)}")
-    return "CONFLICT", current_sha256
+    return "CONFLICT", current_sha256, None
 
 
 def tracked_below(state, relative_path):
@@ -2921,6 +2938,7 @@ def collect_plan(
     destination = destination_root / relative_path
 
     planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
+    replaced_key = None
     if relative_path in RESERVED_PATHS:
         status = "CONFLICT"
         current_sha256 = None
@@ -2928,7 +2946,7 @@ def collect_plan(
         status = "SKIPPED"
         current_sha256 = None
     else:
-        status, current_sha256 = classify_file(
+        status, current_sha256, replaced_key = classify_file(
             service, item, relative_path, destination, state
         )
 
@@ -2939,6 +2957,7 @@ def collect_plan(
             "item": item,
             "relative_path": relative_path,
             "destination": destination,
+            "state_key": replaced_key,  # the replaced file's record, dropped once this one is synced
             "local_sha256": current_sha256,
             "local_stat": planned_stat,
         }
@@ -3962,6 +3981,8 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
             except OSError:
                 pass
+            if entry.get("state_key"):
+                state["files"].pop(entry["state_key"], None)
             record(entry, entry["item"], local_sha256)  # after the date: the next run reuses this hash
             results["FILE_UNCHANGED"] += 1
         elif status in {"CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
