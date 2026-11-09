@@ -3328,6 +3328,46 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         columns = {line.index(" 5 B") for line in lines if " 5 B" in line}
         self.assertEqual(len(columns), 1, lines)
 
+    async def test_long_names_fit_the_tree_width(self):
+        # Names take the room the terminal gives: whole on a wide one, never pushing sizes off a narrow one.
+        drive = demo_drive()
+        drive.items["v4"] = file_item("v4", "Copy of Q3 marketing plan - final - reviewed by legal (v4).docx",
+                                      "docs", b"four")
+        drive.items["v5"] = file_item("v5", "Copy of Q3 marketing plan - final - reviewed by legal (v5).docx",
+                                      "docs", b"five")
+        app = self.make_app(drive)
+        async with app.run_test(size=(220, 55)) as pilot:
+            app.action_expand_all()
+            await pilot.pause()
+            labels = [node.label.plain for node in app.tree_nodes.values()]
+            self.assertTrue(any("legal (v4).docx" in label for label in labels), labels)
+            self.assertTrue(any("legal (v5).docx" in label for label in labels), labels)
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            tree = app.query_one(Tree)
+            self.assertLessEqual(tree.virtual_size.width, tree.scrollable_content_region.width)
+            lines = ["".join(segment.text for segment in tree.render_line(y)) for y in range(12)]
+            self.assertTrue(any("…" in line and "4 B  2025-01-02" in line for line in lines), lines)
+
+    async def test_preview_keeps_size_in_view_with_long_paths(self):
+        path = "Clients/Acme/2026/Q3/Campaign/Assets/Copy of Q3 marketing plan - final - reviewed by legal.docx"
+        plan = [{
+            "status": "KEEP_BOTH", "relative_path": Path(path), "kind": "FILE",
+            "item": {"name": Path(path).name, "size": "1234"}, "destination": self.root / path,
+            "local_copy": self.root / "Copy (local).docx", "copy_goes_up": True,
+        }]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#preview-table")
+            self.assertLessEqual(table.virtual_size.width, table.scrollable_content_region.width)
+            item = table.get_row_at(0)[1].plain
+            self.assertTrue(item.startswith("…") and item.endswith("(yours → Copy (local).docx)"), item)
+            await pilot.resize_terminal(220, 55)
+            await pilot.pause()
+            self.assertEqual(table.get_row_at(0)[1].plain,
+                             f"{path}  (yours → Copy (local).docx)")
+
     async def test_preview_rows_stay_visible_in_80x24(self):
         def entry(status, name, **extra):
             return {

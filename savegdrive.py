@@ -1403,7 +1403,7 @@ def mtime_matches(path_stat, modified_time):
     return abs(path_stat.st_mtime - timestamp) < 2
 
 
-NAME_COLUMN_MAX = 64  # cells from the tree's left edge to the end of the names
+NAME_COLUMN_MIN = 24  # cells from the tree's left edge to the end of the names, however narrow the tree
 
 
 def label_start(node, children_of):
@@ -1418,7 +1418,29 @@ def name_column(nodes):
     for node in nodes:
         prefix = 4 + (2 if node["item"]["mimeType"] == SHORTCUT_MIME_TYPE else 0)  # checkbox, mark
         widest = max(widest, label_start(node, children_of) + prefix + Text(node["item"]["name"]).cell_len)
-    return min(widest, NAME_COLUMN_MAX)
+    return widest
+
+
+def label_columns(entry, totals):
+    """Size, date and format (or file count) shown after a node's name."""
+    item = entry["item"]
+    if is_folder(item):
+        files, size = totals.get(entry["index"], (0, 0))
+        return human_size(size) if size else "", "", plural(files, "file")
+    mime_type = effective_mime_type(item)
+    size_text = display_size(item) if item.get("size") else ""
+    if mime_type in EXPORT_FORMATS:
+        info = f"→ {EXPORT_FORMATS[mime_type][1]}"
+    elif is_unsupported(item):
+        info = "not downloadable"
+    else:
+        info = ""
+    return size_text, display_date(item), info
+
+
+def label_tail(entry, totals):
+    size_text, date_text, info = label_columns(entry, totals)
+    return f"  {size_text:>7}  {date_text:<10}  {info}".rstrip()
 
 
 def local_marks(nodes, destination, state):
@@ -1595,7 +1617,8 @@ class DriveView:
         self.children_of = {}
         self.totals = {}
         self.marks = {}
-        self.name_column = 0
+        self.name_column = 0  # widest label start + name: what the names need
+        self.tail_width = 0  # widest size, date and format after the names
         self.expanded = set()
         self.error = None
 
@@ -1608,6 +1631,7 @@ class DriveView:
         self.totals = folder_totals(nodes)
         self.newest = folder_newest(nodes)
         self.name_column = name_column(nodes)
+        self.tail_width = max((Text(label_tail(node, self.totals)).cell_len for node in nodes), default=0)
         self.sorted_by = "name"
 
     def sort(self, sort):
@@ -1815,6 +1839,8 @@ class DriveSelectorApp(App):
             if view.nodes is not None:
                 view.marks = local_marks(view.nodes, destination, state)
         self.selections = []
+        self.tree_frame = None
+        self.label_column = None  # the name column of the labels shown, to redo them when the width changes
         self.label_index = None  # selection_index of self.selections for node_label; None when stale
         self.tree_nodes = {}
         self.populated = set()
@@ -1848,7 +1874,22 @@ class DriveSelectorApp(App):
 
     @property
     def name_column(self):
-        return self.view.name_column
+        return self.fit_name_column(self.size.width)
+
+    def fit_name_column(self, screen_width):
+        """Names get what they need, up to the tree's width less the columns after them."""
+        if self.tree_frame is None:  # margins, border, padding and scrollbar around the labels
+            styles = self.query_one("#drive-tree", Tree).styles
+            self.tree_frame = styles.margin.width + styles.gutter.width + styles.scrollbar_size_vertical
+        width = screen_width - self.tree_frame
+        return min(self.view.name_column, max(width - self.view.tail_width, NAME_COLUMN_MIN))
+
+    def on_resize(self, event):  # runs before App's own handler: self.size is still the old one
+        if self.view.nodes is None or self.label_column == self.fit_name_column(event.size.width):
+            return
+        self.label_column = self.fit_name_column(event.size.width)
+        for tree_node in self.tree_nodes.values():
+            tree_node.set_label(self.node_label(tree_node.data, self.label_column))
 
     def compose(self) -> ComposeResult:
         yield Header(icon="")
@@ -2126,7 +2167,7 @@ class DriveSelectorApp(App):
     def update_sub_title(self):
         self.sub_title = header_text(self.account, self.destination)
 
-    def node_label(self, entry):
+    def node_label(self, entry, column=None):
         item = entry["item"]
         if self.label_index is None:
             self.label_index = selection_index(self.selections)
@@ -2148,24 +2189,14 @@ class DriveSelectorApp(App):
         folder = is_folder(item)
         unsupported = not folder and is_unsupported(item)
         name_style = "bold cyan" if folder else "bright_black" if unsupported else "bright_white"
-        width = self.name_column - label_start(entry, self.children_of) - label.cell_len
+        if column is None:
+            column = self.label_column = self.name_column
+        width = column - label_start(entry, self.children_of) - label.cell_len
         name = Text(item["name"], style=name_style)
         name.truncate(max(width, 4), overflow="ellipsis", pad=True)
         label.append_text(name)
 
-        mime_type = effective_mime_type(item)
-        if folder:
-            files, size = self.totals.get(entry["index"], (0, 0))
-            size_text, date_text, info = human_size(size) if size else "", "", plural(files, "file")
-        else:
-            size_text = display_size(item) if item.get("size") else ""
-            date_text = display_date(item)
-            if mime_type in EXPORT_FORMATS:
-                info = f"→ {EXPORT_FORMATS[mime_type][1]}"
-            elif unsupported:
-                info = "not downloadable"
-            else:
-                info = ""
+        size_text, date_text, info = label_columns(entry, self.totals)
         label.append(f"  {size_text:>7}  {date_text:<10}  ", style="dim")
         label.append(info, style="dim")
         label.rstrip()
@@ -3850,6 +3881,24 @@ PREVIEW_VIEWS = [
 ]
 
 
+PREVIEW_ITEM_MIN = 20  # cells of the ITEM column of the preview, however narrow the screen
+
+
+def fit_path(path, suffix, width):
+    """The path cut on the left (…/folder/file) so that path and suffix fit in width cells."""
+    if Text(path + suffix).cell_len <= width:
+        return path + suffix
+    room = width - Text(suffix).cell_len - 1
+    if room < 1:
+        return path + suffix  # the table crops it
+    kept = ""
+    for char in reversed(path):
+        if Text(char + kept).cell_len > room:
+            break
+        kept = char + kept
+    return "…" + kept + suffix
+
+
 class PreviewScreen(Screen):
     """The plan before anything changes: y syncs, esc goes back (or cancels)."""
 
@@ -3916,6 +3965,7 @@ class PreviewScreen(Screen):
             if any(keep(entry) for entry in plan)
         ] or PREVIEW_VIEWS[:1]
         self.filter_index = 0
+        self.rows = None
 
     def compose(self) -> ComposeResult:
         yield Header(icon="")
@@ -3927,14 +3977,10 @@ class PreviewScreen(Screen):
 
     def on_mount(self):
         self.sub_title = header_text(self.account, self.destination, "preview")
-        table = self.query_one(DataTable)
-        table.add_column("STATUS", key="status")
-        table.add_column("ITEM", key="item")
-        table.add_column("SIZE", key="size")
         self.rows = []
         self.update_notes()
         self.fill()
-        table.focus()
+        self.query_one(DataTable).focus()
 
     def update_notes(self):
         notes = Text()
@@ -3973,24 +4019,41 @@ class PreviewScreen(Screen):
 
         table = self.query_one(DataTable)
         row = table.cursor_row
-        table.clear()
-        self.rows = rows
+        cells = []
         for entry in rows:
             style, label, _ = STATUS_STYLES[entry["status"]]
-            path = entry["relative_path"].as_posix()
+            path = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
+            suffix = ""
             if entry["status"] == "KEEP_BOTH":
-                path += f"  (yours → {entry['local_copy'].name})"
+                suffix = f"  (yours → {entry['local_copy'].name})"
             elif entry.get("duplicate"):
-                path += f"  {duplicate_label(entry)}"
-            table.add_row(
-                Text(label, style=style),
-                Text(path + "/", style="cyan") if entry["kind"] == "FOLDER" else Text(path),
-                Text(size if size != "-" else "", style="dim", justify="right"),
-            )
+                suffix = f"  {duplicate_label(entry)}"
+            size_cell = Text(size if size != "-" else "", style="dim", justify="right")
+            cells.append((Text(label, style=style), path, suffix, size_cell))
+        # STATUS and SIZE keep their width; ITEM gets the rest, so SIZE stays in view.
+        status_width = max([len("STATUS")] + [status.cell_len for status, *_ in cells])
+        size_width = max([len("SIZE")] + [size.cell_len for *_, size in cells])
+        styles = table.styles
+        frame = styles.margin.width + styles.gutter.width + styles.scrollbar_size_vertical
+        room = self.app.size.width - frame - 6 * table.cell_padding - status_width - size_width
+        needed = max([len("ITEM")] + [Text(path + suffix).cell_len for _, path, suffix, _ in cells])
+        item_width = max(min(needed, room), PREVIEW_ITEM_MIN)
+        table.clear(columns=True)
+        table.add_column("STATUS", key="status", width=status_width)
+        table.add_column("ITEM", key="item", width=item_width)
+        table.add_column(Text("SIZE", justify="right"), key="size", width=size_width)
+        self.rows = rows
+        for entry, (status, path, suffix, size) in zip(rows, cells):
+            item = fit_path(path, suffix, item_width)
+            table.add_row(status, Text(item, style="cyan") if entry["kind"] == "FOLDER" else Text(item), size)
         if rows:
             table.move_cursor(row=min(row, len(rows) - 1))
+
+    def on_resize(self, event):
+        if self.rows is not None:  # filled: fit ITEM to the new width
+            self.fill()
 
     def action_next_filter(self):
         self.filter_index = (self.filter_index + 1) % len(self.filters)
