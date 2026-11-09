@@ -592,6 +592,16 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs", "Docs/a.txt", "Docs/Report.docx")}, {"UNCHANGED"})
 
+    def test_listing_snapshot_written_after_a_sync_is_never_sent_to_drive(self):
+        # tests 74: main's run_sync saves the --again snapshot at the root of the folder after each sync
+        self.run_sync()
+        savegdrive.save_snapshot(self.root, "token", {}, ["root"])
+        self.assertTrue((self.root / savegdrive.REMOTE_CACHE_NAME).exists())
+        statuses, _ = self.run_sync()
+        self.assertNotIn(savegdrive.REMOTE_CACHE_NAME, statuses)
+        self.assertNotIn(f"{savegdrive.REMOTE_CACHE_NAME}.tmp", statuses)
+        self.assertNotIn(savegdrive.REMOTE_CACHE_NAME, [item["name"] for item in self.drive.items.values()])
+
     def test_printed_plan_progress_and_results_stay_readable_on_a_light_terminal(self):
         # design 18: yellow, green and cyan text is 1.1:1 to 2:1 on a white terminal. Printed words, counts
         # and paths keep the terminal's own color; only a ↓ or the spinner may stay green or cyan.
