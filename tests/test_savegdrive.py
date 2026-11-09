@@ -1708,6 +1708,32 @@ class SyncTest(unittest.TestCase):
         )
         self.assertEqual(scopes, [Path()])
 
+    def test_sync_of_whole_view_remembers_its_root_for_again(self):
+        # A cron --again --yes on all of My Drive: run_sync must save the view's root, or new items are skipped.
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [("root", Path())], self.root, state, cache, "0")
+        state = savegdrive.load_state(self.root)
+        self.assertEqual(state["last_selection"]["roots"], [{"id": "root", "base": "."}])
+
+        self.drive.items["new"] = file_item("new", "new.txt", "root", b"new")
+        cache = {}
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, state, cache)
+            plan = savegdrive.build_plan(self.drive, again, again_scopes, self.root, state, cache)
+        self.assertIn("new.txt", [savegdrive.selected_path(entry).as_posix() for entry in again])
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses.get("new.txt"), "NEW")
+
     def test_again_with_whole_shared_with_me_takes_new_shares(self):
         # A cron --again on all of Shared with me: a new share lives in its owner's folder, never in the snapshot.
         shared = savegdrive.SHARED_WITH_ME
