@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2462,6 +2464,61 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             tree = app.query_one(Tree)
             self.assertTrue(all(node.is_expanded for node in tree.root.children if node.allow_expand))
             await pilot.press("q")
+
+
+FAKE_PYTHON = """#!/bin/sh
+case "$1" in
+    -V) echo "Python $FAKE_PY_VERSION"; exit 0 ;;
+    -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;; esac; exit 0 ;;
+    -m) {mkdir} -p "$3/bin" && {cp} "$0" "$3/bin/python"; exit $? ;;
+esac
+echo "ran $*"
+"""
+
+
+@unittest.skipUnless(shutil.which("sh") and shutil.which("dirname"), "needs sh and dirname")
+class LauncherTest(unittest.TestCase):
+    """run-savegdrive.sh, run against a fake interpreter so no venv or pip is involved."""
+
+    def run_launcher(self, names, version_ok=True):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        shutil.copy(Path(__file__).resolve().parent.parent / "run-savegdrive.sh", root)
+        (root / "savegdrive.py").write_text("")
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        os.symlink(shutil.which("dirname"), bin_dir / "dirname")
+        fake = FAKE_PYTHON.format(mkdir=shutil.which("mkdir"), cp=shutil.which("cp"))
+        for name in names:
+            (bin_dir / name).write_text(fake)
+            (bin_dir / name).chmod(0o755)
+        env = {
+            "PATH": str(bin_dir),
+            "FAKE_PY_OK": "1" if version_ok else "0",
+            "FAKE_PY_VERSION": "3.12.0" if version_ok else "3.10.22",
+        }
+        result = subprocess.run(
+            [shutil.which("sh"), str(root / "run-savegdrive.sh"), "--help"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        return result, root
+
+    def test_launcher_uses_python3_when_python_is_missing(self):
+        result, root = self.run_launcher(["python3"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((root / ".venv" / "bin" / "python").exists())
+        self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_falls_back_to_python(self):
+        result, root = self.run_launcher(["python"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((root / ".venv" / "bin" / "python").exists())
+
+    def test_launcher_refuses_python_older_than_3_11(self):
+        result, root = self.run_launcher(["python3"], version_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("3.11 or newer", result.stderr)
+        self.assertIn("3.10.22", result.stderr)
+        self.assertFalse((root / ".venv").exists())
 
 
 if __name__ == "__main__":

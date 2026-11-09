@@ -69,7 +69,7 @@ environment are local files and must never be committed.
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - A POSIX shell
 - Python virtual environment support
 - A Google Cloud project with the Google Drive API enabled
