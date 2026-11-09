@@ -3349,6 +3349,21 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             lines = ["".join(segment.text for segment in tree.render_line(y)) for y in range(12)]
             self.assertTrue(any("…" in line and "4 B  2025-01-02" in line for line in lines), lines)
 
+    async def test_names_cut_alike_in_every_view(self):
+        # A shared drive, Shared with me or Trash has a base path: it is not tree depth, names keep their room.
+        drive = demo_drive()
+        drive.items["v4"] = file_item("v4", "Copy of Q3 marketing plan - final - reviewed by legal (v4).docx",
+                                      "docs", b"four")
+        labels = {}
+        for base in (Path(), Path("Shared with me"), Path("Shared drives/Team")):
+            app = self.make_app(drive, [savegdrive.DriveView("View", "root", base)])
+            async with app.run_test(size=(80, 24)) as pilot:
+                app.action_expand_all()
+                await pilot.pause()
+                labels[base] = sorted(node.label.plain for node in app.tree_nodes.values())
+        self.assertEqual(labels[Path("Shared with me")], labels[Path()])
+        self.assertEqual(labels[Path("Shared drives/Team")], labels[Path()])
+
     async def test_preview_keeps_size_in_view_with_long_paths(self):
         path = "Clients/Acme/2026/Q3/Campaign/Assets/Copy of Q3 marketing plan - final - reviewed by legal.docx"
         plan = [{

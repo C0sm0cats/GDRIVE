@@ -1414,18 +1414,19 @@ def mtime_matches(path_stat, modified_time):
 NAME_COLUMN_MIN = 24  # cells from the tree's left edge to the end of the names, however narrow the tree
 
 
-def label_start(node, children_of):
-    """Cells before a node's label: tree guides, plus the expand arrow of folders with children."""
-    depth = len(node["relative_parent"].parts) + 1
+def label_start(node, children_of, base=Path()):
+    """Cells before a node's label: tree guides, plus the expand arrow of folders with children.
+    The view's base (Shared with me, Shared drives/<name>, Trash) is not tree depth."""
+    depth = len(node["relative_parent"].relative_to(base).parts) + 1
     return depth * 4 + (2 if node["index"] in children_of else 0)
 
 
-def name_column(nodes):
+def name_column(nodes, base=Path()):
     children_of = {node["parent"] for node in nodes}
     widest = 0
     for node in nodes:
         prefix = 4 + (2 if node["item"]["mimeType"] == SHORTCUT_MIME_TYPE else 0)  # checkbox, mark
-        widest = max(widest, label_start(node, children_of) + prefix + Text(node["item"]["name"]).cell_len)
+        widest = max(widest, label_start(node, children_of, base) + prefix + Text(node["item"]["name"]).cell_len)
     return widest
 
 
@@ -1638,7 +1639,7 @@ class DriveView:
             self.children_of.setdefault(node["parent"], []).append(node)
         self.totals = folder_totals(nodes)
         self.newest = folder_newest(nodes)
-        self.name_column = name_column(nodes)
+        self.name_column = name_column(nodes, self.base)
         self.tail_width = max((Text(label_tail(node, self.totals)).cell_len for node in nodes), default=0)
         self.sorted_by = "name"
 
@@ -2199,7 +2200,7 @@ class DriveSelectorApp(App):
         name_style = "bold cyan" if folder else "bright_black" if unsupported else "bright_white"
         if column is None:
             column = self.label_column = self.name_column
-        width = column - label_start(entry, self.children_of) - label.cell_len
+        width = column - label_start(entry, self.children_of, self.view.base) - label.cell_len
         name = Text(item["name"], style=name_style)
         name.truncate(max(width, 4), overflow="ellipsis", pad=True)
         label.append_text(name)
