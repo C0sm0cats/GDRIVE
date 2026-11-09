@@ -2093,6 +2093,21 @@ class SyncTest(unittest.TestCase):
                 self.assertFalse(savegdrive.confirm_in_terminal(args, plan, state))
             self.assertIn("Cancelled. Nothing was changed.", out.getvalue())
 
+    def test_proceed_question_shows_y_n(self):
+        """Rich read "[y/N]" as a tag and erased it: the question must say what to type."""
+        self.run_sync()
+        (self.root / "Docs/a.txt").write_text("changed here")
+        plan, state, _, check = self.deletion_plan()
+        self.assertFalse(check)
+        self.assertTrue(savegdrive.has_actions(plan))
+        out = io.StringIO()
+        quiet = Console(file=out)
+        args = mock.Mock(yes=False, allow_deletions=False)
+        with mock.patch.object(savegdrive, "console", quiet), \
+                mock.patch.object(sys, "stdin", io.StringIO("\n")):
+            self.assertFalse(savegdrive.confirm_in_terminal(args, plan, state))
+        self.assertIn("Proceed? [y/N] ", out.getvalue())
+
     def sync_everything(self):
         """A first sync like the tree's, which also saves the selection for --again."""
         plan, state = self.preview()

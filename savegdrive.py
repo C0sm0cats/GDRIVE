@@ -5423,7 +5423,7 @@ def confirm_in_terminal(args, plan, state):
             return True
     if args.yes or not has_actions(plan):
         return True
-    if ask("\nProceed? [y/N] ").strip().lower() not in {"y", "yes"}:
+    if ask("\nProceed? \\[y/N] ").strip().lower() not in {"y", "yes"}:
         console.print("[dim]Cancelled. Nothing was changed.[/]")
         return False
     return True
