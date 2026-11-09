@@ -2515,7 +2515,7 @@ class SyncTest(unittest.TestCase):
 
         with mock.patch.object(savegdrive.DriveSelectorApp, "run", run):
             with self.assertRaises(SystemExit) as raised:
-                self.run_main("--yes")
+                self.run_main("--yes", isatty=True)
         self.assertEqual(raised.exception.code, 1)
         self.assertFalse(self.drive.items["docs"].get("trashed"))
 
@@ -3397,7 +3397,9 @@ class SyncTest(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(sys, "argv", ["savegdrive", "--download-path", str(target)]), \
                 mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)), \
-                mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")):
+                mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")), \
+                mock.patch.object(sys.stdin, "isatty", lambda: True), \
+                mock.patch.object(sys.stdout, "isatty", lambda: True):
             with self.assertRaises(SystemExit) as raised:
                 savegdrive.main()
         self.assertEqual(raised.exception.code, 1)
@@ -3453,6 +3455,25 @@ class SyncTest(unittest.TestCase):
         self.assertIn("Run again and allow access", output.getvalue())
         self.assertEqual(len(pages), 1)
         self.assertNotIn("signed in", pages[0])
+
+    def test_tree_without_a_terminal_says_to_use_again_and_does_not_hang(self):
+        # ux 40: cron with --yes but no --again; the tree would wait for keys forever, its screen in the log.
+        target = Path(self.temp.name) / "Cron"
+        for interactive_in, interactive_out in ((False, False), (True, False), (False, True)):
+            output = io.StringIO()
+            with self.subTest(stdin=interactive_in, stdout=interactive_out), \
+                    mock.patch.object(sys, "argv", ["savegdrive", "--yes", "--download-path", str(target)]), \
+                    mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)), \
+                    mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")), \
+                    mock.patch.object(savegdrive.DriveSelectorApp, "run", side_effect=AssertionError("tree")), \
+                    mock.patch.object(sys.stdin, "isatty", lambda: interactive_in), \
+                    mock.patch.object(sys.stdout, "isatty", lambda: interactive_out):
+                with self.assertRaises(SystemExit) as raised:
+                    savegdrive.main()
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn("The tree needs a terminal. Run once in a terminal, then use --again --yes",
+                              output.getvalue())
+                self.assertFalse(target.exists())
 
     def test_again_without_a_previous_selection_names_download_path_and_creates_nothing(self):
         # A typo in the path, or a folder never synced (self.root: no selection yet): no folder made, no sign-in.

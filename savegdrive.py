@@ -5731,6 +5731,15 @@ def main():
     VERBOSE = args.verbose
     DRIVE_ROOT = None if args.again else args.folder_id
 
+    # The tree waits for keys: without a terminal (cron, a script, output to a file) it would hang forever.
+    # Checked before the folder is created and before signing in.
+    if not args.again and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print(
+            "[red]✗[/] The tree needs a terminal. Run once in a terminal, "
+            "then use --again --yes to sync without one (e.g. from cron)."
+        )
+        raise SystemExit(1)
+
     try:
         if args.again:
             # Checked before the folder is created and before signing in: a typo or a folder never synced.
