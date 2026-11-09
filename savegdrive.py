@@ -640,7 +640,14 @@ def apply_changes(service, snapshot):
         for item in items:
             where.setdefault(item["id"], set()).add(folder_id)
 
-    page_token, changed, count = snapshot["token"], set(), 0
+    changed = {}  # folder id -> its listing as id -> item, filled once: a change no longer copies the folder
+
+    def changed_listing(folder_id):
+        if folder_id not in changed:
+            changed[folder_id] = {item["id"]: item for item in cache[folder_id]}
+        return changed[folder_id]
+
+    page_token, count = snapshot["token"], 0
     while True:
         try:
             response = (
@@ -666,8 +673,7 @@ def apply_changes(service, snapshot):
             if not file_id:  # a shared drive's own change (changeType "drive"): no file to update
                 continue
             for folder_id in where.pop(file_id, ()):
-                cache[folder_id] = [item for item in cache[folder_id] if item["id"] != file_id]
-                changed.add(folder_id)
+                changed_listing(folder_id).pop(file_id, None)
             item = change.get("file")
             if change.get("removed") or not item or item.get("trashed"):
                 continue
@@ -676,15 +682,14 @@ def apply_changes(service, snapshot):
             note_drives([item])
             for folder_id in parents:
                 if folder_id in cache:
-                    cache[folder_id].append(item)
+                    changed_listing(folder_id)[file_id] = item
                     where.setdefault(file_id, set()).add(folder_id)
-                    changed.add(folder_id)
         if "newStartPageToken" in response:
             break
         page_token = response["nextPageToken"]
 
-    for folder_id in changed:
-        cache[folder_id] = sort_items(cache[folder_id])
+    for folder_id, listing in changed.items():
+        cache[folder_id] = sort_items(listing.values())
     debug(f"Applied {plural(count, 'Drive change')} to {plural(len(cache), 'saved folder')}")
     return cache, response["newStartPageToken"]
 

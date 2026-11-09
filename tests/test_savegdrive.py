@@ -4530,6 +4530,43 @@ class SelectionScalingTest(unittest.TestCase):
                          [Path(), Path("Shared with me/x")])
 
 
+class CountingItem(dict):
+    """A listed item that counts the reads of its id."""
+    reads = [0]
+
+    def __getitem__(self, key):
+        if key == "id":
+            self.reads[0] += 1
+        return super().__getitem__(key)
+
+
+class ChangesReplayScalingTest(unittest.TestCase):
+    """--again replays the changes of a big folder without copying its listing per change (perf 8)."""
+
+    def replay(self, count):
+        CountingItem.reads[0] = 0
+        listing = [CountingItem(id=f"f{index}", name=f"f{index}.txt", mimeType="text/plain", parents=["big"])
+                   for index in range(count)]
+        changes = [{"fileId": f"f{index}", "file": {"id": f"f{index}", "name": f"g{index}.txt",
+                                                     "mimeType": "text/plain", "parents": ["big"]}}
+                   for index in range(count)]
+        changes.append({"fileId": "f0", "removed": True})
+        changes.append({"fileId": "f0", "file": {"id": "f0", "name": "back.txt", "mimeType": "text/plain",
+                                                  "parents": ["big"]}})  # removed, then back in the same batch
+        service = mock.Mock()
+        service.changes().list.return_value = FakeRequest(lambda: {"changes": changes, "newStartPageToken": "9"})
+        with mock.patch.object(savegdrive, "debug"):
+            replayed, token = savegdrive.apply_changes(service, {"token": "1", "folders": {"big": listing}})
+        self.assertEqual(token, "9")
+        self.assertEqual(sorted(item["name"] for item in replayed["big"]),
+                         sorted(["back.txt"] + [f"g{index}.txt" for index in range(1, count)]))
+        return CountingItem.reads[0]
+
+    def test_apply_changes_is_linear_in_the_folder_size(self):
+        small, big = self.replay(20), self.replay(400)
+        self.assertLess(big, small * 30)  # 20x the changes in a 20x folder; copying the folder per change: 400x
+
+
 class UploadTest(unittest.TestCase):
     def test_upload_file_sends_every_chunk(self):
         class Request:
