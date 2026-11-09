@@ -3477,6 +3477,30 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
         self.assertIsNone(app.return_value)
 
+    async def test_filter_rebuilds_the_tree_once_typing_stops(self):
+        # Each rebuild walks the whole tree (seconds on a large Drive): typing a filter must not
+        # rebuild it after every character, only once typing stops or on enter.
+        app = self.make_app()
+        async with app.run_test() as pilot:
+            rebuilds = []
+            original = app.rebuild
+            app.rebuild = lambda: (rebuilds.append(app.filter_terms[:]), original())
+            await pilot.press("slash", *"beach")
+            self.assertEqual(rebuilds, [])
+            await pilot.pause(savegdrive.FILTER_DELAY + 0.2)
+            self.assertEqual(rebuilds, [["beach"]])
+            tree = app.query_one(Tree)
+            self.assertEqual([node.data["display_path"] for node in tree.root.children], ["Photos"])
+            await pilot.press("backspace", "backspace", "enter")  # enter applies at once
+            self.assertEqual(rebuilds, [["beach"], ["bea"]])
+            await pilot.pause(savegdrive.FILTER_DELAY + 0.2)
+            self.assertEqual(len(rebuilds), 2)
+            await pilot.press("slash", "x", "escape")  # escape clears without a late rebuild
+            await pilot.pause(savegdrive.FILTER_DELAY + 0.2)
+            self.assertEqual(rebuilds[2:], [[]])
+            self.assertEqual(len(tree.root.children), 3)
+            await pilot.press("escape")
+
     async def test_columns_are_aligned(self):
         app = self.make_app()
         async with app.run_test(size=(120, 20)) as pilot:

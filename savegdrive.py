@@ -61,6 +61,7 @@ CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 STATE_FILE_NAME = ".savegdrive-state.json"
 REMOTE_CACHE_NAME = ".savegdrive-cache.json"
 PART_SUFFIX = ".savegdrive.part"
+FILTER_DELAY = 0.25  # seconds without typing before the filter rebuilds the tree
 # GDrive Pull (before 2.0) kept the same state format under these names.
 LEGACY_STATE_FILE_NAME = ".gdrivepull-managed-state.json"
 LEGACY_REMOTE_CACHE_NAME = ".gdrivepull-remote-cache.json"
@@ -1898,6 +1899,7 @@ class DriveSelectorApp(App):
         self.filter_terms = []
         self.filter_ancestors = set()
         self.filter_visible = None
+        self.filter_timer = None  # pending apply_filter while typing
         self.busy = False
         self.sort = sort
 
@@ -2447,10 +2449,25 @@ class DriveSelectorApp(App):
 
     @on(Input.Changed, "#filter")
     def filter_changed(self, event):
-        self.apply_filter(event.value)
+        # A rebuild walks the whole tree: wait until typing stops instead of redoing it per key.
+        self.cancel_pending_filter()
+        self.filter_timer = self.set_timer(FILTER_DELAY, self.apply_pending_filter)
+
+    def cancel_pending_filter(self):
+        if self.filter_timer is not None:
+            self.filter_timer.stop()
+            self.filter_timer = None
+            return True
+        return False
+
+    def apply_pending_filter(self):
+        self.filter_timer = None
+        self.apply_filter(self.query_one("#filter", Input).value)
 
     @on(Input.Submitted, "#filter")
     def filter_submitted(self, event):
+        if self.cancel_pending_filter():
+            self.apply_filter(event.value)
         if not event.value.strip():
             event.input.display = False
         self.query_one("#drive-tree", Tree).focus()
@@ -2459,14 +2476,15 @@ class DriveSelectorApp(App):
         filter_input = self.query_one("#filter", Input)
         filter_input.display = False
         self.query_one("#drive-tree", Tree).focus()
+        self.cancel_pending_filter()
+        with filter_input.prevent(Input.Changed):
+            filter_input.value = ""
         if not rebuild:
-            with filter_input.prevent(Input.Changed):
-                filter_input.value = ""
             self.filter_terms = []
             self.filter_visible = None
             self.filter_ancestors = set()
-        elif filter_input.value:
-            filter_input.value = ""  # Input.Changed rebuilds the tree
+        elif self.filter_terms:
+            self.apply_filter("")
 
     def action_open_in_drive(self):
         entry = self.current_entry()
