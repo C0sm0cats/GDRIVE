@@ -2083,7 +2083,7 @@ class DriveSelectorApp(App):
     }
 
     #selection-summary {
-        height: 1;
+        height: auto;
         margin: 0 2;
         padding: 0 1;
         color: #e0f2fe;

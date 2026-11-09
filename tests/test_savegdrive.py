@@ -5476,6 +5476,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(top(), ["Docs", "Photos", "a undated", "big.bin", "new.txt", "notes.txt"])
             await pilot.press("q")
 
+    async def test_selection_summary_shows_sort_and_filter_in_80x24(self):
+        # design 10: with a selection, the one-line summary cropped the sort and the filter at 80 columns.
+        app = self.make_app()
+
+        def summary():
+            widget = app.query_one("#selection-summary")
+            lines = widget.render_lines(widget.size.region)
+            return " ".join("".join(segment.text for segment in line).strip() for line in lines)
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("space", "down", "space", "m")  # two items, by date
+            await pilot.pause()
+            self.assertIn("2 selected", summary())
+            self.assertIn("sorted by date, newest first", summary())
+            await pilot.press("slash", *"annual report", "enter")
+            await pilot.pause()
+            self.assertIn("filter: annual report", summary())
+            self.assertIn("sorted by date, newest first", summary())
+            await pilot.press("q")
+
     async def test_preview_note_when_nothing_to_transfer(self):
         # bugs 21 and 40: "up to date" only without a conflict; "and quits" only where y quits (--again).
         def entry(status, name):
