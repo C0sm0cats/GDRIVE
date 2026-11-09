@@ -5569,6 +5569,49 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(drive.items["a"]["trashed"])
                 await pilot.press("q")
 
+    async def test_filter_typed_while_the_view_loads_is_kept_and_applied(self):
+        # ux 39: the end of a load redraws the same view; a filter kept with enter, or still being
+        # typed, must survive it and apply to the loaded items. Switching views still clears it.
+        drive = demo_drive()
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        listed = threading.Event()
+        load_view = savegdrive.load_view
+
+        def slow(service, view, cache):
+            listed.wait(10)
+            return load_view(service, view, cache)
+
+        def rows():
+            return [node.data["display_path"] for node in app.query_one(Tree).root.children]
+
+        with mock.patch.object(savegdrive, "load_view", slow):
+            async with app.run_test(size=(120, 30)) as pilot:
+                filter_input = app.query_one("#filter", Input)
+                app.drive_changed("done", {})  # reloads every view, as after x, r or shift+t
+                await pilot.pause()
+                self.assertIsNone(app.view.nodes)
+                await pilot.press("slash", *"beach", "enter")
+                listed.set()
+                await self.wait(app, pilot)
+                self.assertEqual(rows(), ["Photos"])
+                self.assertEqual((filter_input.value, filter_input.display), ("beach", True))
+
+                listed.clear()
+                app.drive_changed("done", {})
+                await pilot.pause()
+                await pilot.press("slash", "ctrl+u", *"no")  # still typing when the load ends
+                listed.set()
+                await self.wait(app, pilot)
+                self.assertIs(app.focused, filter_input)
+                self.assertEqual(app.query_one("#keys", savegdrive.KeyBar).context, "filter")
+                await pilot.press(*"tes", "enter")
+                self.assertEqual(rows(), ["notes.txt"])
+
+                await pilot.press("tab")  # another view: the filter goes
+                self.assertEqual((filter_input.value, filter_input.display, app.filter_terms), ("", False, []))
+                await pilot.press("q")
+
     async def test_x_on_a_shortcut_trashes_the_shortcut(self):
         drive = demo_drive()
         drive.items["link"] = {"id": "link", "name": "Link", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,

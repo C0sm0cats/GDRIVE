@@ -2278,11 +2278,16 @@ class DriveSelectorApp(App):
     # Views.
 
     def show_view(self, view):
+        # Only a change of view clears the filter: the end of a load, or a reload after x, r or
+        # shift+t, redraws the same view and applies the filter typed meanwhile to the loaded items.
+        switching = view is not self.view
         self.view = view
-        if self.filter_terms or self.query_one("#filter", Input).display:
+        filter_input = self.query_one("#filter", Input)
+        if switching and (self.filter_terms or filter_input.display):
             self.clear_filter(rebuild=False)
         tree = self.query_one("#drive-tree", Tree)
-        tree.focus()
+        if not filter_input.has_focus:  # still typing the filter: leave the cursor in it
+            tree.focus()
         if view.nodes is None:
             tree.clear()
             tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  loading…", "dim")))
@@ -2294,12 +2299,16 @@ class DriveSelectorApp(App):
         else:
             tree.root.set_label(Text(view.name, style="bold bright_blue"))
             view.sort(self.sort)
-            self.rebuild()
+            if self.filter_terms:
+                self.apply_filter(filter_input.value)  # computed on the loaded items
+            else:
+                self.rebuild()
             if not view.nodes:
                 tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  empty", "dim")))
         self.update_views()
         self.update_selection_summary()
-        self.query_one("#keys", KeyBar).set_context("trash" if view.root_id == TRASH else "tree")
+        if not filter_input.has_focus:
+            self.query_one("#keys", KeyBar).set_context("trash" if view.root_id == TRASH else "tree")
 
     def load_in_background(self, view):
         try:
