@@ -2194,6 +2194,7 @@ class DriveSelectorApp(App):
     def on_resize(self, event):  # runs before App's own handler: self.size is still the old one
         if self.query("#views"):
             self.update_views(event.size.width)
+        self.update_notice(event.size.width)
         if self.view.nodes is None or self.label_column == self.fit_name_column(event.size.width):
             return
         self.label_column = self.fit_name_column(event.size.width)
@@ -2296,13 +2297,16 @@ class DriveSelectorApp(App):
                                        style="red")
             self.update_notice()
 
-    def update_notice(self):
+    def update_notice(self, screen_width=None):
         if not self.is_mounted:
             return
         lines = [text for text in (self.notice, self.last_sync_text) if text]
         notice = self.query_one("#notice", Static)
         notice.display = bool(lines)
-        notice.update(Text("\n").join(Text(line) if isinstance(line, str) else line for line in lines))
+        width = (screen_width or self.size.width) - notice.styles.margin.width
+        notice.update(Text("\n").join(
+            Text(line) if isinstance(line, str) else line.fit(width) if isinstance(line, Summary) else line
+            for line in lines))
 
     def action_review_last(self):
         if self.busy:
@@ -4300,17 +4304,51 @@ def terminal_text(style, text, count=None):
     return " ".join(parts)
 
 
+class Summary:
+    """Counts after a lead ("Preview", "Done", "Since the last sync:"), laid out at a width: a line breaks
+    between two counts, never between a count and what it counts. tail goes after the counts, after
+    below them, on lines of its own."""
+
+    def __init__(self, lead, parts, tail=None, after=None):
+        self.lead, self.parts, self.tail, self.after = lead, parts, tail, after
+
+    def fit(self, width=None):
+        text = self.lead.copy()
+        indent = " " * self.lead.cell_len  # later lines start under the first count
+        line = text.cell_len
+        pieces = [(" · ", part) for part in self.parts]
+        if self.tail is not None:
+            pieces.append(("   ", self.tail))
+        for index, (separator, piece) in enumerate(pieces):
+            if index and width and line + len(separator) + piece.cell_len > width:
+                text.append("\n" + indent)
+                line = len(indent)
+            elif index:
+                text.append(separator)
+                line += len(separator)
+            text.append_text(piece)
+            line += piece.cell_len
+        if self.after is not None:
+            text.append("\n")
+            text.append_text(self.after)
+        return text
+
+    @property
+    def plain(self):
+        return self.fit().plain
+
+
 def plan_summary(plan, plain=False):
-    """Status counts. plain: for the terminal's own background (print_plan), not the TUI's dark one."""
+    """Status counts, one Text each. plain: for the terminal's own background (print_plan), not the TUI's dark one."""
     counts = Counter(entry["status"] for entry in plan)
     parts = []
     for status, (style, label, _) in STATUS_STYLES.items():
         if counts[status]:
             if plain:
-                parts.append(terminal_text(style, label, counts[status]))
+                parts.append(Text.from_markup(terminal_text(style, label, counts[status])))
             else:
-                parts.append(f"[{style}]{counts[status]} {label}[/]")
-    return " · ".join(parts)
+                parts.append(Text(f"{counts[status]} {label}", style=style))
+    return parts
 
 
 def has_actions(plan):
@@ -4359,7 +4397,7 @@ def print_plan(plan, destination_root):
         console.print(table)
 
     console.print()
-    console.print(f"[bold]Preview[/]  {plan_summary(plan, plain=True)}")
+    console.print(Summary(Text.assemble(("Preview", "bold"), "  "), plan_summary(plan, plain=True)).fit(console.width))
     if hidden:
         console.print(f"[dim]{plural(hidden, 'unchanged item')} not listed (--verbose lists them).[/]")
     space, fits = space_line(plan, destination_root)
@@ -4710,7 +4748,9 @@ class PreviewScreen(Screen):
     def fill(self):
         name, keep = self.filters[self.filter_index]
         rows = [entry for entry in self.plan if keep(entry)]
-        summary = Text.from_markup(f"[bold]Preview[/]  {plan_summary(self.plan)}")
+        summary_widget = self.query_one("#preview-summary", Static)
+        summary = Summary(Text.assemble(("Preview", "bold"), "  "), plan_summary(self.plan)).fit(
+            self.app.size.width - summary_widget.styles.margin.width)
         summary.append("\nDestination: ", style="dim")
         summary.append(short_path(self.destination))
         space, fits = space_line(self.plan, self.destination)
@@ -4718,7 +4758,7 @@ class PreviewScreen(Screen):
             summary.append(f"\n{space}", style="dim")
         elif space:
             summary.append(f"\n! {space}: not enough disk space", style="bold red")
-        self.query_one("#preview-summary", Static).update(summary)
+        summary_widget.update(summary)
 
         tabs = []
         for index, (tab_name, tab_keep) in enumerate(self.filters):
@@ -5517,18 +5557,19 @@ RESULT_LABELS = [
 
 
 def results_summary(results, plain=False):
-    """Result counts. plain: for the terminal's own background (print_results), not the TUI's dark one."""
+    """Result counts, one Text each. plain: for the terminal's own background (print_results), not the TUI's
+    dark one."""
     parts = []
     for keys, style, singular, plural_label in RESULT_LABELS:
         count = sum(results[key] for key in keys)
         if count:
             text = f"{count} {singular if count == 1 else plural_label}"
-            parts.append(terminal_text(style, text) if plain else f"[{style}]{text}[/]")
-    return " · ".join(parts) or "[dim]nothing to do[/]"
+            parts.append(Text.from_markup(terminal_text(style, text)) if plain else Text(text, style=style))
+    return parts or [Text("nothing to do", style="dim")]
 
 
 def print_results(results):
-    console.print(f"[bold]Done[/]  {results_summary(results, plain=True)}")
+    console.print(Summary(Text.assemble(("Done", "bold"), "  "), results_summary(results, plain=True)).fit(console.width))
 
 
 # --- Main ------------------------------------------------------------------
@@ -5617,7 +5658,7 @@ def changes_drive(plan):
 
 
 def last_sync_summary(plan):
-    """One line for the start: how far the last selection is from being in sync."""
+    """One Summary for the start (a Text when in sync): how far the last selection is from being in sync."""
     # Files only for transfers (a new folder comes with its files); deletions count a whole folder once.
     counts = Counter(
         entry["status"] for entry in plan
@@ -5653,31 +5694,27 @@ def last_sync_summary(plan):
         (counts["TRASH_LOCAL"], "deleted on Drive", "bright_magenta"),
         (counts["CONFLICT"], "conflict" if counts["CONFLICT"] == 1 else "conflicts", "yellow"),
     ]
-    text.append("Since the last sync: ", style="bold")
-    text.append_text(Text(" · ").join(Text(f"{count} {label}", style=style) for count, label, style in parts if count))
-    text.append("   ")
-    text.append("s", style="bold #f59e0b")
-    text.append(" to review and sync", style="dim")
-    return text
+    return Summary(Text("Since the last sync: ", style="bold"),
+                   [Text(f"{count} {label}", style=style) for count, label, style in parts if count],
+                   tail=Text.assemble(("s", "bold #f59e0b"), (" to review and sync", "dim")))
 
 
 NOTICE_FAILURES = 3  # errors listed above the tree; all of them stay in the terminal
 
 
 def result_notice(plan, results):
-    """The last sync's result, shown above the tree when it comes back."""
+    """The last sync's result, shown above the tree when it comes back: a Summary, or a Text when in sync."""
     text = Text()
     if not in_sync(plan):
-        text.append("Done  ", style="bold")
-        text.append_text(Text.from_markup(results_summary(results)))
         failures = getattr(results, "failures", [])
         for failure in failures[:NOTICE_FAILURES]:
-            text.append("\n✗ ", style="red")
+            text.append("\n✗ " if text else "✗ ", style="red")
             text.append(failure)
         if len(failures) > NOTICE_FAILURES:
             text.append(
                 f"\n… and {len(failures) - NOTICE_FAILURES} more, listed in the terminal after you quit", style="dim"
             )
+        return Summary(Text("Done  ", style="bold"), results_summary(results), after=text if text else None)
     else:
         text.append("✓ ", style="green")
         text.append("Everything was in sync.")

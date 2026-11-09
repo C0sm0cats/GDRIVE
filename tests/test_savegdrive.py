@@ -5336,6 +5336,48 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             red = [span for span in summary.spans if "red" in str(span.style)]
             self.assertEqual(bool(red), warned, summary.spans)
 
+    async def test_summaries_break_between_counts_in_80_columns(self):
+        # design 12: "· 140" ended a line and "unchanged" began the next, read as 140 deletions.
+        plan = [{"kind": "FILE", "status": status, "relative_path": Path(f"{status}{index}.txt"),
+                 "item": {"name": f"{status}{index}.txt", "size": "10"}, "destination": self.root / f"{status}{index}.txt"}
+                for status, count in (("NEW", 12), ("UPDATE", 3), ("UPLOAD", 5), ("TRASH_REMOTE", 2), ("UNCHANGED", 140))
+                for index in range(count)]
+        results = savegdrive.Counter(FILE_NEW=12, FILE_UPDATE=3, FILE_UPLOAD=5, FILE_UNCHANGED=140, FILE_TRASH_REMOTE=2)
+        console = Console(file=io.StringIO(), width=80, highlight=False, record=True)
+        with mock.patch.object(savegdrive, "console", console):
+            savegdrive.print_plan(plan, self.root)
+            savegdrive.print_results(results)
+        output = console.export_text()
+        self.assertIn("Preview  12 ↓ new · 3 ↓ changed · 5 ↑ changed · 2 ↑ to Drive trash\n         140 unchanged\n",
+                      output)
+        self.assertIn("Done  12 downloaded · 3 updated from Drive · 5 sent to Drive · 140 unchanged\n"
+                      "      2 moved to the Drive trash\n", output)
+        self.assertEqual(savegdrive.last_sync_summary(plan).fit(76).plain,
+                         "Since the last sync: 15 ↓ to download · 5 ↑ to send · 2 deleted here\n"
+                         "                     s to review and sync")
+
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            summary = app.screen.query_one("#preview-summary").render().plain.splitlines()
+        self.assertEqual(summary[:2], ["Preview  12 ↓ new · 3 ↓ changed · 5 ↑ changed · 2 ↑ to Drive trash",
+                                       "         140 unchanged"])
+
+        views = [savegdrive.DriveView("My Drive", "root")]
+        drive, cache = demo_drive(), {}
+        savegdrive.load_view(drive, views[0], cache)
+        app = savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), drive, None, cache,
+                                          notice=savegdrive.result_notice(plan, results))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one("#notice").render().plain.splitlines(), [
+                "Done  12 downloaded · 3 updated from Drive · 5 sent to Drive · 140 unchanged",
+                "      2 moved to the Drive trash"])
+            await pilot.resize_terminal(160, 24)
+            await pilot.pause()
+            self.assertEqual(app.query_one("#notice").render().plain.splitlines(), [
+                "Done  12 downloaded · 3 updated from Drive · 5 sent to Drive · 140 unchanged · 2 moved to the Drive trash"])
+
     async def test_preview_shows_the_local_folder_in_80x24(self):
         destination = Path.home() / "Documents" / "Google Drive"
         plan = [{
