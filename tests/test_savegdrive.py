@@ -1442,6 +1442,56 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
 
+    def trash_view_app(self, drive):
+        drive.items["n"]["trashed"] = True  # notes.txt is in the Drive trash
+        views = savegdrive.drive_views(drive, "root")
+        return self.make_app(drive, views)
+
+    async def test_delete_forever_ignores_the_selection_of_other_views(self):
+        drive = demo_drive()
+        app = self.trash_view_app(drive)
+        async with app.run_test() as pilot:
+            await pilot.press("down", "space")  # Docs, selected in My Drive
+            await pilot.press("shift+tab")  # Trash
+            await self.wait(app, pilot)
+            await pilot.press("down", "x")  # notes.txt, under the cursor
+            self.assertIn("“notes.txt”", str(app.screen.message))
+            await pilot.press(*"delete", "enter")
+            await self.wait(app, pilot)
+        self.assertNotIn("n", drive.items)
+        for item_id in ("docs", "a", "b", "report", "form"):
+            self.assertIn(item_id, drive.items)
+            self.assertNotIn("trashed", drive.items[item_id])
+
+    async def test_restore_ignores_the_selection_of_other_views(self):
+        drive = demo_drive()
+        app = self.trash_view_app(drive)
+        async with app.run_test() as pilot:
+            await pilot.press("down", "space", "shift+tab")  # Docs selected in My Drive, then Trash
+            await self.wait(app, pilot)
+            await pilot.press("down", "r")
+            self.assertIn("“notes.txt”", str(app.screen.message))
+            await pilot.press("y")
+            await self.wait(app, pilot)
+        self.assertFalse(drive.items["n"]["trashed"])
+        self.assertNotIn("trashed", drive.items["docs"])
+
+    async def test_drive_trash_ignores_the_selection_of_the_trash_view(self):
+        drive = demo_drive()
+        app = self.trash_view_app(drive)
+        async with app.run_test() as pilot:
+            await pilot.press("shift+tab")  # Trash
+            await self.wait(app, pilot)
+            await pilot.press("down", "space")  # notes.txt, selected in Trash
+            await pilot.press("tab")  # back to My Drive
+            await self.wait(app, pilot)
+            await pilot.press("home", "down", "x")  # Docs, under the cursor
+            self.assertIn("“Docs”", str(app.screen.message))
+            await pilot.press("y")
+            await self.wait(app, pilot)
+        self.assertTrue(drive.items["docs"]["trashed"])
+        self.assertIn("n", drive.items)
+
     async def test_read_only_items_are_not_offered_to_the_drive_trash(self):
         drive = demo_drive()
         drive.items["n"]["capabilities"] = {"canTrash": False}
