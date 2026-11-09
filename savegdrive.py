@@ -704,34 +704,68 @@ def path_selection_state(path, selections):
     return " "
 
 
-def add_selected_item(selections, item, relative_parent):
-    candidate = {
-        "item": item,
-        "relative_parent": relative_parent,
-    }
-    candidate_path = selected_path(candidate)
-
+def selection_index(selections):
+    """The selected paths and the selected folders' paths, for indexed_selection_state."""
+    paths, folders = set(), set()
     for entry in selections:
-        entry_path = selected_path(entry)
-        if entry_path == candidate_path:
-            return False
-        if is_folder(entry["item"]) and entry_path in candidate_path.parents:
-            return False
+        path = selected_path(entry)
+        paths.add(path)
+        if is_folder(entry["item"]):
+            folders.add(path)
+    return paths, folders
 
-    if is_folder(item):
+
+def indexed_selection_state(path, index):
+    """path_selection_state against a selection_index: O(depth) instead of O(selection)."""
+    paths, folders = index
+    if path in paths:
+        return "x"
+    if not folders.isdisjoint(path.parents):
+        return "*"
+    return " "
+
+
+def index_selection(index, entry):
+    path = selected_path(entry)
+    index[0].add(path)
+    if is_folder(entry["item"]):
+        index[1].add(path)
+
+
+def add_selected_items(selections, candidates):
+    """Add candidates ({"item", "relative_parent", …}) in order, like add_selected_item on each,
+    but indexing the selection once and sorting once. Returns the candidates that were kept."""
+    index = selection_index(selections)
+    added, new_folders = [], set()
+    for candidate in candidates:
+        path = selected_path(candidate)
+        if indexed_selection_state(path, index) != " ":
+            continue
+        index_selection(index, candidate)
+        if is_folder(candidate["item"]):
+            new_folders.add(path)
+        added.append(candidate)
+    if not added:
+        return []
+    selections.extend(added)
+    if new_folders:
+        # What an added folder covers goes, including candidates added before it.
         selections[:] = [
-            entry
-            for entry in selections
-            if candidate_path not in selected_path(entry).parents
+            entry for entry in selections
+            if new_folders.isdisjoint(selected_path(entry).parents)
         ]
-    selections.append(candidate)
     selections.sort(
         key=lambda entry: (
             not is_folder(entry["item"]),
             selected_path(entry).as_posix().casefold(),
         )
     )
-    return True
+    kept = {id(entry) for entry in selections}
+    return [candidate for candidate in added if id(candidate) in kept]
+
+
+def add_selected_item(selections, item, relative_parent):
+    return bool(add_selected_items(selections, [{"item": item, "relative_parent": relative_parent}]))
 
 
 def scope_covers(parent, scope):
@@ -742,11 +776,15 @@ def scope_covers(parent, scope):
 
 
 def compact_scopes(scopes):
-    compacted = []
+    compacted, kept = [], set()
     for scope in sorted(set(scopes), key=lambda path: (len(path.parts), path.as_posix())):
-        if any(scope_covers(parent, scope) for parent in compacted):
+        # Same as any(scope_covers(parent, scope) for parent in compacted), in O(depth).
+        if Path() in kept and scope_covers(Path(), scope):
+            continue
+        if any(parent in kept for parent in scope.parents if parent != Path()):
             continue
         compacted.append(scope)
+        kept.add(scope)
     return compacted
 
 
@@ -1628,6 +1666,7 @@ class DriveSelectorApp(App):
             if view.nodes is not None:
                 view.marks = local_marks(view.nodes, destination, state)
         self.selections = []
+        self.label_index = None  # selection_index of self.selections for node_label; None when stale
         self.tree_nodes = {}
         self.populated = set()
         self.filter_terms = []
@@ -1862,6 +1901,7 @@ class DriveSelectorApp(App):
         tree = self.query_one("#drive-tree", Tree)
         current = self.current_entry()
         tree.clear()
+        self.label_index = None
         self.tree_nodes = {}
         self.populated = set()
         self.populate(tree.root)
@@ -1912,7 +1952,9 @@ class DriveSelectorApp(App):
 
     def node_label(self, entry):
         item = entry["item"]
-        state = path_selection_state(selected_path(entry), self.selections)
+        if self.label_index is None:
+            self.label_index = selection_index(self.selections)
+        state = indexed_selection_state(selected_path(entry), self.label_index)
         label = Text()
         label.append(
             {"x": "☑ ", "*": "◩ "}.get(state, "☐ "),
@@ -1954,6 +1996,7 @@ class DriveSelectorApp(App):
         return label
 
     def refresh_node_labels(self):
+        self.label_index = None  # the selection changed
         for tree_node in self.tree_nodes.values():
             tree_node.set_label(self.node_label(tree_node.data))
         self.update_selection_summary()
@@ -2023,17 +2066,21 @@ class DriveSelectorApp(App):
             self.add_entry(entry)
         self.refresh_node_labels()
 
+    def selection_candidate(self, entry):
+        # Keep the view and totals, for the tab counts and the summary.
+        if is_folder(entry["item"]):
+            totals = tuple(self.totals.get(entry["index"], (0, 0)))
+        else:
+            totals = (1, int(entry["item"].get("size") or 0))
+        return {
+            "item": entry["item"],
+            "relative_parent": entry["relative_parent"],
+            "view": self.view,
+            "totals": totals,
+        }
+
     def add_entry(self, entry):
-        if add_selected_item(self.selections, entry["item"], entry["relative_parent"]):
-            # Keep the view and totals, for the tab counts and the summary.
-            if is_folder(entry["item"]):
-                totals = tuple(self.totals.get(entry["index"], (0, 0)))
-            else:
-                totals = (1, int(entry["item"].get("size") or 0))
-            for selected in self.selections:
-                if selected["item"] is entry["item"]:
-                    selected["view"] = self.view
-                    selected["totals"] = totals
+        add_selected_items(self.selections, [self.selection_candidate(entry)])
 
     def action_toggle_current(self):
         self.toggle_entry(self.current_entry())
@@ -2095,17 +2142,17 @@ class DriveSelectorApp(App):
             ]
         else:
             targets = self.children_of.get(None, [])
-        if all(path_selection_state(selected_path(entry), self.selections) != " " for entry in targets):
+        index = selection_index(self.selections)
+        if all(indexed_selection_state(selected_path(entry), index) != " " for entry in targets):
             # Everything is already selected: unselect it.
             paths = {selected_path(entry) for entry in targets}
             self.selections[:] = [
                 entry for entry in self.selections
                 if selected_path(entry) not in paths
-                and not any(path in selected_path(entry).parents for path in paths)
+                and paths.isdisjoint(selected_path(entry).parents)
             ]
         else:
-            for entry in targets:
-                self.add_entry(entry)
+            add_selected_items(self.selections, [self.selection_candidate(entry) for entry in targets])
         self.refresh_node_labels()
 
     def action_clear_selection(self):
@@ -2240,6 +2287,7 @@ class DriveSelectorApp(App):
         self.cache.clear()
         TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
         self.selections.clear()
+        self.label_index = None
         for view in self.views:
             view.nodes, view.error, view.expanded, view.sorted_by = None, None, set(), "name"
         self.show_view(self.view)
@@ -2411,14 +2459,21 @@ def last_selection(service, state, cache):
         return None
     selections = []
     scopes = [Path(scope) for scope in saved.get("scopes", [])]
+    from_roots = []
     for root in saved.get("roots", []):
         if root["id"] in {SHARED_WITH_ME, TRASH}:
             cache.pop(root["id"], None)  # a search, not a folder: Drive changes do not update it
-        for item in list_children(service, root["id"], cache):
-            add_selected_item(selections, item, Path(root["base"]))
+        from_roots.extend(
+            {"item": item, "relative_parent": Path(root["base"])}
+            for item in list_children(service, root["id"], cache)
+        )
+    add_selected_items(selections, from_roots)
+    # Selected so far, kept up to date as items are picked, then added at once.
+    index = selection_index(selections)
+    picked = []
     for saved_item in saved["items"]:
         relative_parent = Path(saved_item["relative_parent"])
-        if path_selection_state(Path(saved_item["path"]), selections) != " ":
+        if indexed_selection_state(Path(saved_item["path"]), index) != " ":
             continue  # already there through a whole view
         try:
             item = (
@@ -2439,7 +2494,11 @@ def last_selection(service, state, cache):
             scopes.append(Path(saved_item["path"]))
             continue
         note_drives([item])
-        add_selected_item(selections, item, relative_parent)
+        candidate = {"item": item, "relative_parent": relative_parent}
+        if indexed_selection_state(selected_path(candidate), index) == " ":
+            index_selection(index, candidate)
+            picked.append(candidate)
+    add_selected_items(selections, picked)
     return selections, compact_scopes(scopes)
 
 

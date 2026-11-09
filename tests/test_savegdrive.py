@@ -1233,6 +1233,79 @@ class DeletionScalingTest(unittest.TestCase):
         self.assertEqual(self.plan_moved_folders(2), self.plan_moved_folders(30))
 
 
+class SelectionScalingTest(unittest.TestCase):
+    """Big selections: a, --again and d index the selection instead of rescanning it per item (perf 2)."""
+
+    def count_paths(self, run):
+        calls = [0]
+        real = savegdrive.selected_path
+
+        def counting(entry):
+            calls[0] += 1
+            return real(entry)
+
+        with mock.patch.object(savegdrive, "selected_path", counting):
+            result = run()
+        return calls[0], result
+
+    def candidates(self, count):
+        folders = [{"item": {"name": f"D{index}", "mimeType": FOLDER}, "relative_parent": Path()}
+                   for index in range(count)]
+        files = [{"item": {"name": f"f{index}.txt", "mimeType": "text/plain"}, "relative_parent": Path(f"D{index}")}
+                 for index in range(count)]
+        loose = [{"item": {"name": f"g{index}.txt", "mimeType": "text/plain"}, "relative_parent": Path("E")}
+                 for index in range(count)]
+        # Files first, then their folders (which replace them), then files under the folders (skipped).
+        return files + folders + files + loose
+
+    def test_add_selected_items_matches_one_by_one(self):
+        one_by_one, at_once = [], []
+        for candidate in self.candidates(5):
+            savegdrive.add_selected_item(one_by_one, candidate["item"], candidate["relative_parent"])
+        added = savegdrive.add_selected_items(at_once, [dict(candidate) for candidate in self.candidates(5)])
+        paths = [savegdrive.selected_path(entry) for entry in one_by_one]
+        self.assertEqual([savegdrive.selected_path(entry) for entry in at_once], paths)
+        self.assertEqual(sorted(savegdrive.selected_path(entry) for entry in added), sorted(paths))
+        self.assertEqual(savegdrive.add_selected_items(at_once, self.candidates(5)), [])
+
+    def test_add_selected_items_is_linear(self):
+        small, _ = self.count_paths(lambda: savegdrive.add_selected_items([], self.candidates(20)))
+        big, _ = self.count_paths(lambda: savegdrive.add_selected_items([], self.candidates(400)))
+        self.assertLess(big, small * 30)  # 20x the items; one by one, it was 400x
+
+    def last_selection(self, count):
+        drive = FakeDrive(
+            [{"id": "f", "name": "F", "mimeType": FOLDER, "parent": "root"}]
+            + [file_item(f"x{index}", f"x{index}.txt", "f", b"x") for index in range(count)]
+        )
+        saved = [{"id": f"x{index}", "path": f"F/x{index}.txt", "relative_parent": "F"} for index in range(count)]
+        saved.append({"id": "x0", "path": "F/x0.txt", "relative_parent": "F"})  # twice: added once
+        state = {"last_selection": {"roots": [], "items": saved, "scopes": []}}
+        with mock.patch.object(savegdrive, "note_drives", lambda items: None):
+            calls, (selections, _) = self.count_paths(lambda: savegdrive.last_selection(drive, state, {}))
+        self.assertEqual(len(selections), count)
+        return calls
+
+    def test_last_selection_is_linear(self):
+        self.assertLess(self.last_selection(400), self.last_selection(20) * 30)
+
+    def test_compact_scopes_is_linear(self):
+        calls = [0]
+        real = savegdrive.scope_covers
+
+        def counting(parent, scope):
+            calls[0] += 1
+            return real(parent, scope)
+
+        scopes = [Path(f"D{index}") for index in range(300)] + [Path(f"D{index}/sub") for index in range(300)]
+        with mock.patch.object(savegdrive, "scope_covers", counting):
+            compacted = savegdrive.compact_scopes(scopes)
+        self.assertEqual(compacted, sorted(scopes[:300], key=lambda path: path.as_posix()))
+        self.assertLess(calls[0], 1000)  # it compared each scope with each kept one: 135 000 calls
+        self.assertEqual(savegdrive.compact_scopes([Path(), Path("Docs"), Path("Shared with me/x")]),
+                         [Path(), Path("Shared with me/x")])
+
+
 class UploadTest(unittest.TestCase):
     def test_upload_file_sends_every_chunk(self):
         class Request:
@@ -1809,6 +1882,33 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("s")  # nothing to review
             self.assertNotIsInstance(app.screen, savegdrive.PreviewScreen)
             await pilot.press("q")
+
+
+    async def test_big_selection_keys_scale_linearly(self):
+        """a, a again and z with a whole view selected: linear in the selection (perf 2)."""
+        async def calls(count):
+            drive = FakeDrive([file_item(f"n{index}", f"n{index}.txt", "root", b"n") for index in range(count)])
+            app = self.make_app(drive)
+            counts = []
+            real = savegdrive.selected_path
+
+            def counting(entry):
+                counts[-1] += 1
+                return real(entry)
+
+            async with app.run_test() as pilot:
+                with mock.patch.object(savegdrive, "selected_path", counting):
+                    for key in ("a", "z", "a"):
+                        counts.append(0)
+                        await pilot.press(key)
+                        if key == "a":
+                            self.assertEqual(len(app.selections), count if len(counts) == 1 else 0)
+                await pilot.press("q")
+            return counts
+
+        small, big = await calls(20), await calls(200)
+        for small_count, big_count in zip(small, big):
+            self.assertLess(big_count, small_count * 20)  # 10x the items; it was about 100x
 
     async def test_help_and_expand_all(self):
         app = self.make_app()
