@@ -28,6 +28,10 @@ DOC = "application/vnd.google-apps.document"
 FORM = "application/vnd.google-apps.form"
 
 
+def raise_(exception):
+    raise exception
+
+
 def http_error(status, reason=None):
     response = mock.Mock(status=status, reason="error")
     if reason is None:
@@ -2098,6 +2102,29 @@ class SyncTest(unittest.TestCase):
         (self.root / "Docs/a.txt").unlink()
         self.assertEqual(self.sync_round(cache)["Docs/a.txt"], "TRASH_REMOTE")
         self.assertNotIn("Docs/a.txt", self.sync_round(cache))
+        self.assertFalse((self.root / "Docs/a.txt").exists())
+
+    def test_failed_drive_trash_is_an_error_and_is_tried_again(self):
+        # tests 40: a trash Drive refuses is not reported done, nor forgotten, nor downloaded back next time.
+        self.run_sync()
+        (self.root / "Docs/a.txt").unlink()
+        update = self.drive.update
+
+        def failing_update(fileId, body, **kwargs):
+            if fileId == "a":
+                return FakeRequest(lambda: raise_(http_error(500)))
+            return update(fileId, body, **kwargs)
+
+        with mock.patch.object(self.drive, "update", failing_update):
+            statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "TRASH_REMOTE")
+        self.assertEqual((results["FILE_ERROR"], results["FILE_TRASH_REMOTE"]), (1, 0))
+        self.assertNotIn("trashed", self.drive.items["a"])
+
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "TRASH_REMOTE")  # still known, not NEW
+        self.assertEqual(results["FILE_TRASH_REMOTE"], 1)
+        self.assertTrue(self.drive.items["a"]["trashed"])
         self.assertFalse((self.root / "Docs/a.txt").exists())
 
     def test_again_with_yes_refuses_a_mass_deletion(self):
@@ -4955,6 +4982,37 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await self.wait(app, pilot)
         self.assertFalse(drive.items["n"]["trashed"])
         self.assertNotIn("trashed", drive.items["docs"])
+
+    async def test_failed_restore_is_reported_as_an_error(self):
+        # tests 40: a restore Drive refuses (403) is an error, not "Restored".
+        drive = demo_drive()
+        drive.items["photos"]["trashed"] = True
+        update = drive.update
+
+        def failing_update(fileId, body, **kwargs):
+            if fileId == "photos":
+                return FakeRequest(lambda: raise_(http_error(403)))
+            return update(fileId, body, **kwargs)
+
+        drive.update = failing_update
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        tree = lambda: app.query_one(Tree)  # noqa: E731
+        notes = []
+        async with app.run_test() as pilot:
+            app.notify = lambda message, **kwargs: notes.append((str(message), kwargs.get("severity")))
+            await pilot.press("shift+tab")  # Trash
+            await self.wait(app, pilot)
+            while (tree().cursor_node.data or {}).get("item", {}).get("id") != "photos":
+                await pilot.press("down")
+            await pilot.press("r")
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("y")
+            await self.wait(app, pilot)
+            await pilot.press("q")
+        self.assertTrue(drive.items["photos"]["trashed"])
+        self.assertTrue(any(severity == "error" for _, severity in notes), notes)
+        self.assertFalse(any(message.startswith("Restored") for message, _ in notes), notes)
 
     async def test_drive_trash_ignores_the_selection_of_the_trash_view(self):
         drive = demo_drive()
