@@ -149,7 +149,7 @@ class FakeDrive:
         self.items = {item["id"]: dict(item) for item in items}
         self.page_size = page_size
         self.batches = []
-        self.failures = {}  # folder id -> errors raised by its next listings
+        self.failures = {}  # folder id, or (folder id, page token), -> errors raised by its next listings
         self.create_failures = {}  # folder name -> errors raised by its next creations
         self.change_log = []
         self.changes_page_size = 2  # small, so the changes feed comes in several pages
@@ -214,7 +214,7 @@ class FakeDrive:
         want_trashed = True if q.endswith("trashed = true") else False if q.endswith("trashed = false") else None
 
         def run():
-            failures = self.failures.get(folder_id)
+            failures = self.failures.get((folder_id, pageToken)) or self.failures.get(folder_id)
             if failures:
                 raise failures.pop(0)
             if folder_id == savegdrive.SHARED_WITH_ME:
@@ -408,6 +408,17 @@ class ListingTest(unittest.TestCase):
             cache = {}
             savegdrive.list_folders(drive, ["docs"], cache)
         self.assertEqual(len(cache["docs"]), 4)
+
+    def test_retries_a_later_page_from_its_own_token(self):
+        drive = demo_drive()
+        drive.page_size = 2  # Docs has 4 children: pages None and "2"
+        drive.failures[("docs", "2")] = [http_error(429)]
+        with mock.patch.object(savegdrive.time, "sleep"):
+            cache = {}
+            savegdrive.list_folders(drive, ["docs"], cache)
+        self.assertEqual(drive.failures[("docs", "2")], [])  # the second page did fail once
+        ids = [item["id"] for item in cache["docs"]]
+        self.assertEqual(sorted(ids), ["a", "b", "form", "report"])  # each once, none listed twice
 
     def test_retries_403_rate_limits(self):
         for reason in ("userRateLimitExceeded", "rateLimitExceeded"):
