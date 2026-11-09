@@ -2333,6 +2333,16 @@ class SyncTest(unittest.TestCase):
         (self.root / "notes.txt").unlink()  # deleted here: goes to the Drive trash
         self.assertEqual(marks()["notes.txt"], "deleted")
 
+    def test_marks_folder_with_a_new_file_on_drive_as_changed(self):
+        # README: ✓ only when every file is the same on both sides; ↻ for a folder with new files.
+        self.run_sync()
+        self.drive.items["c"] = file_item("c", "c.txt", "docs", b"gamma")  # added on Drive after the sync
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        by_path = {node["display_path"]: node["index"] for node in nodes}
+        found = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        self.assertIsNone(found.get(by_path["Docs/c.txt"]))  # not downloaded yet
+        self.assertEqual(found.get(by_path["Docs"]), "changed")
+
     def test_marks_for_changes_made_here(self):
         # Each mark tells what the next sync does: up, to the Drive trash, or a conflict that never goes up.
         self.run_sync()
