@@ -1103,6 +1103,22 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(handle.getvalue(), b"aaabbbcc")
 
 
+class LocalTrashTest(unittest.TestCase):
+    def test_trash_local_sends_to_system_trash_without_deleting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "folder"
+            folder.mkdir()
+            (folder / "inside.txt").write_text("kept")
+            file = Path(temp) / "file.txt"
+            file.write_text("kept")
+            with mock.patch.object(savegdrive, "send2trash") as send2trash:
+                savegdrive.trash_local(folder)
+                savegdrive.trash_local(file)
+            self.assertEqual(send2trash.call_args_list, [mock.call(str(folder)), mock.call(str(file))])
+            self.assertEqual((folder / "inside.txt").read_text(), "kept")
+            self.assertEqual(file.read_text(), "kept")
+
+
 class SignInTest(unittest.TestCase):
     def test_read_only_token_asks_for_full_access(self):
         with tempfile.TemporaryDirectory() as temp:
