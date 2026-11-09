@@ -3014,10 +3014,11 @@ def last_selection(service, state, cache, kept=None):
         if item is not None and item.get("trashed") and from_trash:
             if is_folder(item):
                 TRASHED_FOLDERS.add(effective_id(item))  # picked in the Trash view: list it from there
-        elif item is None or item.get("trashed"):
-            if item is not None and kept is not None:
+        elif item is None or item.get("trashed") or from_trash:
+            # Picked in the Trash view and restored on Drive: gone from that view, its new place comes if selected.
+            if item is not None and item.get("trashed") and kept is not None:
                 kept.append(saved_item)  # in the Drive trash: it may be restored there
-            warn(f"{saved_item['path']} is no longer on Drive")
+            warn(f"{saved_item['path']} is no longer " + ("in the Drive trash" if item is not None else "on Drive"))
             scopes.append(Path(saved_item["path"]))
             continue
         elif moved_on_drive(saved_item, item):

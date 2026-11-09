@@ -1821,6 +1821,37 @@ class SyncTest(unittest.TestCase):
         for path in ("Old/old.txt", "Old/Sub/deep.txt", "gone.txt"):
             self.assertTrue((trash / path).is_file(), path)
 
+    def test_item_restored_from_the_trash_view_leaves_trash_with_again(self):
+        # The whole Trash view synced, then a.txt restored on Drive: --again moves the copy out of Trash/.
+        self.drive.items.update({
+            "a": file_item("a", "a.txt", "root", b"a", trashed=True),
+            "old": file_item("old", "old.txt", "root", b"old", trashed=True),
+        })
+        cache = {}
+        token = savegdrive.start_page_token(self.drive)
+        trash_dir = Path(savegdrive.TRASH_DIR)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, savegdrive.TRASH, cache, base=trash_dir)
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [(savegdrive.TRASH, trash_dir)], self.root, state, cache, token)
+        trash = self.root / trash_dir
+        self.assertEqual(sorted(path.name for path in trash.iterdir()), ["a.txt", "old.txt"])
+
+        self.drive.items["a"]["trashed"] = False
+        self.drive.change("a")
+        self.run_main("--again", "--yes")
+        self.assertEqual(sorted(path.name for path in trash.iterdir()), ["old.txt"])
+        self.assertEqual([path.name for path in self.trash.iterdir()], ["0-a.txt"])
+        self.run_main("--again", "--yes")  # not brought back into Trash/
+        self.assertEqual(sorted(path.name for path in trash.iterdir()), ["old.txt"])
+
     def test_again_after_an_upload_keeps_the_sent_file(self):
         self.sync_everything()
         (self.root / "Docs/new.txt").write_bytes(b"made here")
