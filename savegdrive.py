@@ -4030,6 +4030,7 @@ UPLOADS = {"UPLOAD_NEW", "UPLOAD"}
 DELETIONS = {"TRASH_REMOTE", "TRASH_LOCAL"}
 MASS_DELETION_FILES = 20  # deleting more than this, or more than a quarter of the synced files,
 MASS_DELETION_SHARE = 0.25  # needs a typed confirmation: an unplugged disk or an emptied folder looks the same
+MASS_DELETION_MIN = 2  # the quarter rule only counts above this: 1 or 2 deletions in a small selection pass
 
 
 def can_keep_both(entry):
@@ -4222,7 +4223,7 @@ def deletion_count(plan, state):
 
 def needs_deletion_check(plan, state):
     count, synced = deletion_count(plan, state)
-    return count > MASS_DELETION_FILES or (count > 2 and synced and count > synced * MASS_DELETION_SHARE)
+    return count > MASS_DELETION_FILES or (count > MASS_DELETION_MIN and synced and count > synced * MASS_DELETION_SHARE)
 
 
 def plan_notes(plan):
@@ -5430,8 +5431,8 @@ def main():
     parser.add_argument(
         "--allow-deletions",
         action="store_true",
-        help=f"With --yes: also apply a sync that deletes more than {MASS_DELETION_FILES} files or a quarter "
-        "of the synced ones (refused otherwise).",
+        help=f"With --yes: also apply a sync that deletes more than {MASS_DELETION_FILES} files, or more than "
+        f"{MASS_DELETION_MIN} files and a quarter of the synced ones (refused otherwise).",
     )
     parser.add_argument(
         "--jobs",

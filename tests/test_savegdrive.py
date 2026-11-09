@@ -1679,6 +1679,26 @@ class SyncTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 savegdrive.confirm_in_terminal(args, plan, state)
 
+    def test_one_or_two_deletions_pass_and_the_docs_say_so(self):
+        self.run_sync()
+        (self.root / "Docs/a.txt").unlink()
+        (self.root / "Docs/b.txt").unlink()  # 2 of 5: more than a quarter, but only 2 files
+        _, _, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (2, 5))
+        self.assertFalse(check)
+        (self.root / "Photos/beach.jpg").unlink()  # 3 of 5
+        _, _, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (3, 5))
+        self.assertTrue(check)
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["savegdrive", "--help"]), \
+                mock.patch.dict(os.environ, {"COLUMNS": "1000"}), \
+                mock.patch.object(sys, "stdout", output), self.assertRaises(SystemExit):
+            savegdrive.main()
+        self.assertIn("more than 2 files and a quarter of the synced ones", output.getvalue())
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        self.assertIn("more than 2 files and more than a quarter", " ".join(readme.split()))
+
     def test_mass_deletion_on_drive_needs_a_check(self):
         for i in range(30):
             self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")

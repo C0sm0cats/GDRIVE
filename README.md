@@ -184,10 +184,10 @@ Some rules keep it safe:
 - **Never synced yet**: a file present on both sides with different content is
   a conflict; the same content is simply adopted. The first sync of a folder
   you already have never deletes anything.
-- **Many deletions** (more than 20 files, or more than a quarter of the synced
-  ones) need you to type `delete`; with `--yes` they are refused unless you add
-  `--allow-deletions`. That is what an unplugged disk or an emptied folder
-  looks like.
+- **Many deletions** (more than 20 files, or more than 2 files and more than a
+  quarter of the synced ones) need you to type `delete`; with `--yes` they are
+  refused unless you add `--allow-deletions`. That is what an unplugged disk or
+  an emptied folder looks like. 1 or 2 deletions never ask.
 - **Your rights on Drive count**: a file shared with you read only is never
   sent back (a local change is a conflict); one Drive does not let you trash
   (read only, owned by someone else, or a shared drive role that cannot delete)
