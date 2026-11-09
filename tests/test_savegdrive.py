@@ -2918,6 +2918,51 @@ class DeletionScalingTest(unittest.TestCase):
         self.assertEqual(self.plan_moved_folders(2), self.plan_moved_folders(30))
 
 
+class CountingPath(type(Path())):
+    """A trashed folder path that counts the comparisons made with it."""
+    comparisons = 0
+
+    def __eq__(self, other):
+        CountingPath.comparisons += 1
+        return super().__eq__(other)
+
+    __hash__ = type(Path()).__hash__
+
+
+class TrashedFoldersScalingTest(unittest.TestCase):
+    """Local paths are checked against the folders deleted here by lookup, not one by one (perf 3)."""
+
+    def local_entries(self, deleted):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for index in range(10):
+                (root / "Kept" / f"f{index}.txt").parent.mkdir(parents=True, exist_ok=True)
+                (root / "Kept" / f"f{index}.txt").write_text("x")
+            (root / "Twice" / "inside.txt").parent.mkdir(parents=True)  # two Drive folders on this path
+            (root / "Twice" / "inside.txt").write_text("x")
+            plan = [
+                {"status": "TRASH_REMOTE", "kind": "FOLDER", "item": {"id": f"g{index}"},
+                 "relative_path": CountingPath(f"Gone{index}")}
+                for index in range(deleted)
+            ]
+            plan.append({"status": "CONFLICT", "kind": "FOLDER", "item": {"id": "t"}, "duplicate": True,
+                         "relative_path": CountingPath("Twice")})
+            state = {
+                "files": {f"s{index}": {"path": f"Gone0/old{index}.txt"} for index in range(10)}
+                | {"other": {"path": "Elsewhere/old.txt"}},
+                "folders": {},
+            }
+            CountingPath.comparisons = 0
+            savegdrive.add_local_entries(plan, root, state, [Path()], {Path(): "root"})
+        new_paths = sorted(str(entry["relative_path"]) for entry in plan if entry["item"] is None)
+        self.assertEqual(new_paths, ["Kept"] + [f"Kept/f{index}.txt" for index in range(10)])
+        self.assertEqual(sorted(state["files"]), [f"s{index}" for index in range(10)])  # kept below a trashed one
+        return CountingPath.comparisons
+
+    def test_local_paths_are_not_compared_with_each_deleted_folder(self):
+        self.assertEqual(self.local_entries(2), self.local_entries(40))
+
+
 class ApplyPlanPhasesTest(unittest.TestCase):
     """apply_plan's phases, each tested on its own (maint 1, maint 3)."""
 

@@ -3351,19 +3351,23 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         for entry in plan
         if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE"
     }
-    trashed_remote = [
+    trashed_remote = {
         entry["relative_path"] for entry in plan
         if entry["kind"] == "FOLDER"
         and (
             entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
         )
-    ]  # deleted here, two Drive folders on this path, synced at another path or too deep: nothing below goes anywhere
+    }  # deleted here, two Drive folders on this path, synced at another path or too deep: nothing below goes anywhere
+
+    def at_or_below_trashed(path):
+        # One set lookup per parent: a scan of every trashed folder for each local path was quadratic
+        return bool(trashed_remote) and (path in trashed_remote or not trashed_remote.isdisjoint(path.parents))
 
     def gone_from_both_sides(path, remote):
         return (
             path_is_in_scope(path, scopes)
             and path not in remote
-            and not any(path == trashed or trashed in path.parents for trashed in trashed_remote)
+            and not at_or_below_trashed(path)
             and not os.path.lexists(destination_root / path)
         )
 
@@ -3493,7 +3497,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                     with contextlib.suppress(OSError):
                         child.unlink()  # left by a killed run (kill -9, power cut): ours, never complete
                 continue
-            if any(relative_path == trashed or trashed in relative_path.parents for trashed in trashed_remote):
+            if at_or_below_trashed(relative_path):
                 continue  # deleted here; Drive's copy goes to the Drive trash
 
             if child.is_dir():
