@@ -4171,6 +4171,19 @@ def in_sync(plan):
     return not has_actions(plan) and not any(entry["status"] == "CONFLICT" for entry in plan)
 
 
+def entry_size(entry):
+    """The size a preview row shows: what is sent for an upload (your file), else Drive's."""
+    if entry["kind"] != "FILE":
+        return ""
+    if entry["status"] in UPLOADS:
+        try:
+            return human_size(entry["destination"].stat().st_size)
+        except (KeyError, OSError):
+            return ""  # gone since the plan was made: apply_plan reports it as an error
+    item = entry.get("item")
+    return display_size(item) if item is not None else ""
+
+
 def print_plan(plan, destination_root):
     shown = [entry for entry in plan if VERBOSE or entry["status"] != "UNCHANGED"]
     hidden = len(plan) - len(shown)
@@ -4189,8 +4202,7 @@ def print_plan(plan, destination_root):
                 path += f"  [dim]{escape(duplicate_label(entry))}[/]"
             elif entry.get("unreadable"):
                 path += f"  [dim]{UNREADABLE_LABEL}[/]"
-            item = entry.get("item")
-            size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
+            size = entry_size(entry)
             table.add_row(terminal_text(style, label), path, size if size != "-" else "")
         console.print()
         console.print(table)
@@ -4539,8 +4551,7 @@ class PreviewScreen(Screen):
         for entry in rows:
             style, label, _ = STATUS_STYLES[entry["status"]]
             path = printable(entry["relative_path"].as_posix()) + ("/" if entry["kind"] == "FOLDER" else "")
-            item = entry.get("item")
-            size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
+            size = entry_size(entry)
             suffix = ""
             if entry["status"] == "KEEP_BOTH":
                 suffix = f"  (yours → {printable(entry['local_copy'].name)})"

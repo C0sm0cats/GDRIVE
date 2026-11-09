@@ -1490,6 +1490,21 @@ class SyncTest(unittest.TestCase):
         self.assertEqual({item["name"] for item in self.drive.items.values()}, names_before)
         self.assertEqual((self.root / os.fsdecode(b"Docs/caf\xe9.txt")).read_bytes(), b"latin-1 name")
 
+    def test_preview_shows_the_size_of_what_is_sent(self):
+        # bugs 47: a "↑ changed" row showed the size of the Drive version it replaces, a "↑ new" row none.
+        self.run_sync()
+        (self.root / "Photos/beach.jpg").write_bytes(b"x" * 3_000_000)  # retouched here: 4 B -> 3 MB
+        (self.root / "Docs/a.txt").write_bytes(b"")  # emptied here
+        (self.root / "draft.txt").write_bytes(b"d" * 1500)
+        plan, _ = self.preview()
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200)):
+            savegdrive.print_plan(plan, self.root)
+        rows = {line.split()[2]: line.split()[3:] for line in output.getvalue().splitlines()
+                if line.startswith("↑")}
+        self.assertEqual(rows, {"Docs/a.txt": ["0", "B"], "Photos/beach.jpg": ["3.0", "MB"],
+                                "draft.txt": ["1.5", "KB"]})
+
     def test_synced_folder_replaced_by_a_symlink_is_a_conflict_not_half_synced(self):
         # bugs 39: Photos moved to another disk, a link left in its place. Before, new files there were never
         # sent and deletions on Drive never came down, but downloads and deletions here went through the link.
@@ -4255,6 +4270,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(table.get_row_at(0)[1].plain,
                              f"{path}  (yours → Copy (local).docx)")
+
+    async def test_preview_size_column_shows_the_local_file_for_an_upload(self):
+        # bugs 47: the SIZE cell of an upload came from the Drive item, the version being replaced.
+        (self.root / "beach.jpg").write_bytes(b"x" * 5_000_000)
+        (self.root / "new.txt").write_bytes(b"n" * 1500)
+        plan = [
+            {"status": "UPLOAD", "relative_path": Path("beach.jpg"), "kind": "FILE",
+             "item": {"name": "beach.jpg", "size": "4"}, "destination": self.root / "beach.jpg"},
+            {"status": "UPLOAD_NEW", "relative_path": Path("new.txt"), "kind": "FILE",
+             "item": None, "destination": self.root / "new.txt"},
+            {"status": "NEW", "relative_path": Path("down.txt"), "kind": "FILE",
+             "item": {"name": "down.txt", "size": "2000"}, "destination": self.root / "down.txt"},
+        ]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#preview-table")
+            sizes = {table.get_row_at(index)[1].plain: table.get_row_at(index)[-1].plain
+                     for index in range(table.row_count)}
+        self.assertEqual(sizes, {"beach.jpg": "5.0 MB", "new.txt": "1.5 KB", "down.txt": "2.0 KB"})
 
     async def test_preview_survives_a_file_to_send_deleted_after_the_plan(self):
         (self.root / "kept.txt").write_bytes(b"x" * 7)
