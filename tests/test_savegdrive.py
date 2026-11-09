@@ -3483,6 +3483,13 @@ class SyncTest(unittest.TestCase):
         (self.root / "notes.txt").write_bytes(b"notes")
         statuses, _ = self.run_sync()
         self.assertEqual(statuses["notes.txt"], "UNCHANGED")
+        # tests 48: the adopted copy is tracked, so deleting it on Drive trashes it here instead of sending it back.
+        del self.drive.items["n"]
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["notes.txt"], "TRASH_LOCAL")
+        self.assertEqual(results["FILE_TRASH_LOCAL"], 1)
+        self.assertFalse((self.root / "notes.txt").exists())
+        self.assertEqual(self.drive.uploads, [])
 
     def test_first_sync_different_file_is_a_conflict(self):
         (self.root / "notes.txt").write_bytes(b"my own notes")
