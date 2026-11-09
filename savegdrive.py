@@ -2051,6 +2051,7 @@ class DriveSelectorApp(App):
         self.last_sync = None  # the plan of the last selection, checked in the background at start
         self.last_sync_text = None
         self.last_sync_round = 0
+        self.last_sync_error = False  # the last check failed: s checks again
         self.account = account
         self.views = views
         self.view = view if view in views else views[0]
@@ -2144,6 +2145,7 @@ class DriveSelectorApp(App):
 
     def check_last_sync(self):
         self.last_sync = None
+        self.last_sync_error = False
         state = self.state or {}
         if self.service is None or self.destination is None or not has_last_selection(state):
             self.last_sync_text = None
@@ -2207,7 +2209,9 @@ class DriveSelectorApp(App):
 
     def last_sync_failed(self, round_, message):
         if round_ == self.last_sync_round:
-            self.last_sync_text = Text(f"Could not check your last selection: {message}", style="red")
+            self.last_sync_error = True
+            self.last_sync_text = Text(f"Could not check your last selection: {message} (press s to try again)",
+                                       style="red")
             self.update_notice()
 
     def update_notice(self):
@@ -2220,6 +2224,10 @@ class DriveSelectorApp(App):
 
     def action_review_last(self):
         if self.busy:
+            return
+        if self.last_sync is None and self.last_sync_error:
+            self.notify("Checking your last selection again…")
+            self.check_last_sync()
             return
         if self.last_sync is None:
             self.notify("Your last selection is still being checked, or there is none yet.", severity="warning")

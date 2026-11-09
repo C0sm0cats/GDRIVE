@@ -3490,6 +3490,44 @@ class SyncTest(unittest.TestCase):
         self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
         self.drive.change("b")
 
+    def test_s_after_a_failed_check_checks_again(self):
+        # ux 10: the check at start failed; s says so and checks again instead of "still being checked".
+        import asyncio
+        self.conflict_after_docs_sync()
+        failing = [True]
+        last_selection = savegdrive.last_selection
+
+        def flaky_last_selection(*args, **kwargs):
+            if failing[0]:
+                raise RuntimeError("network down")
+            return last_selection(*args, **kwargs)
+
+        async def fail_then_s():
+            app = savegdrive.DriveSelectorApp([savegdrive.DriveView("My Drive", "root")], self.root,
+                                              savegdrive.load_state(self.root), self.drive, None, {},
+                                              skip_preview=True)
+            savegdrive.load_view(self.drive, app.views[0], app.cache)
+            with mock.patch.object(savegdrive, "last_selection", flaky_last_selection):
+                async with app.run_test(size=(140, 30), notifications=True) as pilot:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    failed_line = app.last_sync_text.plain
+                    self.assertIsNone(app.last_sync)
+                    failing[0] = False
+                    await pilot.press("s")
+                    await pilot.pause()
+                    toasts = [toast.render().plain for toast in app.screen.query(Toast)]
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    return failed_line, toasts, app.last_sync
+
+        failed_line, toasts, last_sync = asyncio.run(fail_then_s())
+        self.assertIn("network down", failed_line)
+        self.assertIn("press s to try again", failed_line)
+        self.assertFalse(any("still being checked" in toast for toast in toasts))
+        self.assertTrue(any("Checking your last selection again" in toast for toast in toasts))
+        self.assertIsNotNone(last_sync)
+
     def test_keep_both_option_in_the_tree_s_and_again(self):
         # tests 42: --keep-both turns every conflict into KEEP_BOTH on each path: tree, s at start, --again.
         import asyncio
