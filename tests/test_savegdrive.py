@@ -298,6 +298,15 @@ class ListingTest(unittest.TestCase):
             savegdrive.list_folders(drive, ["docs"], cache)
         self.assertEqual(len(cache["docs"]), 4)
 
+    def test_gives_up_after_retries(self):
+        drive = demo_drive()
+        drive.failures["docs"] = [http_error(503) for _ in range(10)]
+        with mock.patch.object(savegdrive.time, "sleep"):
+            with self.assertRaises(HttpError):
+                savegdrive.list_folders(drive, ["docs"], {})
+        # One first try plus API_RETRIES retries, not one more.
+        self.assertEqual(len(drive.failures["docs"]), 10 - 1 - savegdrive.API_RETRIES)
+
     def test_raises_other_errors(self):
         drive = demo_drive()
         drive.failures["docs"] = [http_error(404)]
