@@ -3070,6 +3070,30 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
+    def test_keep_both_failed_download_puts_your_version_back(self):
+        # tests 13: the download of Drive's version fails after yours stepped aside as "b (local).txt".
+        self.run_sync()
+        (self.root / "Docs/b.txt").write_bytes(b"edited locally")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
+        plan, state = self.preview()
+        conflict = next(entry for entry in plan if entry["relative_path"].as_posix() == "Docs/b.txt")
+        self.assertEqual(conflict["status"], "CONFLICT")
+        savegdrive.set_keep_both(plan, [conflict], True)
+
+        def failing_fetch(service, item, file_handle, stop=None):
+            if savegdrive.effective_id(item) == "b":
+                file_handle.write(b"partial")
+                raise OSError("network down")
+            fake_fetch(service, item, file_handle, stop)
+
+        with mock.patch.object(savegdrive, "fetch_media", failing_fetch):
+            results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 1)
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"edited locally")
+        self.assertFalse(os.path.lexists(self.root / "Docs/b (local).txt"))
+        self.assertEqual(sorted(path.name for path in (self.root / "Docs").iterdir() if "b" in path.name),
+                         ["b.txt"])
+
     def test_keep_both_never_overwrites_the_copy_kept_last_time(self):
         self.run_sync()
         (self.root / "Docs/b (local).txt").write_bytes(b"kept last time")  # an earlier keep both
