@@ -1093,6 +1093,19 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertEqual(self.drive.uploads, [])
 
+    def test_edited_here_deleted_on_drive_in_read_only_folder_is_kept(self):
+        # The only copy of the edit is here: it cannot go up, so it must not go to the system trash either.
+        self.drive.items["docs"]["capabilities"] = {"canAddChildren": False, "canTrash": True, "canEdit": True}
+        self.run_sync()
+        (self.root / "Docs/a.txt").write_bytes(b"edited here")
+        del self.drive.items["a"]
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"edited here")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual(results["FILE_ERROR"], 0)
+        self.assertEqual(self.drive.uploads, [])
+
     def test_local_symlinks_are_never_followed(self):
         # Links to places outside the synced folder (~/Documents, ~, a secret) never send anything to Drive.
         outside = Path(self.temp.name) / "outside"
