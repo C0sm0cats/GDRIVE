@@ -1499,6 +1499,8 @@ KEYS = {
         ]),
     ]),
 }
+# --help is read in 80-column terminals: its hand-made lines stop 2 columns short.
+HELP_WIDTH = 78
 KEY_HELP_NOTE = (
     "Nothing changes, here or on Drive, before you confirm: y in the preview, or the question of x, r and "
     "shift+t. The mouse works too: click to move, click a folder's arrow to unfold it."
@@ -1513,17 +1515,25 @@ MARKS = {
 }
 
 
+def help_row(key, description):
+    """One --help row, wrapped under its description so it fits in 80 columns."""
+    wrapped = textwrap.wrap(description, HELP_WIDTH - 13) or [""]
+    return [f"  {key:<11}{wrapped[0]}"] + [" " * 13 + line for line in wrapped[1:]]
+
+
 def help_lines():
     """The ? help as plain lines, for --help."""
     lines = []
     for title, groups in KEYS.values():
         lines.append(f"{title.lower()}:")
         for _, keys in groups:
-            lines += [f"  {key:<11}{description}" for key, _, description in keys]
+            for key, _, description in keys:
+                lines += help_row(key, description)
         lines.append("")
     lines.append("marks (since the last sync):")
-    lines += [f"  {symbol:<11}{description}" for symbol, _, description in MARKS.values()]
-    return lines + [""] + ["  " + line for line in textwrap.wrap(KEY_HELP_NOTE, 76)]
+    for symbol, _, description in MARKS.values():
+        lines += help_row(symbol, description)
+    return lines + [""] + ["  " + line for line in textwrap.wrap(KEY_HELP_NOTE, HELP_WIDTH - 2)]
 
 
 def help_text():
@@ -5703,12 +5713,13 @@ def no_previous_selection(destination):
 def main():
     parser = argparse.ArgumentParser(
         prog="savegdrive",
-        description=(
-            "Sync Google Drive folders and files with a local folder, both ways. Pick them in a\n"
-            "terminal tree, review the preview, then confirm. A file changed on both sides is a\n"
-            "conflict, never overwritten, and nothing is deleted for good: what you delete on one\n"
-            "side goes to the trash of the other (the Drive trash, or your system trash). The tree\n"
-            "also moves items to the Drive trash; the Trash view restores, deletes or empties it."
+        description=textwrap.fill(
+            "Sync Google Drive folders and files with a local folder, both ways. Pick them in a "
+            "terminal tree, review the preview, then confirm. A file changed on both sides is a "
+            "conflict, never overwritten, and nothing is deleted for good: what you delete on one "
+            "side goes to the trash of the other (the Drive trash, or your system trash). The tree "
+            "also moves items to the Drive trash; the Trash view restores, deletes or empties it.",
+            HELP_WIDTH,
         ),
         epilog="keys:\n" + "\n".join(help_lines()),
         formatter_class=argparse.RawDescriptionHelpFormatter,

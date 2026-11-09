@@ -4822,6 +4822,23 @@ class KeyListTest(unittest.TestCase):
         for title, _ in savegdrive.KEYS.values():
             self.assertIn(title.lower(), lines)
 
+    def test_help_fits_in_80_columns_with_wrapped_rows_under_their_description(self):
+        # design 7: an 80-column terminal cut --help mid-word and sent key descriptions back to column 0.
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["savegdrive", "--help"]), \
+                mock.patch.dict(os.environ, {"COLUMNS": "80"}), \
+                mock.patch.object(sys, "stdout", output), self.assertRaises(SystemExit):
+            savegdrive.main()
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line for line in lines if len(line) > 80], [])
+        self.assertIn("Pick them in a terminal tree", " ".join(output.getvalue().split()))
+        _, _, description = savegdrive.MARKS["conflict"]
+        row = savegdrive.help_row("!", description)
+        self.assertGreater(len(row), 1)
+        self.assertTrue(row[0].startswith("  !          "))
+        self.assertTrue(all(line.startswith(" " * 13) and line[13] != " " for line in row[1:]))
+        self.assertEqual(" ".join(line[13:] for line in row), description)
+
 
 class SelectorTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
