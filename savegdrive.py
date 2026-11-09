@@ -2693,10 +2693,16 @@ class DriveSelectorApp(App):
         entry = self.current_entry()
         if entry is None:
             return
-        if open_quietly(drive_url(entry["item"])):
-            self.notify(f"Opened {printable(entry['item']['name'])} in your browser.", markup=False)
+        # A launched opener does not prove a browser opened (xdg-open over SSH): always show the URL
+        url = drive_url(entry["item"])
+        if open_quietly(url):
+            self.notify(
+                f"Opening {printable(entry['item']['name'])} in your browser: {url}",
+                markup=False,
+                timeout=30,
+            )
         else:
-            self.notify("Could not open a browser.", severity="error")
+            self.notify(f"Could not open a browser. Open {url}", severity="error", markup=False, timeout=30)
 
     def action_change_destination(self):
         if self.busy:

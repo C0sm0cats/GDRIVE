@@ -5465,7 +5465,7 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(savegdrive, "open_quietly", return_value=True):
                 await pilot.press("o")
             await pilot.pause()
-            self.assertIn(f"Opened {name} in your browser.", toasts())
+            self.assertIn(f"Opening {name} in your browser: https://drive.google.com/file/d/n/view", toasts())
 
             await pilot.press("x")
             self.assertIn(f"Move “{name}” to the Google Drive trash?", question())
@@ -5481,6 +5481,30 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape", "x")
             self.assertIn(f"Delete “{name}” forever from Google Drive?", question())
             await pilot.press("escape", "q")
+
+    async def test_open_in_drive_always_shows_the_address(self):
+        # A launched opener (xdg-open with no browser, a failing $BROWSER) proves nothing was opened
+        drive = demo_drive()
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        tree = lambda: app.query_one(Tree)  # noqa: E731
+        url = "https://drive.google.com/file/d/n/view"
+
+        def toasts():
+            return " ".join(toast.render().plain for toast in app.screen.query(Toast))
+
+        async with app.run_test(size=(140, 30), notifications=True) as pilot:
+            while (tree().cursor_node.data or {}).get("item", {}).get("id") != "n":
+                await pilot.press("down")
+            for opened in (True, False):
+                with mock.patch.object(savegdrive, "open_quietly", return_value=opened) as opener:
+                    await pilot.press("o")
+                await pilot.pause()
+                opener.assert_called_once_with(url)
+                self.assertIn(url, toasts())
+                self.assertNotIn("Opened", toasts())
+                app.clear_notifications()
+                await pilot.pause()
 
     async def test_restore_ignores_the_selection_of_other_views(self):
         drive = demo_drive()
