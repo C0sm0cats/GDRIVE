@@ -1057,6 +1057,52 @@ class UploadTest(unittest.TestCase):
                 savegdrive.upload_file(service, path, file_id="a", stop=stop)
 
 
+class DownloadTest(unittest.TestCase):
+    def test_download_request_exports_google_files_and_gets_others(self):
+        service = mock.Mock()
+        files = service.files.return_value
+        savegdrive.download_request(service, {"id": "d1", "mimeType": DOC})
+        files.export_media.assert_called_once_with(
+            fileId="d1", mimeType=savegdrive.EXPORT_FORMATS[DOC][0]
+        )
+        files.get_media.assert_not_called()
+
+        files.reset_mock()
+        shortcut = {
+            "id": "s1",
+            "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+            "shortcutDetails": {"targetId": "d2", "targetMimeType": DOC},
+        }
+        savegdrive.download_request(service, shortcut)
+        files.export_media.assert_called_once_with(
+            fileId="d2", mimeType=savegdrive.EXPORT_FORMATS[DOC][0]
+        )
+        files.get_media.assert_not_called()
+
+        files.reset_mock()
+        savegdrive.download_request(service, {"id": "f1", "mimeType": "image/jpeg"})
+        files.get_media.assert_called_once_with(fileId="f1", supportsAllDrives=True)
+        files.export_media.assert_not_called()
+
+    def test_fetch_media_reads_every_chunk(self):
+        chunks = [b"aaa", b"bbb", b"cc"]
+
+        class Downloader:
+            def __init__(self, file_handle, request, chunksize):
+                self.file_handle = file_handle
+                self.calls = 0
+
+            def next_chunk(self, num_retries=0):
+                self.file_handle.write(chunks[self.calls])
+                self.calls += 1
+                return None, self.calls == len(chunks)
+
+        handle = io.BytesIO()
+        with mock.patch.object(savegdrive, "MediaIoBaseDownload", Downloader):
+            savegdrive.fetch_media(mock.Mock(), {"id": "f1", "mimeType": "image/jpeg"}, handle)
+        self.assertEqual(handle.getvalue(), b"aaabbbcc")
+
+
 class SignInTest(unittest.TestCase):
     def test_read_only_token_asks_for_full_access(self):
         with tempfile.TemporaryDirectory() as temp:
