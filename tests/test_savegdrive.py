@@ -2325,11 +2325,15 @@ class SyncTest(unittest.TestCase):
             file_handle.write(b"partial")
             raise KeyboardInterrupt
 
+        # The local copy being updated must stay intact: only the .part file is written and removed.
+        (self.root / "x.txt").write_bytes(b"old")
         entry = {"destination": self.root / "x.txt", "item": self.drive.items["a"]}
         with mock.patch.object(savegdrive, "fetch_media", interrupted):
             with self.assertRaises(KeyboardInterrupt):
                 savegdrive.download_file_atomically(self.drive, entry)
-        self.assertEqual(sorted(path.name for path in self.root.iterdir()), [savegdrive.STATE_FILE_NAME])
+        self.assertEqual((self.root / "x.txt").read_bytes(), b"old")
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()),
+                         sorted([savegdrive.STATE_FILE_NAME, "x.txt"]))
 
     def interrupted_while_reading_the_first_result(self):
         """Ctrl+C while the loop reads the first finished transfer: the others are finished but not read yet."""
