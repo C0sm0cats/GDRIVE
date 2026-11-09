@@ -1536,6 +1536,34 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
 
+    async def test_x_on_a_shortcut_trashes_the_shortcut(self):
+        drive = demo_drive()
+        drive.items["link"] = {"id": "link", "name": "Link", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                               "parent": "root",
+                               "shortcutDetails": {"targetId": "docs", "targetMimeType": FOLDER}}
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        tree = lambda: app.query_one(Tree)  # noqa: E731
+        async with app.run_test() as pilot:
+            await pilot.press("down", "down")
+            self.assertEqual(tree().cursor_node.data["item"]["id"], "link")
+            await pilot.press("x")
+            self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+            await pilot.press("y")
+            await self.wait(app, pilot)
+            self.assertTrue(drive.items["link"]["trashed"])  # the shortcut, not its target
+            self.assertNotIn("trashed", drive.items["docs"])
+
+            await pilot.press("shift+tab")  # Trash view
+            await self.wait(app, pilot)
+            self.assertEqual([node.data["item"]["name"] for node in tree().root.children], ["Link"])
+            await pilot.press("down", "x", *"delete", "enter")
+            await self.wait(app, pilot)
+            self.assertNotIn("link", drive.items)
+            self.assertIn("docs", drive.items)  # the shared folder and its content stay
+            self.assertIn("a", drive.items)
+            await pilot.press("q")
+
     async def test_cancelled_drive_questions_change_nothing(self):
         drive = demo_drive()
         drive.items["a"]["trashed"] = True
