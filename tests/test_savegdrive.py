@@ -1669,6 +1669,27 @@ class SyncTest(unittest.TestCase):
         )
         self.assertEqual(scopes, [Path()])
 
+    def test_again_with_whole_shared_with_me_takes_new_shares(self):
+        # A cron --again on all of Shared with me: a new share lives in its owner's folder, never in the snapshot.
+        shared = savegdrive.SHARED_WITH_ME
+        self.drive.items["s"] = file_item("s", "from Ann.pdf", "ann", b"pdf", shared=True)
+        cache = {}
+        token = savegdrive.start_page_token(self.drive)
+        savegdrive.prefetch_folders(self.drive, [shared], cache)
+        savegdrive.save_snapshot(self.root, token, cache, [shared])
+        self.assertIn(shared, savegdrive.load_snapshot(self.root)["folders"])
+
+        self.drive.items["s2"] = file_item("s2", "from Bob.pdf", "bob", b"pdf", shared=True)
+        self.drive.change("s2")
+        replayed, _ = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
+        state = {"last_selection": {"roots": [{"id": shared, "base": savegdrive.SHARED_WITH_ME_DIR}],
+                                    "items": [], "scopes": [savegdrive.SHARED_WITH_ME_DIR]}}
+        selections, _ = savegdrive.last_selection(self.drive, state, replayed)
+        self.assertEqual(
+            sorted(savegdrive.selected_path(entry).name for entry in selections),
+            ["from Ann.pdf", "from Bob.pdf"],
+        )
+
     def test_changes_replay_matches_a_fresh_listing(self):
         cache = {}
         token = savegdrive.start_page_token(self.drive)
