@@ -4579,9 +4579,10 @@ def set_remote_mtime(destination, item):
 def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: None, check=None):
     """Download to a temporary file, then put it in place; check() runs just before and may refuse (OSError)."""
     destination = entry["destination"]
-    temporary = destination.with_name(
-        f".{destination.name}{PART_SUFFIX}"
-    )
+    # A short name, whatever the length of the file's: ".<name>.savegdrive.part" would not fit for names of
+    # 239 to 255 bytes (Errno 36). One per destination, in the same folder so os.replace stays atomic.
+    name_hash = hashlib.sha256(os.fsencode(destination.name)).hexdigest()[:16]
+    temporary = destination.with_name(f".{name_hash}{PART_SUFFIX}")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     try:

@@ -3096,6 +3096,17 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(left.exists())
         self.assertNotIn(f"Docs/{left.name}", statuses)
 
+    def test_drive_name_near_the_255_byte_limit_comes_down(self):
+        # bugs 16: ".<name>.savegdrive.part" is 17 bytes longer than the name: 239 to 255 bytes failed (Errno 36)
+        name = "会議録" * 27 + ".pdf"  # 247 bytes in UTF-8
+        self.drive.items["long"] = file_item("long", name, "docs", b"minutes")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses[f"Docs/{name}"], "NEW")
+        self.assertEqual((self.root / "Docs" / name).read_bytes(), b"minutes")
+        self.assertEqual(list(self.root.rglob(f"*{savegdrive.PART_SUFFIX}")), [])
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses[f"Docs/{name}"], "UNCHANGED")
+
     def test_same_content_changed_on_both_sides_is_not_a_conflict(self):
         self.run_sync()
         # Sent and downloaded, but the state could not be written (disk full): both sides look changed.
