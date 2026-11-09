@@ -761,6 +761,25 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
         self.assertEqual(self.drive.uploads, [])
 
+    def test_printed_preview_names_options_not_tree_keys(self):
+        # ux 4: with --again --yes (cron), no key is read: the printed notes must name --keep-both, and say
+        # that o works in the tree only. The tree's preview keeps its keys.
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha from Drive"))
+        (self.root / "Docs/a.txt").write_bytes(b"alpha from here")
+        self.drive.items["w"] = file_item("w", "Report.docx", "docs", b"word")
+        plan, _ = self.preview()
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)):
+            savegdrive.print_plan(plan, self.root)
+        printed = " ".join(output.getvalue().split())
+        self.assertIn("Conflicts are left as they are (--keep-both: keep both versions).", printed)
+        self.assertIn("rename one on Drive (in the tree, o opens it).", printed)
+        self.assertNotIn("shift+b", printed)
+        tree = " ".join(savegdrive.plan_notes(plan))
+        self.assertIn("(b: keep both versions of this one, shift+b: of all)", tree)
+        self.assertIn("rename one on Drive (o opens it).", tree)
+
     def test_same_names_at_the_top_of_my_drive_are_conflicts(self):
         # Two "Untitled document"s, and a folder and a file both named "notes.txt": none is dropped
         # from the plan or synced with the other's content.

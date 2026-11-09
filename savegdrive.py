@@ -4229,7 +4229,7 @@ def print_plan(plan, destination_root):
     space, fits = space_line(plan, destination_root)
     if space:
         console.print(f"[dim]{space}[/]" if fits else f"[bold red]! {space}: not enough disk space[/]")
-    for note in plan_notes(plan):
+    for note in plan_notes(plan, terminal=True):
         console.print(f"[dim]{note}[/]")
     console.print(f"[dim]Destination:[/] {escape(str(destination_root))}")
 
@@ -4311,16 +4311,19 @@ def needs_deletion_check(plan, state):
     return count > MASS_DELETION_FILES or (count > MASS_DELETION_MIN and synced and count > synced * MASS_DELETION_SHARE)
 
 
-def plan_notes(plan):
+def plan_notes(plan, terminal=False):
+    """The notes under the preview. terminal: printed by print_plan, where no key of the tree is read."""
     statuses = {entry["status"] for entry in plan}
     notes = []
+    opens = "(in the tree, o opens it)" if terminal else "(o opens it)"
+    keep_both = "--keep-both: keep both versions" if terminal else "b: keep both versions of this one, shift+b: of all"
     if any(
         entry["status"] == "CONFLICT" and not entry.get("duplicate") and not entry.get("symlink")
         and not entry.get("view_name") and not entry.get("unreadable")
         for entry in plan
     ):
         notes.append(
-            "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
+            f"Conflicts are left as they are ({keep_both}). "
             "A file you cannot edit on Drive (a Google Doc export, a file shared read only) and changed here is a "
             "conflict too: it never goes back to Drive."
         )
@@ -4344,7 +4347,7 @@ def plan_notes(plan):
     if any(entry.get("duplicate") for entry in plan):
         notes.append(
             "Several Drive items get one local name (the same name, a Google Doc next to its .docx, "
-            "a / turned into _...): none of them syncs until you rename one on Drive (o opens it)."
+            f"a / turned into _...): none of them syncs until you rename one on Drive {opens}."
         )
     if any(entry.get("numbered") for entry in plan):
         notes.append(
@@ -4385,7 +4388,7 @@ def plan_notes(plan):
         names = " or ".join(f"'{name}'" for name in sorted(path.as_posix() for path in VIEW_NAME_PATHS))
         notes.append(
             f"A Drive item at the top named like a view ({names}) would share that view's local folder: "
-            "nothing syncs in it, and what is on your disk there is left as it is. Rename it on Drive (o opens it)."
+            f"nothing syncs in it, and what is on your disk there is left as it is. Rename it on Drive {opens}."
         )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
