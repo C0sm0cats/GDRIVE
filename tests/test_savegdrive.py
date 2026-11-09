@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3439,6 +3440,66 @@ class SignInTest(unittest.TestCase):
         self.assertIs(result, sign_in.return_value)
         self.assertIn("session expired", sign_in.call_args[0][0])
         self.assertEqual(token, "{}")
+
+    def test_saved_token_is_private_and_kept_when_the_write_fails(self):
+        # security 7: token.json carries a full-Drive refresh token, so only its owner may read it.
+        # bugs 42: a failed write (disk full) must leave the previous token.json as it was.
+        from google.auth.exceptions import RefreshError
+        old_umask = os.umask(0o022)
+        try:
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            token = Path(temp.name) / "token.json"
+            token.write_text('{"token": "t", "refresh_token": "r", "client_id": "c", "client_secret": "s", '
+                             '"scopes": ["https://www.googleapis.com/auth/drive"], "expiry": "2000-01-01T00:00:00Z"}')
+            token.chmod(0o644)  # a token.json saved by an earlier version
+            with mock.patch.object(savegdrive, "TOKEN_PATH", token), \
+                    mock.patch.object(savegdrive.Credentials, "refresh", side_effect=RefreshError("invalid_grant")), \
+                    mock.patch.object(savegdrive, "console", Console(file=io.StringIO())), \
+                    mock.patch.object(sys.stdin, "isatty", lambda: True), \
+                    mock.patch.object(savegdrive, "sign_in", return_value=mock.Mock(to_json=lambda: "{}")):
+                savegdrive.authenticate()
+            self.assertEqual(token.read_text(), "{}")
+            self.assertEqual(stat.S_IMODE(token.stat().st_mode), 0o600)
+            token.unlink()
+            savegdrive.save_token(mock.Mock(to_json=lambda: '{"token": "new"}'), token)
+            self.assertEqual(token.read_text(), '{"token": "new"}')
+            self.assertEqual(stat.S_IMODE(token.stat().st_mode), 0o600)
+            savegdrive.save_token(mock.Mock(to_json=lambda: '{"token": "newer"}'), token)
+            self.assertEqual(stat.S_IMODE(token.stat().st_mode), 0o600)
+            # A lone surrogate cannot be encoded: the write fails after the file is opened, like ENOSPC.
+            with self.assertRaises(UnicodeEncodeError):
+                savegdrive.save_token(mock.Mock(to_json=lambda: '{"token": "\udc80"}'), token)
+            self.assertEqual(token.read_text(), '{"token": "newer"}')
+            self.assertEqual(sorted(path.name for path in Path(temp.name).iterdir()), ["token.json"])
+        finally:
+            os.umask(old_umask)
+
+    def test_unreadable_token_signs_in_again_and_names_the_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        token = Path(temp.name) / "token.json"
+        token.write_text("")  # left empty by a write that failed in an older version
+        for isatty in (False, True):
+            with self.subTest(isatty=isatty):
+                output = io.StringIO()
+                new = mock.Mock(to_json=lambda: "{}")
+                with mock.patch.object(savegdrive, "TOKEN_PATH", token), \
+                        mock.patch.object(savegdrive, "console", Console(file=output, width=200)), \
+                        mock.patch.object(sys.stdin, "isatty", lambda: isatty), \
+                        mock.patch.object(savegdrive, "sign_in", return_value=new) as sign_in:
+                    try:
+                        result = savegdrive.authenticate()
+                    except SystemExit as error:
+                        result = error
+                if isatty:
+                    self.assertIs(result, new)
+                    self.assertIn("token.json", sign_in.call_args[0][0])
+                    self.assertEqual(token.read_text(), "{}")
+                else:
+                    sign_in.assert_not_called()
+                    self.assertIsInstance(result, SystemExit)
+                    self.assertIn("token.json", output.getvalue())
 
 
 class KeyListTest(unittest.TestCase):

@@ -236,11 +236,37 @@ def sign_in_or_exit(reason, needed):
     return sign_in(reason)
 
 
+def save_token(creds, path=None):
+    """Write the token readable by its owner only, and atomically: a failed write keeps the old one."""
+    path = path or TOKEN_PATH
+    temporary = path.with_name(f"{path.name}.tmp")
+    text = creds.to_json()
+    try:
+        temporary.unlink(missing_ok=True)  # O_CREAT keeps the mode of a file already there
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def authenticate():
     creds = None
     if TOKEN_PATH.exists():
-        # Without scopes given, the credentials keep the ones the token was granted.
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        try:
+            # Without scopes given, the credentials keep the ones the token was granted.
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        except ValueError as error:
+            # Empty or damaged (a write cut short): the session is lost, sign in again.
+            debug(f"Could not read {TOKEN_PATH}: {error}")
+            creds = sign_in_or_exit(
+                f"Could not read the saved Google Drive session ({TOKEN_PATH.name}), sign in again in your browser.",
+                f"Could not read the saved Google Drive session in {escape(str(TOKEN_PATH))}.",
+            )
+            save_token(creds)
+            return creds
         if not creds.has_scopes(SCOPES):
             # A token from the read-only versions: Google must ask again for the wider access.
             debug("Saved token lacks the full Drive scope")
@@ -248,7 +274,7 @@ def authenticate():
                 "SaveGDrive now syncs both ways: allow full Drive access in your browser.",
                 "SaveGDrive now syncs both ways and needs full Drive access.",
             )
-            TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            save_token(creds)
             return creds
 
     if not creds or not creds.valid:
@@ -278,7 +304,7 @@ def authenticate():
                     )
         else:
             creds = sign_in_or_exit("Sign in to Google Drive in your browser.", "Not signed in to Google Drive.")
-        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+        save_token(creds)
 
     return creds
 
