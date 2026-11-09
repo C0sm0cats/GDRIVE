@@ -3335,6 +3335,21 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Errno", output.getvalue())
         self.assertFalse(target.parent.exists())
 
+    def test_again_without_a_previous_selection_names_download_path_and_creates_nothing(self):
+        # A typo in the path, or a folder never synced (self.root: no selection yet): no folder made, no sign-in.
+        for target in (Path(self.temp.name) / "Wrok", self.root):
+            existed = target.exists()
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", ["savegdrive", "--again", "--download-path", str(target)]), \
+                    mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)), \
+                    mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")):
+                with self.assertRaises(SystemExit) as raised:
+                    savegdrive.main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn(f"No previous selection in {target}. Pass the folder you synced with "
+                          "--download-path PATH, or run once without --again.", output.getvalue())
+            self.assertEqual(target.exists(), existed)
+
     def test_folder_synced_with_my_drive_refuses_another_folder_id(self):
         self.run_sync()  # My Drive, in a folder made before the Drive root was recorded
         for folder_id in ("root", "docs", None):  # None: --again, which replays the folder's own roots

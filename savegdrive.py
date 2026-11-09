@@ -5495,13 +5495,25 @@ def result_notice(plan, results):
     return text
 
 
-def resolve_destination(path_text):
-    """The local folder: new (created), empty, or already managed by SaveGDrive."""
+def destination_path(path_text):
+    """The local folder's absolute path, nothing created."""
     destination = Path(path_text).expanduser()
     if not destination.is_absolute():
         destination = Path.cwd() / destination
-    destination = destination.parent.resolve() / destination.name
-    return initialize_managed_destination(destination)
+    return destination.parent.resolve() / destination.name
+
+
+def resolve_destination(path_text):
+    """The local folder: new (created), empty, or already managed by SaveGDrive."""
+    return initialize_managed_destination(destination_path(path_text))
+
+
+def no_previous_selection(destination):
+    console.print(
+        f"[red]✗[/] No previous selection in {escape(str(destination))}. Pass the folder you synced with "
+        "--download-path PATH, or run once without --again."
+    )
+    raise SystemExit(1)
 
 
 def main():
@@ -5572,6 +5584,13 @@ def main():
     DRIVE_ROOT = None if args.again else args.folder_id
 
     try:
+        if args.again:
+            # Checked before the folder is created and before signing in: a typo or a folder never synced.
+            candidate = destination_path(args.download_path)
+            if not holds_state(candidate) or (
+                has_valid_state(candidate) and not has_last_selection(load_state(candidate))
+            ):
+                no_previous_selection(candidate)
         try:
             destination_root = resolve_destination(args.download_path)
         except (OSError, ValueError) as error:
@@ -5593,11 +5612,7 @@ def main():
         if args.again:
             state = load_state(destination_root)
             if not has_last_selection(state):
-                console.print(
-                    f"[red]✗[/] No previous selection in {escape(str(destination_root))}: "
-                    "run once without --again."
-                )
-                raise SystemExit(1)
+                no_previous_selection(destination_root)
             with console.status("[dim]Checking Drive changes…[/]"):
                 snapshot = load_snapshot(destination_root)
                 replayed = apply_changes(service, snapshot) if snapshot else None
