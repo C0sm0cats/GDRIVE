@@ -3869,6 +3869,20 @@ class DriveCallBatchingTest(unittest.TestCase):
         self.assertEqual(len(gets), 60)
         self.assertEqual(drive.batches, [50, 10])  # every get went through a batch
 
+    def test_trash_restore_and_delete_handle_every_batch(self):
+        # A sort of more than API_BATCH_SIZE photos: no batch after the first may be skipped (tests 47).
+        ids = [f"f{index}" for index in range(60)]
+        drive = FakeDrive([file_item(item_id, f"{item_id}.jpg", "root", b"x") for item_id in ids])
+        for run, check in (
+            (savegdrive.trash_items, lambda: all(drive.items[item_id].get("trashed") for item_id in ids)),
+            (savegdrive.restore_items, lambda: not any(drive.items[item_id]["trashed"] for item_id in ids)),
+            (savegdrive.delete_items, lambda: not drive.items),
+        ):
+            drive.batches.clear()
+            self.assertEqual(run(drive, ids), {}, run.__name__)
+            self.assertTrue(check(), run.__name__)
+            self.assertEqual(drive.batches, [50, 10], run.__name__)
+
 
 class ApplyPlanPhasesTest(unittest.TestCase):
     """apply_plan's phases, each tested on its own (maint 1, maint 3)."""
