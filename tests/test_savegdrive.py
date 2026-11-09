@@ -698,6 +698,71 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
         self.assertFalse((self.root / "Photos").exists())  # left empty: removed
 
+    def test_folder_deleted_on_drive_with_changes_here_comes_back(self):
+        self.run_sync()
+        (self.root / "Photos/beach.jpg").write_bytes(b"edited here")
+        (self.root / "Photos/2026").mkdir()
+        (self.root / "Photos/2026/new.txt").write_bytes(b"made here")
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        statuses, results = self.run_sync()
+        for path in ("Photos", "Photos/beach.jpg", "Photos/2026", "Photos/2026/new.txt"):
+            self.assertEqual(statuses[path], "UPLOAD_NEW", path)
+        self.assertEqual(results["FILE_ERROR"] + results["FOLDER_ERROR"], 0)
+        names = {item["name"]: item for item in self.drive.items.values() if not item.get("trashed")}
+        self.assertEqual(names["Photos"]["parent"], "root")
+        self.assertEqual(names["beach.jpg"]["content"], b"edited here")
+        self.assertEqual(names["beach.jpg"]["parent"], names["Photos"]["id"])
+        self.assertEqual(names["new.txt"]["parent"], names["2026"]["id"])
+        self.assertEqual(names["2026"]["parent"], names["Photos"]["id"])
+        statuses, _ = self.run_sync()
+        self.assertEqual({path: status for path, status in statuses.items() if status not in {"UNCHANGED", "SKIPPED"}},
+                         {})
+
+    def test_picked_folder_renamed_on_drive_sends_the_changes_back(self):
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        by_path = {node["display_path"]: node for node in nodes}
+        selections = []
+        savegdrive.add_selected_item(selections, by_path["Docs"]["item"], by_path["Docs"]["relative_parent"])
+        state = savegdrive.load_state(self.root)
+        savegdrive.remember_selection(state, selections, savegdrive.build_local_scopes(selections, browsed))
+        self.apply(savegdrive.build_plan(self.drive, selections, [Path("Docs")], self.root, state, cache), state)
+        (self.root / "Docs/a.txt").write_bytes(b"edited here")
+        self.drive.items["docs"]["name"] = "Docs 2026"
+
+        def again():
+            state = savegdrive.load_state(self.root)
+            with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                selections, scopes = savegdrive.last_selection(self.drive, state, {})
+            plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, {})
+            statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+            return statuses, self.apply(plan, state)
+
+        statuses, _ = again()
+        self.assertEqual(statuses["Docs"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Docs/a.txt"], "UPLOAD_NEW")
+        statuses, _ = again()
+        self.assertNotIn("CONFLICT", statuses.values())
+        sent = [item for item in self.drive.items.values() if item.get("content") == b"edited here"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.drive.items[sent[0]["parent"]]["name"], "Docs")
+
+    def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
+        self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["club_photos"] = {"id": "club_photos", "name": "Photos 2026", "mimeType": FOLDER,
+                                           "parent": "club"}
+        self.run_sync()
+        self.drive.items["club"]["trashed"] = True  # x in the tree, or a colleague
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Club/Photos 2026"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Club").exists())
+        self.drive.items["club"]["trashed"] = False  # r in the Trash view
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Club"], "NEW")
+        self.assertFalse(self.drive.items["club"].get("trashed"))
+        self.assertTrue((self.root / "Club/Photos 2026").is_dir())
+
     def test_read_only_items_are_never_sent_or_trashed(self):
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False, "canTrash": True, "canEdit": True}
         for key in ["a", "b"]:
@@ -1491,7 +1556,8 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Photos/contract-signed.pdf"], "NEW")
         self.assertEqual(statuses["Docs/b.txt"], "NEW")
         self.assertEqual(statuses["notes.txt"], "UPLOAD_NEW")
-        self.assertEqual(statuses["Docs/Inbox/scan-0001.pdf"], "LOCAL_ONLY")  # kept here, not trashed
+        self.assertEqual(statuses["Docs/Inbox"], "UPLOAD_NEW")  # gone from Drive, but saved into: created again
+        self.assertEqual(statuses["Docs/Inbox/scan-0001.pdf"], "UPLOAD_NEW")  # kept here and sent, not trashed
         self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"budget v2, a colleague's work")
 
     def test_keep_both_in_a_read_only_folder_says_so(self):

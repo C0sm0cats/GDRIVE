@@ -3054,7 +3054,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         tracked_key, current_sha256 = None, None
 
         planned_stat = None
-        if kind == "FOLDER" and relative_path in synced_folders:
+        if kind == "FOLDER" and relative_path in new_folders:
+            status = "UPLOAD_NEW"  # gone from Drive, but what is in it goes up: created again
+        elif kind == "FOLDER" and relative_path in synced_folders:
             status = "TRASH_LOCAL"  # an empty folder synced before, deleted on Drive
         elif tracked_entry:
             tracked_key, record = tracked_entry
@@ -3087,6 +3089,22 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         )
         planned_local_paths.add(relative_path)
 
+    def scan_gone_folder(relative_path, directory):
+        """A folder synced before and gone from Drive. Something changed or new in it goes up (the change wins
+        over the deletion): the folder is created again on Drive. Else what is in it follows the deletion."""
+        start = len(plan)
+        maybe_sent = can_send(relative_path)
+        if maybe_sent:
+            new_folders.add(relative_path)  # its content is planned as if it were created again
+        scan_directory(relative_path, directory)
+        if maybe_sent and any(entry["status"] == "UPLOAD_NEW" for entry in plan[start:]):
+            add_local_entry(relative_path, "FOLDER")
+            plan.insert(start, plan.pop())  # listed before its content
+            return
+        new_folders.discard(relative_path)  # nothing goes up: nothing in it was planned through can_send
+        if relative_path in synced_folders and not any(directory.rglob("*")):
+            add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
+
     def scan_directory(relative_directory, directory=None):
         """directory: where relative_directory is on disk, when the disk spells it differently."""
         if directory is None:
@@ -3116,9 +3134,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 elif remote is not None:
                     scan_directory(remote, child)  # the same folder under Drive's spelling
                 elif relative_path in tracked_directories:
-                    scan_directory(relative_path, child)
-                    if relative_path in synced_folders and not any(child.rglob("*")):
-                        add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
+                    scan_gone_folder(relative_path, child)
                 else:
                     add_local_entry(relative_path, "FOLDER")
                     if relative_path in new_folders:
@@ -3132,7 +3148,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
 
     for scope in scopes:
         destination = destination_root / scope
-        if scope == Path() or destination.is_dir():
+        if scope != Path() and destination.is_dir() and scope not in remote_folders:
+            scan_gone_folder(scope, destination)  # picked before, gone from Drive (--again)
+        elif scope == Path() or destination.is_dir():
             scan_directory(scope)
         elif destination.is_file() and scope not in remote_files:
             add_local_entry(scope, "FILE")
@@ -4080,6 +4098,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 if not directory.is_dir() or any(directory.iterdir()):
                     break
                 directory.rmdir()
+                state.setdefault("folders", {}).pop(folder.as_posix(), None)  # removed by the sync, not by you
                 folder = folder.parent
     except BaseException:
         stop.set()  # running transfers stop at their next chunk; downloads remove their partial file
