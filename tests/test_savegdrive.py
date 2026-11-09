@@ -1712,6 +1712,22 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(savegdrive.is_readonly_path(Path(savegdrive.SHARED_WITH_ME_DIR) / "Team/x.txt"))
         self.assertFalse(savegdrive.is_readonly_path(Path("Docs/x.txt")))
 
+    def test_file_and_a_shortcut_to_it_both_come_down_when_it_changes_on_drive(self):
+        # tests 79: Docs/a.txt and Photos/a-link.txt -> a share one Drive id; each copy keeps its own state.
+        self.drive.items["lnk"] = {"id": "lnk", "name": "a-link.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                                   "parent": "photos",
+                                   "shortcutDetails": {"targetId": "a", "targetMimeType": "text/plain"}}
+        self.run_sync()
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Docs/a.txt"], statuses["Photos/a-link.txt"]), ("UPDATE", "UPDATE"))
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+        self.assertEqual((self.root / "Photos/a-link.txt").read_bytes(), b"alpha v2")
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Docs/a.txt"], statuses["Photos/a-link.txt"]), ("UNCHANGED", "UNCHANGED"))
+
     def test_drive_folder_named_like_a_read_only_view_is_a_conflict_not_silently_read_only(self):
         # bugs 14: a My Drive folder "Trash" or "Shared with me" shares its local folder with that view:
         # edits there were conflicts, deletions came back, new files stayed local, and nothing said why.
