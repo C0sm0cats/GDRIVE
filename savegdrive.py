@@ -2062,13 +2062,13 @@ class DriveSelectorApp(App):
         self.populate(tree_node)
         tree_node.expand()
 
-    @on(Tree.NodeExpanded)
+    @on(Tree.NodeExpanded, "#drive-tree")
     def node_expanded(self, event):
         self.populate(event.node)
         if not self.filter_terms and event.node.data is not None:
             self.expanded.add(event.node.data["index"])
 
-    @on(Tree.NodeCollapsed)
+    @on(Tree.NodeCollapsed, "#drive-tree")
     def node_collapsed(self, event):
         if not self.filter_terms and event.node.data is not None:
             self.expanded.discard(event.node.data["index"])

@@ -18,7 +18,7 @@ import savegdrive  # noqa: E402
 
 from googleapiclient.errors import HttpError  # noqa: E402
 from rich.console import Console  # noqa: E402
-from textual.widgets import Input, Static, Tree  # noqa: E402
+from textual.widgets import DirectoryTree, Input, Static, Tree  # noqa: E402
 from textual.widgets._toast import Toast  # noqa: E402
 
 FOLDER = savegdrive.FOLDER_MIME_TYPE
@@ -3363,6 +3363,28 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(savegdrive.has_valid_state(app.destination))
                 self.assertIn("Session", app.sub_title)
                 await pilot.press("q")
+
+    async def test_folding_a_directory_on_the_destination_screen_keeps_the_app_open(self):
+        (Path(self.temp.name) / "Documents").mkdir()
+        app = self.make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("down", "space")  # Docs
+            await pilot.press("f")
+            self.assertIsInstance(app.screen, savegdrive.DestinationSetupScreen)
+            directories = app.screen.query_one("#directory-tree", DirectoryTree)
+            directories.focus()
+            await pilot.pause(0.3)  # directory listing
+            directories.move_cursor(next(node for node in directories.root.children if node.label.plain == "Documents"))
+            await pilot.press("enter")  # unfold
+            await pilot.pause(0.3)
+            await pilot.press("enter")  # fold again: used to crash the whole app
+            await pilot.pause(0.3)
+            self.assertTrue(app.is_running)
+            self.assertIsInstance(app.screen, savegdrive.DestinationSetupScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.selected(app), ["Docs"])
+            await pilot.press("q")
 
     async def test_sort_by_size_and_date(self):
         drive = demo_drive()
