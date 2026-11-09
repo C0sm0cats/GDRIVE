@@ -3222,7 +3222,10 @@ def classify_file(service, item, relative_path, destination, state):
     if record is None:
         # Another Drive file synced here before (deleted and sent again, or renamed over it)?
         replaced_key, replaced = record_at_path(state, relative_path)
-    current_sha256 = local_hash(destination, record or replaced)
+    try:
+        current_sha256 = local_hash(destination, record or replaced)
+    except OSError:
+        return "CONFLICT", None, None  # cannot read it here: left as it is on both sides (see the unreadable mark)
     if record:
         local_changed = current_sha256 != record.get("local_sha256")
         remote_changed = signature != record.get("remote_signature")
@@ -3471,6 +3474,7 @@ def file_entry(service, item, relative_path, destination, state, symlink=None):
         symlink = destination.is_symlink()
     planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
     replaced_key = None
+    unreadable = False  # a file here it cannot read
     view_name = relative_path in VIEW_NAME_PATHS
     if relative_path in RESERVED_PATHS or symlink or view_name:
         status = "CONFLICT"
@@ -3482,6 +3486,7 @@ def file_entry(service, item, relative_path, destination, state, symlink=None):
         status, current_sha256, replaced_key = classify_file(
             service, item, relative_path, destination, state
         )
+        unreadable = status == "CONFLICT" and current_sha256 is None and destination.is_file()
 
     return (
         {
@@ -3499,6 +3504,7 @@ def file_entry(service, item, relative_path, destination, state, symlink=None):
             and tracked_record(state, item, relative_path) is not None,
             "symlink": symlink,
             "view_name": view_name,
+            "unreadable": unreadable,
         }
     )
 
@@ -3636,6 +3642,17 @@ def tracked_files_by_path(state):
     return tracked
 
 
+def maybe_exists(path):
+    """False only when path is surely not there: below a folder you cannot read, it may be."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def add_local_entries(plan, destination_root, state, scopes, remote_folders):
     """Local files and folders Drive does not have: new here (sent to Drive), or deleted on Drive (to your trash).
 
@@ -3670,7 +3687,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             path_is_in_scope(path, scopes)
             and path not in remote
             and not at_or_below_trashed(path)
-            and not os.path.lexists(destination_root / path)
+            and not maybe_exists(destination_root / path)
         )
 
     # Gone from Drive and from here since the last sync: forget it (saved only if the sync is applied), so what
@@ -3692,6 +3709,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         if entry.get("item") is None
     }
     new_folders = set()
+    unreadable = set()  # folders that cannot be listed here, and files that cannot be read
     # On a case-insensitive disk (macOS, exFAT...), Drive's "Report.txt" can be the local "report.txt"
     remote_by_key = {
         "FILE": {same_name_key(path): path for path in remote_files},
@@ -3733,8 +3751,14 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         elif tracked_entry:
             tracked_key, record = tracked_entry
             planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
-            current_sha256 = local_hash(destination, record)
-            if current_sha256 == record.get("local_sha256"):
+            try:
+                current_sha256 = local_hash(destination, record)
+            except OSError:
+                current_sha256 = None
+                unreadable.add(relative_path)
+            if relative_path in unreadable:
+                status = "CONFLICT"  # cannot read it here: neither sent nor trashed
+            elif current_sha256 == record.get("local_sha256"):
                 status = "TRASH_LOCAL"  # synced before, deleted on Drive
             elif can_send(relative_path):
                 status = "UPLOAD_NEW"  # deleted on Drive but changed here: the change wins
@@ -3817,8 +3841,13 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             directory = destination_root / relative_directory
         if not directory.is_dir():
             return
+        try:
+            children = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
+        except OSError:
+            unreadable.add(relative_directory)  # nothing in it or below goes anywhere: see the end
+            return
 
-        for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
+        for child in children:
             relative_path = relative_directory / child.name
             if relative_path.parts[0] in RESERVED_NAMES or is_disk_trash(relative_path.parts[0]):
                 continue
@@ -3878,6 +3907,17 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             scan_directory(scope)
         elif destination.is_file() and scope not in remote_files:
             add_local_entry(scope, "FILE")
+
+    # In or below a folder that cannot be listed here, files look deleted here (to the Drive trash) or missing
+    # (to download into it): all left as they are on both sides, until it can be read.
+    if unreadable:
+        for entry in plan:
+            path = entry["relative_path"]
+            if path in unreadable or not unreadable.isdisjoint(path.parents):
+                if entry["status"] != "SKIPPED":
+                    entry["status"] = "CONFLICT"
+                entry["unreadable"] = True
+                entry.pop("contents", None)
 
     # An item picked alone and deleted here may have been renamed or moved next to it: the new name is outside
     # the selection, so it is not sent. Listed as local only, so the preview does not hide it.
@@ -4031,6 +4071,11 @@ UPLOADS = {"UPLOAD_NEW", "UPLOAD"}
 DELETIONS = {"TRASH_REMOTE", "TRASH_LOCAL"}
 MASS_DELETION_FILES = 20  # deleting more than this, or more than a quarter of the synced files,
 MASS_DELETION_SHARE = 0.25  # needs a typed confirmation: an unplugged disk or an emptied folder looks the same
+UNREADABLE_LABEL = "(cannot read it here)"
+UNREADABLE_NOTE = (
+    "Some files or folders cannot be read here (their permissions: a Docker volume, a folder made with sudo...): "
+    "they are left as they are on both sides until you make them readable or move them out."
+)
 MASS_DELETION_MIN = 2  # the quarter rule only counts above this: 1 or 2 deletions in a small selection pass
 
 
@@ -4043,6 +4088,7 @@ def can_keep_both(entry):
         and not entry.get("duplicate")
         and not entry.get("symlink")
         and not entry.get("view_name")
+        and not entry.get("unreadable")
         and entry["destination"].is_file()
     )
 
@@ -4141,6 +4187,8 @@ def print_plan(plan, destination_root):
                 path = f"[bold]{path}/[/]"  # the color would be pale on a light terminal
             if entry.get("duplicate"):
                 path += f"  [dim]{escape(duplicate_label(entry))}[/]"
+            elif entry.get("unreadable"):
+                path += f"  [dim]{UNREADABLE_LABEL}[/]"
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
             table.add_row(terminal_text(style, label), path, size if size != "-" else "")
@@ -4241,7 +4289,7 @@ def plan_notes(plan):
     notes = []
     if any(
         entry["status"] == "CONFLICT" and not entry.get("duplicate") and not entry.get("symlink")
-        and not entry.get("view_name")
+        and not entry.get("view_name") and not entry.get("unreadable")
         for entry in plan
     ):
         notes.append(
@@ -4264,6 +4312,8 @@ def plan_notes(plan):
         for entry in plan
     ):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
+    if any(entry.get("unreadable") for entry in plan):
+        notes.append(UNREADABLE_NOTE)
     if any(entry.get("duplicate") for entry in plan):
         notes.append(
             "Several Drive items get one local name (the same name, a Google Doc next to its .docx, "
@@ -4496,6 +4546,8 @@ class PreviewScreen(Screen):
                 suffix = f"  (yours → {printable(entry['local_copy'].name)})"
             elif entry.get("duplicate"):
                 suffix = f"  {duplicate_label(entry)}"
+            elif entry.get("unreadable"):
+                suffix = f"  {UNREADABLE_LABEL}"
             size_cell = Text(size if size != "-" else "", style="dim", justify="right")
             cells.append((Text(label, style=style), path, suffix, size_cell))
         # STATUS and SIZE keep their width; ITEM gets the rest, so SIZE stays in view.
@@ -4548,6 +4600,9 @@ class PreviewScreen(Screen):
             self.notify(
                 f"{duplicate_label(entry)}: rename one on Drive (o opens it).", severity="warning", markup=False
             )
+            return
+        if entry.get("unreadable"):
+            self.notify(UNREADABLE_NOTE, severity="warning", markup=False)
             return
         if not can_keep_both(entry):
             self.notify("Keep both applies to a file changed on both sides.", severity="warning")

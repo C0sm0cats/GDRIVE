@@ -1077,6 +1077,59 @@ class SyncTest(unittest.TestCase):
         self.assertEqual({path: status for path, status in statuses.items() if status not in {"UNCHANGED", "SKIPPED"}},
                          {})
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads every folder")
+    def test_unreadable_folder_or_file_is_a_conflict_and_the_rest_syncs(self):
+        # bugs 45: one unreadable folder (a Docker volume, made with sudo) or changed file stopped the whole plan.
+        self.run_sync()
+        locked = self.root / "Docs/lockeddir"
+        locked.mkdir()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+
+        plan, state = self.preview()
+        entries = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertEqual(entries["Docs/lockeddir"]["status"], "CONFLICT")
+        self.assertTrue(entries["Docs/lockeddir"].get("unreadable"))
+        self.assertFalse(savegdrive.can_keep_both(entries["Docs/lockeddir"]))
+        console = Console(file=io.StringIO(), width=200)
+        with mock.patch.object(savegdrive, "console", console):
+            savegdrive.print_plan(plan, self.root)
+        printed = console.file.getvalue()
+        self.assertIn("Docs/lockeddir/  (cannot read it here)", printed)
+        self.assertIn("cannot be read here", printed)
+        self.apply(plan, state)
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+
+        # A synced file changed here, then unreadable: a conflict, never sent nor overwritten.
+        b_file = self.root / "Docs/b.txt"
+        b_file.write_bytes(b"bravo, edited again")
+        b_file.chmod(0)
+        self.addCleanup(b_file.chmod, 0o644)
+        self.drive.items["n"].update(file_item("n", "notes.txt", "root", b"notes v2"))
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "CONFLICT")
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"notes v2")
+        b_file.chmod(0o644)
+
+        # The whole synced folder unreadable: its files look deleted here, but nothing goes to the Drive trash.
+        docs = self.root / "Docs"
+        docs.chmod(0)
+        self.addCleanup(docs.chmod, 0o755)
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs"], "CONFLICT")
+        self.assertEqual({statuses[path] for path in ("Docs/a.txt", "Docs/b.txt", "Docs/Report.docx")}, {"CONFLICT"})
+        self.assertFalse(any(item.get("trashed") for item in self.drive.items.values()))
+        self.assertEqual(results["FILE_ERROR"], 0)
+        docs.chmod(0o755)
+        statuses, _ = self.run_sync()  # readable again: nothing was forgotten in between
+        self.assertEqual(statuses["Docs/a.txt"], "UNCHANGED")
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")  # readable again: its change goes up
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited again")
+
     def test_deleted_on_both_sides_then_made_again_here_is_sent(self):
         self.run_sync()
         del self.drive.items["a"]
