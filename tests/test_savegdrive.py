@@ -1859,6 +1859,32 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Report (local).docx"], "UPLOAD_NEW")
         self.assertEqual(savegdrive.local_copy_path(Path("/x/.env"), set()), Path("/x/.env (local)"))
 
+    def test_keep_both_never_overwrites_the_copy_kept_last_time(self):
+        self.run_sync()
+        (self.root / "Docs/b (local).txt").write_bytes(b"kept last time")  # an earlier keep both
+        (self.root / "Docs/b.txt").write_bytes(b"edited locally again")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v3"))  # a new conflict
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = []
+        for node in nodes:
+            if node["item"]["id"] == "b":  # only b.txt chosen: the earlier copy is not in this plan
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(
+            self.drive, selections, savegdrive.build_local_scopes(selections, browsed), self.root, state, cache
+        )
+        entries = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertNotIn("Docs/b (local).txt", entries)
+        self.assertEqual(entries["Docs/b.txt"]["status"], "CONFLICT")
+        savegdrive.set_keep_both(plan, [entries["Docs/b.txt"]], True)
+        self.assertEqual(entries["Docs/b.txt"]["local_copy"].name, "b (local 2).txt")
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 0)
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo v3")
+        self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"kept last time")
+        self.assertEqual((self.root / "Docs/b (local 2).txt").read_bytes(), b"edited locally again")
+
     def test_keep_both_never_takes_a_name_the_plan_downloads(self):
         self.run_sync()
         (self.root / "Docs/a.txt").write_bytes(b"MY UNSAVED WORK")
