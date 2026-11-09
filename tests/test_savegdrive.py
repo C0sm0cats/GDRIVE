@@ -706,6 +706,25 @@ class SyncTest(unittest.TestCase):
         january = folders[("01", folders[("2000", archive)])]
         self.assertIn(("a.txt", january), folders)
 
+    def test_drive_folder_that_cannot_be_made_here_is_an_error_and_comes_back(self):
+        # tests 51: a failed local mkdir of a new empty Drive folder must count as an error, not pass as synced.
+        self.run_sync()
+        self.drive.items["new"] = {"id": "new", "name": "New", "mimeType": FOLDER, "parent": "docs"}
+        docs = self.root / "Docs"
+        docs.chmod(0o555)
+        try:
+            statuses, results = self.run_sync()
+            self.assertEqual(statuses["Docs/New"], "NEW")
+            self.assertEqual(results["FOLDER_ERROR"], 1)
+            self.assertEqual(results["FOLDER_NEW"], 0)
+            self.assertFalse((docs / "New").exists())
+        finally:
+            docs.chmod(0o755)
+        statuses, results = self.run_sync()  # tried again on the next run
+        self.assertEqual(statuses["Docs/New"], "NEW")
+        self.assertEqual((results["FOLDER_NEW"], results["FOLDER_ERROR"]), (1, 0))
+        self.assertTrue((docs / "New").is_dir())
+
     def test_conflicts(self):
         self.run_sync()
         self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha from Drive"))
