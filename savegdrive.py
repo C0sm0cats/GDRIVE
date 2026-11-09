@@ -30,7 +30,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from rich.console import Console, Group
 from send2trash import send2trash
 from rich.markup import escape
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 from textual import on
@@ -3705,12 +3705,38 @@ def set_keep_both(plan, entries, keep):
             entry["status"] = "CONFLICT"
 
 
-def plan_summary(plan):
+# Printed output lands on the terminal's own background, light or dark: words and numbers keep its default
+# color (bold or dim at most), and only marks are colored, in bold when the color is too pale on white.
+TERMINAL_WORD_STYLES = {"yellow": "bold", "bright_yellow": "bold", "bright_black": "dim", "red": "red"}
+TERMINAL_MARK_STYLES = {"yellow": "bold", "bright_yellow": "bold", "bright_green": "bold", "bright_cyan": "bold"}
+
+
+def terminal_text(style, text, count=None):
+    """Markup for '[count] [arrow] words' printed on the terminal: the arrow keeps a readable color, the
+    count and words none (bold or dim at most)."""
+    mark, _, words = text.partition(" ") if text[:1] in "↓↑" else ("", "", text)
+    word_style = TERMINAL_WORD_STYLES.get(style)
+
+    def plain(part):
+        return f"[{word_style}]{part}[/]" if word_style else part
+
+    parts = [] if count is None else [plain(str(count))]
+    if mark:
+        parts.append(f"[{TERMINAL_MARK_STYLES.get(style, style)}]{mark}[/]")
+    parts.append(plain(words))
+    return " ".join(parts)
+
+
+def plan_summary(plan, plain=False):
+    """Status counts. plain: for the terminal's own background (print_plan), not the TUI's dark one."""
     counts = Counter(entry["status"] for entry in plan)
     parts = []
     for status, (style, label, _) in STATUS_STYLES.items():
         if counts[status]:
-            parts.append(f"[{style}]{counts[status]} {label}[/]")
+            if plain:
+                parts.append(terminal_text(style, label, counts[status]))
+            else:
+                parts.append(f"[{style}]{counts[status]} {label}[/]")
     return " · ".join(parts)
 
 
@@ -3731,17 +3757,17 @@ def print_plan(plan, destination_root):
             style, label, _ = STATUS_STYLES[entry["status"]]
             path = escape(entry["relative_path"].as_posix())
             if entry["kind"] == "FOLDER":
-                path = f"[cyan]{path}/[/]"
+                path = f"[bold]{path}/[/]"  # the color would be pale on a light terminal
             if entry.get("duplicate"):
                 path += f"  [dim]{escape(duplicate_label(entry))}[/]"
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
-            table.add_row(f"[{style}]{label}[/]", path, size if size != "-" else "")
+            table.add_row(terminal_text(style, label), path, size if size != "-" else "")
         console.print()
         console.print(table)
 
     console.print()
-    console.print(f"[bold]Preview[/]  {plan_summary(plan)}")
+    console.print(f"[bold]Preview[/]  {plan_summary(plan, plain=True)}")
     if hidden:
         console.print(f"[dim]{plural(hidden, 'unchanged item')} not listed (--verbose lists them).[/]")
     space, fits = space_line(plan, destination_root)
@@ -4433,7 +4459,7 @@ def create_folders(service, plan, state, results, report):
             state.setdefault("folders", {})[relative.as_posix()] = folder["id"]
             reselect_sent(state, relative, folder, parent_id)
             results["FOLDER_UPLOAD_NEW"] += 1
-            report("[bright_green]↑[/]", f"{relative.as_posix()}/")
+            report("[bold]↑[/]", f"{relative.as_posix()}/")
         except DRIVE_CALL_ERRORS as error:
             results["FOLDER_ERROR"] += 1
             report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(error)}")
@@ -4516,8 +4542,8 @@ def transfer_entry(client, entry, folder_ids, stop, on_bytes):
     return item, local_sha256
 
 
-TRANSFER_MARKS = {"NEW": "[green]↓[/]", "UPDATE": "[cyan]↓[/]", "UPLOAD_NEW": "[bright_green]↑[/]",
-                  "UPLOAD": "[bright_cyan]↑[/]"}
+# ↑ in bold, not bright green or cyan: those are unreadable on a light terminal
+TRANSFER_MARKS = {"NEW": "[green]↓[/]", "UPDATE": "[cyan]↓[/]", "UPLOAD_NEW": "[bold]↑[/]", "UPLOAD": "[bold]↑[/]"}
 
 
 def run_transfers(service, make_service, transfers, folder_ids, state, results, report, progress, executor,
@@ -4566,7 +4592,7 @@ def run_transfers(service, make_service, transfers, folder_ids, state, results, 
                     reselect_sent(state, entry["relative_path"], item,
                                   folder_ids.get(entry["relative_path"].parent, entry.get("parent_id")))
                 if status == "KEEP_BOTH":
-                    report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
+                    report("[bold]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
                 else:
                     report(TRANSFER_MARKS[status], relative)
             progress.advance(task)
@@ -4647,7 +4673,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         SpinnerColumn(),
         TextColumn("{task.description}"),
         BarColumn(),
-        MofNCompleteColumn(),
+        TextColumn("{task.completed}/{task.total}"),  # no color: MofNCompleteColumn's green is pale on white
         TextColumn("[dim]{task.fields[transfer]}[/]"),
         console=console,
         transient=True,
@@ -4700,17 +4726,19 @@ RESULT_LABELS = [
 ]
 
 
-def results_summary(results):
+def results_summary(results, plain=False):
+    """Result counts. plain: for the terminal's own background (print_results), not the TUI's dark one."""
     parts = []
     for keys, style, singular, plural_label in RESULT_LABELS:
         count = sum(results[key] for key in keys)
         if count:
-            parts.append(f"[{style}]{count} {singular if count == 1 else plural_label}[/]")
+            text = f"{count} {singular if count == 1 else plural_label}"
+            parts.append(terminal_text(style, text) if plain else f"[{style}]{text}[/]")
     return " · ".join(parts) or "[dim]nothing to do[/]"
 
 
 def print_results(results):
-    console.print(f"[bold]Done[/]  {results_summary(results)}")
+    console.print(f"[bold]Done[/]  {results_summary(results, plain=True)}")
 
 
 # --- Main ------------------------------------------------------------------

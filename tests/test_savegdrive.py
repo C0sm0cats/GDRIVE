@@ -543,6 +543,54 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs", "Docs/a.txt", "Docs/Report.docx")}, {"UNCHANGED"})
 
+    def test_printed_plan_progress_and_results_stay_readable_on_a_light_terminal(self):
+        # design 18: yellow, green and cyan text is 1.1:1 to 2:1 on a white terminal. Printed words, counts
+        # and paths keep the terminal's own color; only a ↓ or the spinner may stay green or cyan.
+        pale = {"yellow", "bright_yellow", "green", "bright_green", "cyan", "bright_cyan"}
+
+        def pale_texts(console):
+            return [segment.text for segment in console._record_buffer
+                    if segment.style and segment.style.color and segment.style.color.name in pale
+                    and segment.text.strip() not in {"", "↓"} and not "⠀" <= segment.text <= "⣿"]
+
+        def terminal():
+            return Console(file=io.StringIO(), width=200, force_terminal=True, color_system="standard", record=True,
+                           highlight=False)  # as savegdrive.console
+
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        (self.root / "Ideas").mkdir()
+        self.drive.items["p"].update(file_item("p", "beach.jpg", "photos", b"jpeg v2"))
+        (self.root / "Photos/beach.jpg").write_bytes(b"jpeg, edited here")
+        plan, state = self.preview()
+        conflict = next(entry for entry in plan if entry["relative_path"].as_posix() == "Photos/beach.jpg")
+        self.assertEqual(conflict["status"], "CONFLICT")
+        savegdrive.set_keep_both(plan, [conflict], True)
+        statuses = {entry["status"] for entry in plan}
+        self.assertTrue({"UPDATE", "UPLOAD", "UPLOAD_NEW", "KEEP_BOTH"} <= statuses, statuses)
+        extra = [{"kind": "FILE", "status": status, "relative_path": Path(f"{status}.txt")}
+                 for status in ("NEW", "CONFLICT", "LOCAL_ONLY", "SKIPPED")]
+
+        console = terminal()
+        with mock.patch.object(savegdrive, "console", console):
+            savegdrive.print_plan(plan + extra, self.root)
+        self.assertIn("keep both", console.export_text(clear=False))
+        self.assertEqual(pale_texts(console), [])
+
+        console = terminal()
+        with mock.patch.object(savegdrive, "console", console):
+            results = savegdrive.apply_plan(self.drive, plan, self.root, state, 1, lambda: self.drive)
+            savegdrive.print_results(results + savegdrive.Counter(FILE_CONFLICT=1, FILE_NEW=1, FOLDER_NEW=1))
+        self.assertIn("conflict kept both ways", console.export_text(clear=False))
+        self.assertEqual(pale_texts(console), [])
+        # The M/N counter of the progress bar: Rich's MofNCompleteColumn prints it green.
+        with mock.patch.object(savegdrive, "Progress", wraps=savegdrive.Progress) as progress:
+            with mock.patch.object(savegdrive, "console", terminal()):
+                savegdrive.apply_plan(self.drive, [], self.root, state, 1, lambda: self.drive)
+        self.assertNotIn("MofNCompleteColumn", [type(column).__name__ for column in progress.call_args.args])
+
     def test_changes_go_both_ways(self):
         self.run_sync()
         # On Drive: a changed, beach.jpg deleted. Here: b changed, notes deleted, new.txt and a new folder.
