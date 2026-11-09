@@ -2513,7 +2513,10 @@ class SyncTest(unittest.TestCase):
     def test_last_sync_summary_line(self):
         # tests 43: the start line counts conflicts and Drive deletions, and says in sync only when it is.
         def summary(*entries):
-            return savegdrive.last_sync_summary([{"kind": kind, "status": status} for kind, status in entries]).plain
+            # Every entry sits under one folder: a new folder here comes with its new file.
+            plan = [{"kind": kind, "status": status, "relative_path": Path("Docs") if kind == "FOLDER"
+                     else Path(f"Docs/{index}")} for index, (kind, status) in enumerate(entries)]
+            return savegdrive.last_sync_summary(plan).plain
 
         self.assertEqual(summary(("FILE", "UNCHANGED"), ("FOLDER", "UNCHANGED")), "✓ Your last selection is in sync.")
         conflict = summary(("FILE", "UNCHANGED"), ("FILE", "CONFLICT"))
@@ -2524,6 +2527,27 @@ class SyncTest(unittest.TestCase):
         mixed = summary(("FOLDER", "NEW"), ("FILE", "NEW"), ("FILE", "UPLOAD"), ("FOLDER", "TRASH_REMOTE"),
                         ("FILE", "CONFLICT"), ("FILE", "CONFLICT"))
         self.assertIn("1 ↓ to download · 1 ↑ to send · 1 deleted here · 2 conflicts", mixed)
+
+    def test_last_sync_summary_names_kept_conflicts_and_empty_new_folders(self):
+        # ux 22, ux 24: --keep-both conflicts and new empty folders are named, not "Since the last sync:" alone.
+        def summary(*entries):
+            plan = [{"kind": kind, "status": status, "relative_path": Path(path)} for kind, status, path in entries]
+            return savegdrive.last_sync_summary(plan).plain
+
+        self.assertIn("Since the last sync: 1 conflict to keep both ways   s",
+                      summary(("FILE", "UNCHANGED", "Docs/b.txt"), ("FILE", "KEEP_BOTH", "Docs/a.txt")))
+        self.assertIn("1 ↓ to download · 2 conflicts to keep both ways",
+                      summary(("FILE", "NEW", "Docs/c.txt"), ("FILE", "KEEP_BOTH", "Docs/a.txt"),
+                              ("FILE", "KEEP_BOTH", "Docs/b.txt")))
+        self.assertIn("Since the last sync: 1 folder to create on Drive   s",
+                      summary(("FOLDER", "UNCHANGED", "Docs"), ("FOLDER", "UPLOAD_NEW", "Docs/Invoices")))
+        self.assertIn("Since the last sync: 1 folder to create here   s",
+                      summary(("FOLDER", "UNCHANGED", "Docs"), ("FOLDER", "NEW", "Docs/2026")))
+        # A new folder that comes with its files is counted by its files only.
+        with_files = summary(("FOLDER", "NEW", "Docs/2026"), ("FILE", "NEW", "Docs/2026/x.txt"),
+                             ("FOLDER", "UPLOAD_NEW", "Docs/Invoices"), ("FOLDER", "UPLOAD_NEW", "Docs/Invoices/Q1"),
+                             ("FILE", "UPLOAD_NEW", "Docs/Invoices/Q1/y.txt"), ("FOLDER", "UPLOAD_NEW", "Docs/Empty"))
+        self.assertIn("Since the last sync: 1 ↓ to download · 1 ↑ to send · 1 folder to create on Drive   s", with_files)
 
     def test_parallel_downloads(self):
         for i in range(20):
