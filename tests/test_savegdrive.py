@@ -1281,6 +1281,21 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(new_token, "5")
         self.assertIsNone(savegdrive.apply_changes(self.drive, {"token": "expired", "folders": {}}))
 
+    def test_changes_replay_skips_shared_drive_changes(self):
+        cache = {}
+        token = savegdrive.start_page_token(self.drive)
+        savegdrive.prefetch_folders(self.drive, ["root"], cache)
+        savegdrive.save_snapshot(self.root, token, cache, ["root"])
+        self.drive.change_log.append({"removed": False})  # a shared drive renamed: changeType "drive", no fileId
+        self.drive.items["c"] = file_item("c", "c.txt", "photos", b"charlie")
+        self.drive.change("c")
+
+        replayed, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
+        fresh = {}
+        savegdrive.prefetch_folders(self.drive, ["root"], fresh)
+        self.assertEqual(replayed, fresh)
+        self.assertEqual(new_token, "2")
+
     def test_shared_views_get_their_own_folders(self):
         self.drive.items["s"] = file_item("s", "from Ann.pdf", "nobody", b"pdf", shared=True)
         self.drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")

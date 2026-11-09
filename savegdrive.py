@@ -503,7 +503,9 @@ def apply_changes(service, snapshot):
             raise
         for change in response.get("changes", []):
             count += 1
-            file_id = change["fileId"]
+            file_id = change.get("fileId")
+            if not file_id:  # a shared drive's own change (changeType "drive"): no file to update
+                continue
             for folder_id in where.pop(file_id, ()):
                 cache[folder_id] = [item for item in cache[folder_id] if item["id"] != file_id]
                 changed.add(folder_id)
