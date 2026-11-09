@@ -1626,6 +1626,32 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(again_scopes, [Path("Photos"), Path("notes.txt")])
         self.assertIsNone(savegdrive.last_selection(self.drive, {"files": {}}, {}))
 
+    def test_again_scans_the_picked_folder_here(self):
+        # Only Docs synced: --again must still look at the local Docs folder, not just at Drive.
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        by_path = {node["display_path"]: node for node in nodes}
+        selections = []
+        savegdrive.add_selected_item(selections, by_path["Docs"]["item"], by_path["Docs"]["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [], self.root, state, cache, "0")
+        self.assertTrue((self.root / "Docs/b.txt").exists())
+
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        del self.drive.items["b"]  # deleted on Drive: its copy here must go too
+        state = savegdrive.load_state(self.root)
+        cache = {}
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, state, cache)
+            plan = savegdrive.build_plan(self.drive, again, again_scopes, self.root, state, cache)
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses.get("Docs/new.txt"), "UPLOAD_NEW")
+        self.assertEqual(statuses.get("Docs/b.txt"), "TRASH_LOCAL")
+
     def test_again_stops_on_a_drive_error(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
