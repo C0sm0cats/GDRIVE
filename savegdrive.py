@@ -2997,10 +2997,12 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         tracked_entry = tracked.get(relative_path) if kind == "FILE" else None
         tracked_key, current_sha256 = None, None
 
+        planned_stat = None
         if kind == "FOLDER" and relative_path in synced_folders:
             status = "TRASH_LOCAL"  # an empty folder synced before, deleted on Drive
         elif tracked_entry:
             tracked_key, record = tracked_entry
+            planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
             current_sha256 = local_hash(destination, record)
             if current_sha256 == record.get("local_sha256"):
                 status = "TRASH_LOCAL"  # synced before, deleted on Drive
@@ -3024,6 +3026,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 "destination": destination,
                 "state_key": tracked_key,
                 "local_sha256": current_sha256,
+                "local_stat": planned_stat,
             }
         )
         planned_local_paths.add(relative_path)
@@ -3650,6 +3653,35 @@ def check_unchanged_since_plan(entry):
         raise OSError(CHANGED_SINCE_PREVIEW)
 
 
+CHANGED_ON_DRIVE_SINCE_PREVIEW = "changed on Drive since the preview, not trashed: compared again at the next sync"
+
+
+def still_deleted_here(service, entry, state):
+    """Right before the Drive trash: still gone here, and Drive's side still the one last synced (the plan may be old)."""
+    if os.path.lexists(entry["destination"]):
+        return False
+    item = entry["item"]
+    try:
+        if entry["kind"] == "FOLDER":
+            return remote_subtree_unchanged(service, effective_id(item), entry["relative_path"], state, {})
+        now = service.files().get(fileId=item["id"], fields=ITEM_FIELDS, supportsAllDrives=True).execute(
+            num_retries=API_RETRIES)
+    except HttpError:
+        return False
+    return remote_signature(now) == remote_signature(item) and can(now, "canTrash")
+
+
+def still_deleted_on_drive_unchanged_here(entry):
+    """Right before the system trash: the local file is still the one last synced, the folder still empty."""
+    destination = entry["destination"]
+    if entry["kind"] == "FOLDER":
+        try:
+            return destination.is_dir() and not destination.is_symlink() and not any(destination.rglob("*"))
+        except OSError:
+            return False
+    return entry.get("local_sha256") is not None and unchanged_since_plan(entry)
+
+
 def local_hash(path, record):
     """SHA-256 of a local file; reuses the last sync's when its size and date have not changed (like rsync)."""
     if record:
@@ -3931,7 +3963,17 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 progress.advance(task)
 
         # 4. Deleted here: Drive's copies go to the Drive trash.
-        trashed = [entry for entry in plan if entry["status"] == "TRASH_REMOTE"]
+        trashed = []
+        for entry in plan:
+            if entry["status"] != "TRASH_REMOTE":
+                continue
+            if still_deleted_here(service, entry, state):
+                trashed.append(entry)
+                continue
+            results[f"{entry['kind']}_ERROR"] += 1
+            relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
+            changed_here = os.path.lexists(entry["destination"])
+            report("[red]✗[/]", f"{relative}: {CHANGED_SINCE_PREVIEW if changed_here else CHANGED_ON_DRIVE_SINCE_PREVIEW}")
         if trashed:
             failed = trash_items(service, [entry["item"]["id"] for entry in trashed])
             for entry in trashed:
@@ -3951,6 +3993,10 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             if entry["status"] != "TRASH_LOCAL":
                 continue
             relative = entry["relative_path"]
+            if not still_deleted_on_drive_unchanged_here(entry):
+                results[f"{entry['kind']}_ERROR"] += 1
+                report("[red]✗[/]", f"{relative.as_posix()}: {CHANGED_SINCE_PREVIEW}")
+                continue
             try:
                 trash_local(entry["destination"])
             except OSError as error:

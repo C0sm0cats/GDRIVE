@@ -1342,6 +1342,48 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
         self.assertEqual(self.drive.items["b"]["content"], b"take 2 + more edits saved during the upload")
 
+    def test_deletions_skip_what_changed_after_the_preview(self):
+        import shutil
+
+        self.drive.items["inbox"] = {"id": "inbox", "name": "Inbox", "mimeType": FOLDER, "parent": "docs"}
+        self.run_sync()
+        shutil.rmtree(self.root / "Photos")  # deleted here
+        (self.root / "Docs/b.txt").unlink()  # deleted here
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))  # a download runs first
+        del self.drive.items["n"]  # deleted on Drive
+        del self.drive.items["inbox"]  # an empty synced folder, deleted on Drive
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual([statuses[path] for path in ("Photos", "Docs/b.txt", "notes.txt", "Docs/Inbox")],
+                         ["TRASH_REMOTE", "TRASH_REMOTE", "TRASH_LOCAL", "TRASH_LOCAL"])
+
+        # While the preview is open: a colleague adds a file to Photos, you edit notes.txt, you save into Inbox.
+        self.drive.items["c1"] = file_item("c1", "contract-signed.pdf", "photos", b"signed")
+        (self.root / "notes.txt").write_bytes(b"notes + TODAY'S EDITS")
+        (self.root / "Docs/Inbox/scan-0001.pdf").write_bytes(b"scan")
+
+        def fetch_while_a_colleague_edits_b(service, item, file_handle, stop=None):
+            service.items["b"].update(file_item("b", "b.txt", "docs", b"budget v2, a colleague's work",
+                                                modifiedTime="2026-03-01T00:00:00.000Z"))
+            fake_fetch(service, item, file_handle, stop)
+
+        with mock.patch.object(savegdrive, "fetch_media", fetch_while_a_colleague_edits_b):
+            results = self.apply(plan, state)
+        self.assertEqual(results["FILE_TRASH_REMOTE"] + results["FOLDER_TRASH_REMOTE"], 0)
+        self.assertEqual(results["FILE_TRASH_LOCAL"] + results["FOLDER_TRASH_LOCAL"], 0)
+        for item_id in ("photos", "c1", "p", "b"):
+            self.assertFalse(self.drive.is_trashed(self.drive.items[item_id]), item_id)
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"notes + TODAY'S EDITS")
+        self.assertEqual((self.root / "Docs/Inbox/scan-0001.pdf").read_bytes(), b"scan")
+
+        statuses, _ = self.run_sync()  # compared again: nothing new is lost
+        self.assertEqual(statuses["Photos/contract-signed.pdf"], "NEW")
+        self.assertEqual(statuses["Docs/b.txt"], "NEW")
+        self.assertEqual(statuses["notes.txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Docs/Inbox/scan-0001.pdf"], "LOCAL_ONLY")  # kept here, not trashed
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"budget v2, a colleague's work")
+
     def test_keep_both_in_a_read_only_folder_says_so(self):
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False}
         self.run_sync()
@@ -1460,11 +1502,15 @@ class DeletionScalingTest(unittest.TestCase):
         state = self.state(1, count)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            (root / "Old0").mkdir()
             plan = [
                 {"status": "TRASH_LOCAL", "kind": "FILE", "item": None, "state_key": f"id-0-{index}",
-                 "relative_path": Path(f"Old0/f{index}.txt"), "destination": root / f"Old0/f{index}.txt"}
+                 "relative_path": Path(f"Old0/f{index}.txt"), "destination": root / f"Old0/f{index}.txt",
+                 "local_sha256": savegdrive.hashlib.sha256(b"").hexdigest()}
                 for index in range(count)
             ]
+            for entry in plan:
+                entry["destination"].write_bytes(b"")  # still the synced copy when the trash runs
             with mock.patch.object(savegdrive, "trash_local", lambda path: None), \
                     mock.patch.object(savegdrive, "save_state", lambda *args: None), \
                     mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
