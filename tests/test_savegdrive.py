@@ -1125,6 +1125,30 @@ class SyncTest(unittest.TestCase):
         self.assertFalse((self.root / "Photos/beach.jpg").exists())
         self.assertEqual(sorted(path.name.split("-", 1)[1] for path in self.trash.iterdir()), ["beach.jpg"])
 
+    def test_printed_preview_log_and_results_name_what_goes_to_a_trash(self):
+        # tests 70: with --yes or --again outside the TUI, the printed preview and log are the only trace of what
+        # went to a trash. Each must name the deletions on both sides.
+        self.run_sync()
+        (self.root / "Docs/b.txt").unlink()  # deleted here: to the Drive trash
+        self.drive.items["p"]["trashed"] = True  # deleted on Drive: to your trash
+        plan, state = self.preview()
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200, highlight=False)):
+            savegdrive.print_plan(plan, self.root)
+            results = savegdrive.apply_plan(self.drive, plan, self.root, state, 1, lambda: self.drive)
+            savegdrive.print_results(results)
+        lines = [" ".join(line.split()) for line in output.getvalue().splitlines()]
+        self.assertIn("↑ to Drive trash Docs/b.txt 5 B", lines)
+        self.assertIn("↓ to your trash Photos/beach.jpg", lines)
+        preview = next(line for line in lines if line.startswith("Preview "))
+        self.assertIn("1 ↑ to Drive trash", preview)
+        self.assertIn("1 ↓ to your trash", preview)
+        self.assertIn("✗ Docs/b.txt → Drive trash", lines)
+        self.assertIn("✗ Photos/beach.jpg → your trash", lines)
+        done = next(line for line in lines if line.startswith("Done "))
+        self.assertIn("1 moved to the Drive trash", done)
+        self.assertIn("1 moved to your trash", done)
+
     def test_folder_deleted_on_drive_goes_to_your_trash(self):
         self.run_sync()
         for key in ["photos", "p"]:
