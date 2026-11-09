@@ -4471,5 +4471,26 @@ class LauncherTest(unittest.TestCase):
         self.assertFalse((root / ".venv" / ".savegdrive-deps").exists())
 
 
+class GitignoreTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_fresh_clone_never_stages_secrets_or_local_environment(self):
+        gitignore = Path(savegdrive.__file__).resolve().parent / ".gitignore"
+        self.assertTrue(gitignore.is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                   "-c", "core.excludesFile=/dev/null", "-C", str(repo)]
+            subprocess.run([*git, "init", "-q"], check=True)
+            (repo / ".git" / "info" / "exclude").write_text("")  # only the versioned .gitignore counts
+            shutil.copyfile(gitignore, repo / ".gitignore")
+            for name in ("credentials.json", "token.json", "token.json.tmp", ".venv/pyvenv.cfg", "__pycache__/x.pyc"):
+                (repo / name).parent.mkdir(exist_ok=True)
+                (repo / name).write_text("FAKE")
+            subprocess.run([*git, "add", "."], check=True)
+            staged = subprocess.run([*git, "diff", "--cached", "--name-only"], check=True,
+                                    capture_output=True, text=True).stdout.split()
+        self.assertEqual(staged, [".gitignore"])
+
+
 if __name__ == "__main__":
     unittest.main()

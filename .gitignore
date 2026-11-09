@@ -1,0 +1,7 @@
+# Secrets: never commit them (full read/write access to your Drive)
+credentials.json
+token.json
+token.json.tmp
+
+.venv/
+__pycache__/
