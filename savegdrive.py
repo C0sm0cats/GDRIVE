@@ -1025,7 +1025,7 @@ class DestinationSetupScreen(Screen):
     }
 
     .field-title {
-        height: 2;
+        height: 1;
         margin-top: 1;
         color: #93c5fd;
         text-style: bold;
@@ -1041,9 +1041,9 @@ class DestinationSetupScreen(Screen):
     }
 
     #final-path {
-        min-height: 4;
+        min-height: 2;
         margin-top: 1;
-        padding: 1;
+        padding: 0 1;
         background: #0f2742;
         color: #e0f2fe;
     }
@@ -1183,6 +1183,10 @@ class DestinationSetupScreen(Screen):
         except (OSError, ValueError) as error:
             status.update(
                 Text(str(error), style="bold bright_red")
+            )
+            # On a short terminal the refusal and the button sit below the form's fold.
+            self.call_after_refresh(
+                self.query_one("#setup-actions").scroll_visible, animate=False
             )
             return
         self.dismiss(destination)

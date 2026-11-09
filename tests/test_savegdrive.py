@@ -3404,6 +3404,33 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Session", app.sub_title)
                 await pilot.press("q")
 
+    async def test_destination_refusal_and_button_stay_visible_on_small_terminals(self):
+        for size in [(80, 24), (110, 27)]:
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as temp:
+                (Path(temp) / "GDrive").mkdir()
+                (Path(temp) / "GDrive" / "file.txt").write_text("x")  # not empty, no state: refused
+                app = self.make_app()
+                async with app.run_test(size=size) as pilot:
+                    await pilot.press("f")
+                    screen = app.screen
+                    self.assertIsInstance(screen, savegdrive.DestinationSetupScreen)
+                    screen.query_one("#parent-path", Input).value = temp
+                    screen.query_one("#folder-name", Input).value = "GDrive"
+                    await pilot.pause()
+                    form = screen.query_one("#setup-form").content_region
+                    if size == (110, 27):  # the final path fits before saving
+                        self.assertTrue(form.contains_region(screen.query_one("#final-path").region))
+                    await pilot.press("ctrl+s")
+                    await pilot.pause(0.3)
+                    status = screen.query_one("#setup-status")
+                    self.assertIn("already contains files", str(status.render()))
+                    form = screen.query_one("#setup-form").content_region
+                    self.assertTrue(form.contains_region(status.region), (form, status.region))
+                    button = screen.query_one("#save-destination").region
+                    self.assertTrue(form.contains_region(button), (form, button))
+                    await pilot.press("escape")
+                    await pilot.press("q")
+
     async def test_folding_a_directory_on_the_destination_screen_keeps_the_app_open(self):
         (Path(self.temp.name) / "Documents").mkdir()
         app = self.make_app()
