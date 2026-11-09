@@ -117,7 +117,10 @@ class FakeDrive:
 
     def public(self, item):
         fields = ("id", "name", "mimeType", "size", "modifiedTime", "md5Checksum", "shortcutDetails", "capabilities")
-        return {key: item[key] for key in fields if key in item}
+        public = {key: item[key] for key in fields if key in item}
+        if item.get("parent"):
+            public["parents"] = [item["parent"]]
+        return public
 
     def is_trashed(self, item):
         while item is not None:
@@ -888,6 +891,23 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Photos/beach.jpg"], "UPLOAD_NEW")  # the change is not lost
         self.assertIn(b"retouched here", [item.get("content") for item in self.drive.items.values()])
         self.assertEqual((self.root / "Photos 2026/beach.jpg").read_bytes(), b"jpeg")
+
+    def test_picked_items_moved_on_drive_into_another_pick_are_synced_once(self):
+        # Docs, Photos and notes.txt picked; on Drive, Photos and notes.txt are moved into Docs, then --again.
+        self.sync_picked("Docs", "Photos", "notes.txt")
+        (self.root / "notes.txt").write_bytes(b"edited here")
+        self.drive.items["photos"]["parent"] = "docs"
+        self.drive.items["n"]["parent"] = "docs"
+        statuses = self.sync_picked(again=True)
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Photos").exists())
+        self.assertEqual((self.root / "Docs/Photos/beach.jpg").read_bytes(), b"jpeg")
+        self.assertEqual(statuses["notes.txt"], "UPLOAD_NEW")  # the change made here is not lost
+        self.assertEqual((self.root / "Docs/notes.txt").read_bytes(), b"notes")
+        # The next run keeps one copy of each.
+        statuses = self.sync_picked(again=True)
+        self.assertNotIn("Photos/beach.jpg", statuses)
+        self.assertEqual(statuses["Docs/Photos/beach.jpg"], "UNCHANGED")
 
     def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
         self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}

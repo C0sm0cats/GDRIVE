@@ -86,8 +86,8 @@ FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 LIST_FIELDS = (
     "nextPageToken,"
-    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,explicitlyTrashed,"
-    "capabilities(canEdit,canAddChildren,canTrash))"
+    "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,"
+    "explicitlyTrashed,capabilities(canEdit,canAddChildren,canTrash))"
 )
 API_BATCH_SIZE = 50  # Drive accepts 100 calls per batch, but throttles large ones
 API_RETRIES = 5
@@ -545,7 +545,7 @@ def apply_changes(service, snapshot):
             item = change.get("file")
             if change.get("removed") or not item or item.get("trashed"):
                 continue
-            parents = item.pop("parents", [])
+            parents = item.get("parents") or []  # kept: --again tells a moved item by its parent
             item.pop("trashed", None)
             note_drives([item])
             for folder_id in parents:
@@ -2609,9 +2609,15 @@ class DriveSelectorApp(App):
 
 
 ITEM_FIELDS = (
-    "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId,"
+    "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId,parents,"
     "capabilities(canEdit,canAddChildren,canTrash)"
 )
+
+
+def moved_on_drive(saved_item, item):
+    """Whether item now sits in another Drive folder than when it was picked (known only when both are)."""
+    before, now = saved_item.get("parents"), item.get("parents")
+    return bool(before) and bool(now) and set(before) != set(now)
 
 
 def remember_selection(state, selections, scopes, roots=()):
@@ -2624,6 +2630,7 @@ def remember_selection(state, selections, scopes, roots=()):
                 "name": entry["item"]["name"],
                 "relative_parent": entry["relative_parent"].as_posix(),
                 "path": selected_path(entry).as_posix(),
+                "parents": entry["item"].get("parents") or [],
             }
             for entry in selections
         ],
@@ -2670,6 +2677,11 @@ def last_selection(service, state, cache):
                 TRASHED_FOLDERS.add(effective_id(item))  # picked in the Trash view: list it from there
         elif item is None or item.get("trashed"):
             warn(f"{saved_item['path']} is no longer on Drive")
+            scopes.append(Path(saved_item["path"]))
+            continue
+        elif moved_on_drive(saved_item, item):
+            # Like a deletion and a new item: the old copy goes, the new place comes if it is selected.
+            warn(f"{saved_item['path']} was moved to another folder on Drive")
             scopes.append(Path(saved_item["path"]))
             continue
         note_drives([item])
