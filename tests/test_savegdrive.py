@@ -601,6 +601,19 @@ class SyncTest(unittest.TestCase):
                 savegdrive.apply_plan(self.drive, [], self.root, state, 1, lambda: self.drive)
         self.assertNotIn("MofNCompleteColumn", [type(column).__name__ for column in progress.call_args.args])
 
+    def test_new_version_from_drive_keeps_the_local_file_mode(self):
+        # bugs 46: a new version from Drive replaced the file with a default-mode one (chmod +x lost).
+        self.run_sync()
+        os.chmod(self.root / "Docs/a.txt", 0o755)
+        os.chmod(self.root / "Docs/b.txt", 0o600)
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Docs/a.txt"], statuses["Docs/b.txt"]), ("UPDATE", "UPDATE"))
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+        self.assertEqual(stat.S_IMODE((self.root / "Docs/a.txt").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((self.root / "Docs/b.txt").stat().st_mode), 0o600)
+
     def test_changes_go_both_ways(self):
         self.run_sync()
         # On Drive: a changed, beach.jpg deleted. Here: b changed, notes deleted, new.txt and a new folder.

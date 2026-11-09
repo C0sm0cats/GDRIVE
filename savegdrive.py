@@ -4714,6 +4714,8 @@ def download_file_atomically(service, entry, stop=None, on_bytes=lambda count: N
         set_remote_mtime(temporary, entry["item"])
         if check is not None:
             check()
+        if entry["status"] == "UPDATE" and destination.is_file():
+            shutil.copymode(destination, temporary)  # a new version, not a new file: keep its mode (x, 600...)
         os.replace(temporary, destination)
     except BaseException:
         if temporary.exists():
