@@ -3096,6 +3096,19 @@ class SyncTest(unittest.TestCase):
         with self.assertRaises(OSError):
             savegdrive.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
 
+        # The default ~/GDrive, and --download-path=~/x, which the shell leaves unexpanded after "=".
+        home = Path(self.temp.name) / "home"
+        workdir = Path(self.temp.name) / "workdir"
+        home.mkdir()
+        workdir.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(workdir)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertEqual(savegdrive.resolve_destination(savegdrive.DOWNLOAD_PATH), home / "GDrive")
+            self.assertEqual(savegdrive.resolve_destination("~/x"), home / "x")
+        self.assertTrue(savegdrive.has_valid_state(home / "GDrive"))
+        self.assertEqual(list(workdir.iterdir()), [])
+
     def test_folder_synced_with_my_drive_refuses_another_folder_id(self):
         self.run_sync()  # My Drive, in a folder made before the Drive root was recorded
         for folder_id in ("root", "docs", None):  # None: --again, which replays the folder's own roots
