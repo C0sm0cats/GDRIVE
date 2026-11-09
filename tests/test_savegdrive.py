@@ -465,6 +465,38 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
         self.assertEqual(self.drive.uploads, [])
 
+    def test_folder_shortcut_content_only_comes_down(self):
+        # My Drive holds a shortcut to someone else's folder: its content never goes back up.
+        self.drive.items.update({
+            "link": {"id": "link", "name": "Team", "mimeType": savegdrive.SHORTCUT_MIME_TYPE, "parent": "root",
+                     "shortcutDetails": {"targetId": "team", "targetMimeType": FOLDER}},
+            "team": {"id": "team", "name": "team", "mimeType": FOLDER, "parent": "elsewhere"},
+            "sub": {"id": "sub", "name": "Sub", "mimeType": FOLDER, "parent": "team"},
+            "budget": file_item("budget", "budget.xlsx", "team", b"budget"),
+            "plan": file_item("plan", "plan.txt", "team", b"plan"),
+            "deep": file_item("deep", "deep.txt", "sub", b"deep"),
+        })
+        self.run_sync()
+        self.assertEqual((self.root / "Team/Sub/deep.txt").read_bytes(), b"deep")
+        (self.root / "Team/plan.txt").unlink()
+        (self.root / "Team/budget.xlsx").write_bytes(b"local edit")
+        (self.root / "Team/new.txt").write_bytes(b"made here")
+        for path in (self.root / "Team/Sub").iterdir():
+            path.unlink()
+        (self.root / "Team/Sub").rmdir()
+
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Team/plan.txt"], "NEW")  # deleted here: it comes back
+        self.assertEqual(statuses["Team/budget.xlsx"], "CONFLICT")
+        self.assertEqual(statuses["Team/new.txt"], "LOCAL_ONLY")
+        self.assertEqual(statuses["Team/Sub"], "NEW")
+        self.assertFalse(any(item.get("trashed") for item in self.drive.items.values()))
+        self.assertEqual(self.drive.items["budget"]["content"], b"budget")
+        self.assertEqual(self.drive.uploads, [])
+        self.assertNotIn("new.txt", {item["name"] for item in self.drive.items.values()})
+        self.assertEqual((self.root / "Team/plan.txt").read_bytes(), b"plan")
+        self.assertEqual((self.root / "Team/Sub/deep.txt").read_bytes(), b"deep")
+
     def test_deleted_on_one_side_but_changed_on_the_other_comes_back(self):
         self.run_sync()
         (self.root / "Docs/a.txt").unlink()

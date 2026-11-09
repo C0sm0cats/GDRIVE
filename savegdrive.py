@@ -2760,6 +2760,8 @@ def collect_plan(
         tracked_folders = tracked_folder_paths(state)  # build_plan computes it once for all
     if mime_type == FOLDER_MIME_TYPE:
         folder_id = effective_id(item)
+        if item["mimeType"] == SHORTCUT_MIME_TYPE:
+            item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
         if relative_path in RESERVED_PATHS:
             status = "CONFLICT"
@@ -2769,7 +2771,7 @@ def collect_plan(
             status = "CONFLICT"
         elif (
             status == "NEW"
-            and item["mimeType"] != SHORTCUT_MIME_TYPE
+            and not item.get("readonly")
             and not is_readonly_path(relative_path)
             and can(item, "canTrash")
             and (
@@ -2793,7 +2795,7 @@ def collect_plan(
         for child in list_children(service, folder_id, cache):
             collect_plan(
                 service,
-                child,
+                dict(child, readonly=True) if item.get("readonly") else child,
                 relative_path,
                 destination_root,
                 state,
@@ -2804,7 +2806,7 @@ def collect_plan(
             )
         return
 
-    shortcut = item["mimeType"] == SHORTCUT_MIME_TYPE
+    shortcut = item["mimeType"] == SHORTCUT_MIME_TYPE or item.get("readonly")
     item = resolve_file_shortcut(service, item)
     if shortcut:
         item = dict(item, readonly=True)  # the target may live anywhere: only downloaded
@@ -3009,9 +3011,11 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
     remote_folders = dict(roots if roots is not None else {Path(): "root"})
     for entry in plan:
         if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE":
-            # None: a folder you may not add to (shared read only): new files there stay local
+            # None: a folder you may not add to (shared read only, behind a shortcut): new files there stay local
             remote_folders[entry["relative_path"]] = (
-                effective_id(entry["item"]) if can(entry["item"], "canAddChildren") else None
+                effective_id(entry["item"])
+                if can(entry["item"], "canAddChildren") and not entry["item"].get("readonly")
+                else None
             )
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
     for entry in plan:
