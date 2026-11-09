@@ -508,8 +508,9 @@ The local folder contains:
 .savegdrive-cache.json    Drive listings and changes token, for a fast --again
 ```
 
-Do not delete the state file: without it, SaveGDrive no longer knows what was
-synced and treats every difference as a conflict. The cache can be deleted at
+Do not delete the state file: without it, SaveGDrive no longer knows what it
+synced, and the folder is refused (see
+[Troubleshooting](#troubleshooting) to recover). The cache can be deleted at
 any time.
 
 ## Troubleshooting
@@ -522,6 +523,11 @@ any time.
   both, then keep the version you want.
 - **A sync is refused with `--yes`**: it deletes many files. Check it in the
   preview, or add `--allow-deletions` if it is expected.
+- **The folder is refused: it "already contains files but has no
+  `.savegdrive-state.json`"**: the state file was deleted, or not copied with
+  the folder. Move the folder aside (for example `mv ~/GDrive ~/GDrive.old`),
+  run SaveGDrive again to sync into a new empty folder, then compare the two
+  and copy back what you changed locally before deleting the old one.
 - **More details**: run with `--verbose`.
 
 ## Tests
