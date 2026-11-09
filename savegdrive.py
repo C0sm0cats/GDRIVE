@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httplib2
+from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -111,6 +113,10 @@ EXPORT_FORMATS = {
 }
 
 console = Console(highlight=False)
+
+# What one Drive call can raise when it fails: an API error, a local or network error (OSError),
+# httplib2 without network (ServerNotFoundError...), or a sign-in that cannot be renewed (RefreshError...).
+DRIVE_CALL_ERRORS = (HttpError, OSError, httplib2.HttpLib2Error, GoogleAuthError)
 VERBOSE = False
 
 
@@ -3936,7 +3942,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             state.setdefault("folders", {})[relative.as_posix()] = folder["id"]
             results["FOLDER_UPLOAD_NEW"] += 1
             report("[bright_green]↑[/]", f"{relative.as_posix()}/")
-        except (HttpError, OSError) as error:
+        except DRIVE_CALL_ERRORS as error:
             results["FOLDER_ERROR"] += 1
             report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(error)}")
 
@@ -4054,7 +4060,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 status = entry["status"]
                 try:
                     item, local_sha256 = future.result()
-                except (HttpError, OSError) as error:
+                except DRIVE_CALL_ERRORS as error:
                     results["FILE_ERROR"] += 1
                     report("[red]✗[/]", f"{relative}: {error_text(error)}")
                 else:
@@ -4447,7 +4453,7 @@ def main():
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/]")
         raise SystemExit(130)
-    except (HttpError, OSError) as error:
+    except DRIVE_CALL_ERRORS as error:
         console.print(f"[red]✗[/] {escape(error_text(error))}")
         raise SystemExit(1) from error
 

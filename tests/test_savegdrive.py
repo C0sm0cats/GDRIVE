@@ -1018,6 +1018,45 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         self.assertFalse(self.drive.items["docs"].get("trashed"))
 
+    def test_network_loss_during_a_transfer_is_a_file_error(self):
+        import httplib2
+        from google.auth.exceptions import RefreshError
+
+        for error in (httplib2.ServerNotFoundError("Unable to find the server at www.googleapis.com"),
+                      RefreshError("invalid_grant")):
+            with self.subTest(error=type(error).__name__):
+                self.start_afresh()
+                self.sync_everything()
+                for item_id, name, parent in (("a", "a.txt", "docs"), ("b", "b.txt", "docs"),
+                                              ("p", "beach.jpg", "photos")):
+                    self.drive.items[item_id].update(file_item(item_id, name, parent, b"v2 " + name.encode(),
+                                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+                    self.drive.change(item_id)
+                (self.root / "notes.txt").unlink()
+
+                def fetch_without_network(service, item, file_handle, stop=None):
+                    if item["id"] == "b":
+                        raise error
+                    fake_fetch(service, item, file_handle, stop)
+
+                with mock.patch.object(savegdrive, "fetch_media", fetch_without_network):
+                    with self.assertRaises(SystemExit) as raised:  # a failed file: exit 1, not a traceback
+                        self.run_main("--again", "--yes")
+                self.assertEqual(raised.exception.code, 1)
+                self.assertTrue(self.drive.items["n"].get("trashed"))  # the deletions still ran
+                self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"v2 a.txt")
+                self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo")
+                statuses, _ = self.run_sync()  # the transfers that finished were recorded
+                self.assertEqual(statuses["Docs/a.txt"], "UNCHANGED")
+                self.assertEqual(statuses["Photos/beach.jpg"], "UNCHANGED")
+                self.assertEqual(statuses["Docs/b.txt"], "UPDATE")
+
+    def start_afresh(self):
+        """A fresh Drive and destination, for one more round in the same test."""
+        shutil.rmtree(self.root)
+        savegdrive.initialize_managed_destination(self.root)
+        self.drive = demo_drive()
+
     def test_tree_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
         import asyncio
