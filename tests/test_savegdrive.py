@@ -1827,6 +1827,40 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Empty there"], "TRASH_REMOTE")
         self.assertTrue(self.drive.items["empty"]["trashed"])
 
+    def test_empty_folder_is_tracked_right_after_upload_or_adoption(self):
+        # tests 75: no sync in between, so each of UPLOAD_NEW and UNCHANGED must record the folder by itself
+        def taxes_on_drive():
+            return [key for key, item in self.drive.items.items() if item["name"] == "Taxes" and not item.get("trashed")]
+
+        self.run_sync()
+        (self.root / "Taxes").mkdir()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "UPLOAD_NEW")
+        del self.drive.items[taxes_on_drive()[0]]  # (A) sent, then deleted on Drive
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Taxes").exists())
+        self.assertEqual(taxes_on_drive(), [])
+
+        (self.root / "Taxes").mkdir()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "UPLOAD_NEW")
+        (self.root / "Taxes").rmdir()  # (B) sent, then deleted here
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "TRASH_REMOTE")
+        self.assertEqual(taxes_on_drive(), [])
+        self.assertFalse((self.root / "Taxes").exists())
+
+        (self.root / "Taxes").mkdir()  # (C) made on both sides, then deleted on Drive
+        self.drive.items["taxes"] = {"id": "taxes", "name": "Taxes", "mimeType": FOLDER, "parent": "root"}
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "UNCHANGED")
+        del self.drive.items["taxes"]
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Taxes"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Taxes").exists())
+        self.assertEqual(taxes_on_drive(), [])
+
     def test_empty_folder_deleted_on_drive_but_filled_here_is_kept(self):
         # tests 12: a synced empty folder gone from Drive follows the deletion only while it is still empty.
         # A new file here is sent back up; a link (never sent) keeps the folder here.
