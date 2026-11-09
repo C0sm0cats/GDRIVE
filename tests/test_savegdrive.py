@@ -1452,6 +1452,35 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(savegdrive.is_readonly_path(Path(savegdrive.SHARED_WITH_ME_DIR) / "Team/x.txt"))
         self.assertFalse(savegdrive.is_readonly_path(Path("Docs/x.txt")))
 
+    def test_drive_folder_named_like_a_read_only_view_is_a_conflict_not_silently_read_only(self):
+        # bugs 14: a My Drive folder "Trash" or "Shared with me" shares its local folder with that view:
+        # edits there were conflicts, deletions came back, new files stayed local, and nothing said why.
+        for folder_id, name in [("vt", savegdrive.TRASH_DIR), ("vs", savegdrive.SHARED_WITH_ME_DIR)]:
+            self.drive.items[folder_id] = {"id": folder_id, "name": name, "mimeType": FOLDER, "parent": "root"}
+            self.drive.items[f"{folder_id}x"] = file_item(f"{folder_id}x", "x.txt", folder_id, b"x")
+            self.drive.items[f"{folder_id}y"] = file_item(f"{folder_id}y", "y.txt", folder_id, b"y")
+        with mock.patch.object(savegdrive, "VIEW_NAME_PATHS", set(), create=True):
+            self.run_sync()  # synced by an older version, as plain folders
+        for name in (savegdrive.TRASH_DIR, savegdrive.SHARED_WITH_ME_DIR):
+            (self.root / name / "x.txt").write_bytes(b"x edited here")
+            (self.root / name / "y.txt").unlink()
+            (self.root / name / "new.txt").write_bytes(b"new")
+
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        for name in (savegdrive.TRASH_DIR, savegdrive.SHARED_WITH_ME_DIR):
+            self.assertEqual(statuses[name], "CONFLICT")
+            self.assertFalse([path for path in statuses if path.startswith(f"{name}/")])
+        self.assertTrue(any("named like a view" in note for note in savegdrive.plan_notes(plan)))
+        self.apply(plan, state)
+        self.assertEqual(self.drive.uploads, [])
+        self.assertEqual(list(self.trash.iterdir()), [])
+        for name in (savegdrive.TRASH_DIR, savegdrive.SHARED_WITH_ME_DIR):
+            self.assertEqual((self.root / name / "x.txt").read_bytes(), b"x edited here")
+            self.assertFalse((self.root / name / "y.txt").exists())
+            self.assertTrue((self.root / name / "new.txt").exists())
+        self.assertFalse(any(self.drive.is_trashed(item) for item in self.drive.items.values()))
+
     def test_unchanged_files_are_not_hashed_again(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")

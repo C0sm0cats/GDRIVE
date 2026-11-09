@@ -88,6 +88,9 @@ SHARED_DRIVES_DIR = "Shared drives"
 TRASH = "trash"  # pseudo folder id: the items you moved to the Drive trash
 TRASH_DIR = "Trash"
 VIEW_DIRS = {SHARED_WITH_ME_DIR, SHARED_DRIVES_DIR, TRASH_DIR}
+# A Drive item at the top named like a read only view would share its local folder: what you change
+# there would only come down. It is a conflict until renamed on Drive.
+VIEW_NAME_PATHS = {Path(SHARED_WITH_ME_DIR), Path(TRASH_DIR)}
 STATE_VERSION = 1
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
@@ -3337,7 +3340,8 @@ def collect_plan(
             item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
         repeat = arrived = too_deep = False
-        if relative_path in RESERVED_PATHS or symlink:
+        view_name = relative_path in VIEW_NAME_PATHS
+        if relative_path in RESERVED_PATHS or symlink or view_name:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
             status = "SKIPPED"
@@ -3385,6 +3389,7 @@ def collect_plan(
                 "too_deep": too_deep,
                 "comes_back": comes_back,
                 "symlink": symlink,
+                "view_name": view_name,
             }
         )
         if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
@@ -3442,7 +3447,8 @@ def file_entry(service, item, relative_path, destination, state, symlink=None):
         symlink = destination.is_symlink()
     planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
     replaced_key = None
-    if relative_path in RESERVED_PATHS or symlink:
+    view_name = relative_path in VIEW_NAME_PATHS
+    if relative_path in RESERVED_PATHS or symlink or view_name:
         status = "CONFLICT"
         current_sha256 = None
     elif is_unsupported(item):
@@ -3468,6 +3474,7 @@ def file_entry(service, item, relative_path, destination, state, symlink=None):
             and not can(item, "canTrash")
             and tracked_record(state, item, relative_path) is not None,
             "symlink": symlink,
+            "view_name": view_name,
         }
     )
 
@@ -3625,7 +3632,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         if entry["kind"] == "FOLDER"
         and (
             entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
-            or entry.get("symlink")
+            or entry.get("symlink") or entry.get("view_name")
         )
     }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link here:
     # nothing below goes anywhere
@@ -3991,6 +3998,7 @@ def can_keep_both(entry):
         and entry["status"] in {"CONFLICT", "KEEP_BOTH"}
         and not entry.get("duplicate")
         and not entry.get("symlink")
+        and not entry.get("view_name")
         and entry["destination"].is_file()
     )
 
@@ -4178,7 +4186,11 @@ def needs_deletion_check(plan, state):
 def plan_notes(plan):
     statuses = {entry["status"] for entry in plan}
     notes = []
-    if any(entry["status"] == "CONFLICT" and not entry.get("duplicate") and not entry.get("symlink") for entry in plan):
+    if any(
+        entry["status"] == "CONFLICT" and not entry.get("duplicate") and not entry.get("symlink")
+        and not entry.get("view_name")
+        for entry in plan
+    ):
         notes.append(
             "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
             "A file you cannot edit on Drive (a Google Doc export, a file shared read only) and changed here is a "
@@ -4225,6 +4237,12 @@ def plan_notes(plan):
         notes.append(
             "Symbolic links are never followed: a link stays here only, and what it points to is not synced. "
             "A link with the name of a Drive item is a conflict: nothing syncs there until you replace the link."
+        )
+    if any(entry.get("view_name") for entry in plan):
+        names = " or ".join(f"'{name}'" for name in sorted(path.as_posix() for path in VIEW_NAME_PATHS))
+        notes.append(
+            f"A Drive item at the top named like a view ({names}) would share that view's local folder: "
+            "nothing syncs in it, and what is on your disk there is left as it is. Rename it on Drive (o opens it)."
         )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
