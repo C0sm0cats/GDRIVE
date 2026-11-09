@@ -4140,6 +4140,23 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(table.get_row_at(0)[1].plain,
                              f"{path}  (yours → Copy (local).docx)")
 
+    async def test_preview_survives_a_file_to_send_deleted_after_the_plan(self):
+        (self.root / "kept.txt").write_bytes(b"x" * 7)
+        (self.root / "draft.txt").write_bytes(b"draft")
+        plan = [{
+            "status": "UPLOAD_NEW", "relative_path": Path(name), "kind": "FILE",
+            "item": None, "destination": self.root / name,
+        } for name in ("kept.txt", "draft.txt")]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            (self.root / "draft.txt").unlink()  # gone while the preview is open
+            await pilot.press("tab")
+            await pilot.pause()
+            summary = str(app.screen.query_one("#preview-summary").render())
+            self.assertIn("7 B to send to Drive", summary)
+        self.assertEqual(savegdrive.upload_size(plan, self.root), 7)
+
     async def test_preview_shows_the_local_folder_in_80x24(self):
         destination = Path.home() / "Documents" / "Google Drive"
         plan = [{

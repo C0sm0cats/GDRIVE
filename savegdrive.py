@@ -4178,11 +4178,14 @@ def free_space(path):
 
 
 def upload_size(plan, destination_root):
-    return sum(
-        (destination_root / entry["relative_path"]).stat().st_size
-        for entry in plan
-        if entry["kind"] == "FILE" and entry["status"] in UPLOADS
-    )
+    total = 0
+    for entry in plan:
+        if entry["kind"] == "FILE" and entry["status"] in UPLOADS:
+            try:
+                total += (destination_root / entry["relative_path"]).stat().st_size
+            except OSError:
+                continue  # gone since the plan was made: apply_plan reports it as an error
+    return total
 
 
 def space_line(plan, destination_root):
