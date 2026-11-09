@@ -305,6 +305,9 @@ class FakeDrive:
         return self.items[fileId]["content"]
 
 
+REAL_FETCH_MEDIA = savegdrive.fetch_media  # SyncTest replaces it with fake_fetch
+
+
 def fake_fetch(service, item, file_handle, stop=None):
     file_handle.write(service.items[savegdrive.effective_id(item)]["content"])
 
@@ -3729,6 +3732,46 @@ class SyncTest(unittest.TestCase):
                 self.assertEqual(list(root.rglob(f"*{savegdrive.PART_SUFFIX}")), [])
                 saved = {record["path"]: record for record in savegdrive.load_state(root)["files"].values()}
                 self.assertEqual(saved["Docs/a.txt"]["remote_signature"], shown["a"])  # downloaded before: no conflict
+
+    def test_ctrl_c_stops_running_downloads_at_their_next_chunk(self):
+        # tests 78: apply_plan sets stop, download_file_atomically passes it to the real fetch_media, which
+        # checks it before each chunk; a regression on any of the three lets b.txt download to the end.
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2",
+                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2",
+                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+        b_started = threading.Event()
+        b_chunks = []
+        drive = self.drive
+
+        class Downloader:
+            def __init__(self, file_handle, request, chunksize):
+                self.file_handle = file_handle
+                self.item_id = request
+
+            def next_chunk(self, num_retries=0):
+                if self.item_id == "a":
+                    b_started.wait(5)
+                    raise KeyboardInterrupt
+                b_started.set()
+                b_chunks.append(1)
+                time.sleep(0.05)
+                if len(b_chunks) == 40:
+                    self.file_handle.write(drive.items["b"]["content"])
+                return None, len(b_chunks) == 40
+
+        with mock.patch.object(savegdrive, "fetch_media", REAL_FETCH_MEDIA), \
+                mock.patch.object(savegdrive, "download_request", lambda service, item: savegdrive.effective_id(item)), \
+                mock.patch.object(savegdrive, "MediaIoBaseDownload", Downloader):
+            plan, state = self.preview()
+            with self.assertRaises(KeyboardInterrupt):
+                self.apply(plan, state, jobs=2)
+        self.assertLess(len(b_chunks), 40)
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo")
+        self.assertEqual(list(self.root.rglob(f"*{savegdrive.PART_SUFFIX}")), [])
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/b.txt"], "UPDATE")
 
     def test_disk_trash_at_the_destination_root_is_never_sent(self):
         # security 18: with a disk root as the destination, send2trash puts what it removes in <root>/.Trash-<uid>
