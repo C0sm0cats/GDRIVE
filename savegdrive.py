@@ -2523,7 +2523,13 @@ class DriveSelectorApp(App):
     def action_empty_trash(self):
         if self.busy:
             return
-        count = len(self.children_of.get(None, [])) if self.view.nodes else 0
+        if self.view.nodes is None:  # no count yet: never ask on a made-up "0 items"
+            if self.view.error is not None:
+                self.notify("The Trash could not be listed, so it is not emptied.", severity="warning")
+            else:
+                self.notify("The Trash view is still loading.", severity="warning")
+            return
+        count = len(self.children_of.get(None, []))
         self.drive_change(
             f"Empty the Google Drive trash ({plural(count, 'item')} at its top)? Everything in it is deleted "
             "forever.", "empty",

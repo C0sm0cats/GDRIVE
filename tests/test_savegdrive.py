@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -3370,6 +3371,51 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("r")
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
             await pilot.press("q")
+
+    async def test_empty_trash_waits_for_the_trash_to_be_listed(self):
+        drive = demo_drive()
+        drive.items["a"]["trashed"] = True
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        listed, failing = threading.Event(), [True]
+        load_view = savegdrive.load_view
+
+        def slow_trash(service, view, cache):
+            if view.root_id == savegdrive.TRASH:
+                if failing[0]:
+                    raise RuntimeError("network down")
+                listed.wait(10)
+            return load_view(service, view, cache)
+
+        def toasts():
+            return [toast.render().plain for toast in app.screen.query(Toast)]
+
+        with mock.patch.object(savegdrive, "load_view", slow_trash):
+            async with app.run_test(size=(140, 30), notifications=True) as pilot:
+                await pilot.press("shift+tab")  # Trash, whose listing fails
+                await self.wait(app, pilot)
+                await pilot.press("T")  # no "0 items" question on a list that never came
+                self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+                self.assertTrue(any("could not be listed" in toast for toast in toasts()))
+
+                failing[0] = False
+                app.views[-1].error = None
+                await pilot.press("tab", "shift+tab")  # Trash again, still loading
+                await pilot.pause()
+                self.assertIsNone(app.view.nodes)
+                await pilot.press("T")
+                self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+                self.assertTrue(any("still loading" in toast for toast in toasts()))
+
+                listed.set()
+                await self.wait(app, pilot)
+                await pilot.press("T")  # listed: the real count
+                self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
+                self.assertIn("(1 item at its top)",
+                              app.screen.query_one("#confirm").query(Static).first().render().plain)
+                await pilot.press("escape")
+                self.assertTrue(drive.items["a"]["trashed"])
+                await pilot.press("q")
 
     async def test_x_on_a_shortcut_trashes_the_shortcut(self):
         drive = demo_drive()
