@@ -5221,6 +5221,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             keys = app.screen.query_one(savegdrive.KeyBar)
             self.assertLessEqual(keys.region.bottom, 24)
 
+    async def test_preview_home_and_end_go_to_the_first_and_last_row(self):
+        # The help says home / end go to the top / bottom, not to the leftmost / rightmost column.
+        names = [f"{'Long folder name/' * 5}file {n:02}.txt" for n in range(60)]
+        plan = [{
+            "status": "NEW", "relative_path": Path(name), "kind": "FILE",
+            "item": {"name": Path(name).name, "size": "10"}, "destination": self.root / name,
+        } for name in names]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#preview-table")
+            await pilot.press("end")
+            await pilot.pause()
+            self.assertEqual(table.cursor_row, table.row_count - 1)
+            self.assertEqual(table.scroll_x, 0)
+            await pilot.press("home")
+            await pilot.pause()
+            self.assertEqual(table.cursor_row, 0)
+            self.assertEqual(table.scroll_x, 0)
+
     async def test_session_destination(self):
         app = self.make_app()
         with tempfile.TemporaryDirectory() as temp:

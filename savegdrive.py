@@ -4553,6 +4553,15 @@ def fit_path(path, suffix, width):
     return path + cut_middle(suffix, width - Text(path).cell_len)
 
 
+class PreviewTable(DataTable):
+    """home / end go to the first / last row, as the help says, not to the leftmost / rightmost column."""
+
+    BINDINGS = [
+        Binding("home", "scroll_top", "Top", show=False),
+        Binding("end", "scroll_bottom", "Bottom", show=False),
+    ]
+
+
 class PreviewScreen(Screen):
     """The plan before anything changes: y syncs, esc goes back (or cancels)."""
 
@@ -4626,7 +4635,7 @@ class PreviewScreen(Screen):
         yield Header(icon="")
         yield Static(id="preview-summary")
         yield Static(id="preview-filters")
-        yield DataTable(id="preview-table", cursor_type="row", zebra_stripes=False)
+        yield PreviewTable(id="preview-table", cursor_type="row", zebra_stripes=False)
         yield Static(id="preview-notes")
         yield KeyBar(self.KEY_CONTEXT)
 
