@@ -259,6 +259,7 @@ class FakeDrive:
                 removed |= more
             for key in removed:
                 self.items.pop(key, None)
+                self.change(key)
             return {}
 
         return FakeRequest(run)
@@ -1687,6 +1688,41 @@ class SyncTest(unittest.TestCase):
         shutil.rmtree(self.root)
         savegdrive.initialize_managed_destination(self.root)
         self.drive = demo_drive()
+
+    def test_tree_after_a_sync_replays_drive_changes_instead_of_listing_it_again(self):
+        self.sync_everything()
+        import asyncio
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        listings, after_sync, trees = [], [], []
+        list_folder = self.drive.list
+        self.drive.list = lambda q, **kwargs: listings.append(q) or list_folder(q, **kwargs)
+        run_sync = savegdrive.run_sync
+
+        def counted_sync(*args, **kwargs):
+            results = run_sync(*args, **kwargs)
+            after_sync.append(len(listings))
+            return results
+
+        def run(app):
+            if after_sync:  # the tree back after the sync: look at it, then quit
+                trees.append([node["display_path"] for node in app.views[0].nodes])
+                return None
+
+            async def drive_it():
+                async with app.run_test() as pilot:
+                    await pilot.press("down", "space", "d")  # Docs: sends new.txt
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    await pilot.press("y")
+            asyncio.run(drive_it())
+            return app.return_value
+
+        with mock.patch.object(savegdrive.DriveSelectorApp, "run", run), \
+                mock.patch.object(savegdrive, "run_sync", counted_sync):
+            self.run_main(isatty=True)
+        self.assertTrue(any(item["name"] == "new.txt" for item in self.drive.items.values()))
+        self.assertIn("Docs/new.txt", trees[0])  # the sync's own upload is in the tree
+        self.assertEqual(listings[after_sync[0]:], [])  # from the Drive changes, no folder listed again
 
     def test_tree_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
@@ -3370,12 +3406,13 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = savegdrive.initialize_managed_destination(Path(self.temp.name) / "GDrive")
 
-    def make_app(self, drive=None, views=None):
+    def make_app(self, drive=None, views=None, token=None):
         drive = drive or demo_drive()
         cache = {}
         views = views or [savegdrive.DriveView("My Drive", "root")]
         savegdrive.load_view(drive, views[0], cache)
-        return savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), drive, None, cache)
+        return savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), drive, None, cache,
+                                           token=token)
 
     def selected(self, app):
         return [savegdrive.selected_path(entry).as_posix() for entry in app.selections]
@@ -3763,9 +3800,32 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         await pilot.pause()
 
     async def test_drive_trash_restore_and_delete(self):
+        await self.drive_trash_restore_and_delete(token=None)
+
+    async def test_drive_trash_restore_and_delete_from_drive_changes(self):
+        await self.drive_trash_restore_and_delete(token="0")
+
+    async def test_drive_trash_rebuilds_the_tree_without_listing_drive_again(self):
         drive = demo_drive()
         views = savegdrive.drive_views(drive, "root")
-        app = self.make_app(drive, views)
+        listings = []
+        list_folder = drive.list
+        drive.list = lambda q, **kwargs: listings.append(q) or list_folder(q, **kwargs)
+        app = self.make_app(drive, views, token=savegdrive.start_page_token(drive))
+        tree_names = lambda: [node.data["item"]["name"] for node in app.query_one(Tree).root.children]  # noqa: E731
+        async with app.run_test() as pilot:
+            listings.clear()
+            await pilot.press("down", "down", "x", "y")  # Photos
+            await self.wait(app, pilot)
+            self.assertTrue(drive.items["photos"]["trashed"])
+            self.assertEqual(tree_names(), ["Docs", "notes.txt"])
+            self.assertEqual(listings, [])  # the Drive changes only, not every folder again
+            await pilot.press("q")
+
+    async def drive_trash_restore_and_delete(self, token):
+        drive = demo_drive()
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views, token)
         tree_names = lambda: [node.data["item"]["name"] for node in app.query_one(Tree).root.children]  # noqa: E731
         async with app.run_test() as pilot:
             await pilot.press("down", "down", "x")  # Photos, moved to the Drive trash after y

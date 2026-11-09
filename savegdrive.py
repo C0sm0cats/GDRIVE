@@ -421,7 +421,10 @@ def list_folders(service, folder_ids, cache):
             # Only what you trashed yourself; what was inside a trashed folder shows below it.
             items = [item for item in items if item.get("explicitlyTrashed", True)]
         if folder_id == TRASH or folder_id in TRASHED_FOLDERS:
-            TRASHED_FOLDERS.update(effective_id(item) for item in items if is_folder(item))
+            trashed = {effective_id(item) for item in items if is_folder(item)}
+            for stale in trashed - TRASHED_FOLDERS:
+                cache.pop(stale, None)  # listed before it was trashed: list its trashed content instead
+            TRASHED_FOLDERS.update(trashed)
         for item in items:
             item.pop("explicitlyTrashed", None)
         cache[folder_id] = sort_items(items)
@@ -597,6 +600,24 @@ def apply_changes(service, snapshot):
         cache[folder_id] = sort_items(cache[folder_id])
     debug(f"Applied {plural(count, 'Drive change')} to {plural(len(cache), 'saved folder')}")
     return cache, response["newStartPageToken"]
+
+
+def refresh_listings(service, cache, token):
+    """Bring cache up to date with the Drive changes since token instead of listing every folder again.
+
+    Shared with me and the Trash are searches, and trashed folders list trashed items: the changes feed does
+    not update them, so their listings go and are listed again when needed. Returns the new token; when token
+    is no longer valid, the whole cache goes.
+    """
+    searches = {SHARED_WITH_ME, TRASH} | TRASHED_FOLDERS
+    folders = {folder_id: items for folder_id, items in cache.items() if folder_id not in searches}
+    replayed = apply_changes(service, {"token": token, "folders": folders})
+    TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
+    cache.clear()
+    if replayed is None:
+        return start_page_token(service)
+    cache.update(replayed[0])
+    return replayed[1]
 
 
 SHORTCUT_TARGET_FIELDS = (
@@ -2587,22 +2608,33 @@ class DriveSelectorApp(App):
         self.push_screen(ConfirmScreen(question, word), answered)
 
     def change_in_background(self, work, done):
+        service = self.make_service()
         try:
-            failed = work(self.make_service()) or {}
+            failed = work(service) or {}
         except (HttpError, OSError) as error:
             failed = {"": error_text(error)}
-        self.call_from_thread(self.drive_changed, done, failed)
+        replayed = False
+        if self.drive_token is not None:
+            # Replay what changed on Drive rather than listing the whole tree again.
+            try:
+                with self.cache_lock:
+                    self.drive_token = refresh_listings(service, self.cache, self.drive_token)
+                replayed = True
+            except DRIVE_CALL_ERRORS as error:
+                debug(f"Could not replay the Drive changes, listing again: {error_text(error)}")
+        self.call_from_thread(self.drive_changed, done, failed, replayed)
 
-    def drive_changed(self, done, failed):
+    def drive_changed(self, done, failed, replayed=False):
         self.busy = False
         if failed:
             first = next(iter(failed.values()))
             self.notify(f"{plural(len(failed), 'item')} failed: {first}", severity="error", markup=False)
         else:
             self.notify(done, markup=False)
-        # Drive changed: reload every view from scratch, starting with this one; the selection goes.
-        self.cache.clear()
-        TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
+        # Drive changed: rebuild every view from the updated listings, starting with this one; the selection goes.
+        if not replayed:
+            self.cache.clear()
+            TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
         self.selections.clear()
         self.label_index = None
         for view in self.views:
@@ -5137,13 +5169,12 @@ def main():
                 break
             notice = result_notice(plan, results)
             if changes_drive(plan):
-                # Drive changed under the loaded tree: list it again before the next round.
-                token = start_page_token(service)
-                cache.clear()
-                TRASHED_FOLDERS.clear()
-                for view_ in views:
-                    view_.nodes, view_.error, view_.sorted_by = None, None, "name"
-                load_view(service, view, cache)
+                # Drive changed under the loaded tree: replay its changes before the next round.
+                with console.status("[dim]Checking Drive changes…[/]"):
+                    token = refresh_listings(service, cache, token)
+                    for view_ in views:
+                        view_.nodes, view_.error, view_.sorted_by = None, None, "name"
+                    load_view(service, view, cache)
         if failed:
             raise SystemExit(1)
     except KeyboardInterrupt:
