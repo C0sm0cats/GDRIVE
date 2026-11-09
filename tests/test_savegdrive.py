@@ -1692,6 +1692,43 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Empty there"], "TRASH_REMOTE")
         self.assertTrue(self.drive.items["empty"]["trashed"])
 
+    def test_empty_folder_deleted_on_drive_but_filled_here_is_kept(self):
+        # tests 12: a synced empty folder gone from Drive follows the deletion only while it is still empty.
+        # A new file here is sent back up; a link (never sent) keeps the folder here.
+        self.drive.items["empty"] = {"id": "empty", "name": "Empty", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["empty2"] = {"id": "empty2", "name": "Empty 2", "mimeType": FOLDER, "parent": "root"}
+        self.run_sync()
+        del self.drive.items["empty"], self.drive.items["empty2"]
+        (self.root / "Empty/mine.txt").write_bytes(b"made here")
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_bytes(b"outside")
+        (self.root / "Empty 2/link").symlink_to(outside)
+        statuses, results = self.run_sync()
+        self.assertEqual((statuses["Empty"], statuses["Empty/mine.txt"]), ("UPLOAD_NEW", "UPLOAD_NEW"))
+        self.assertNotIn("Empty 2", statuses)
+        self.assertEqual(statuses["Empty 2/link"], "LOCAL_ONLY")
+        self.assertEqual(results["FILE_ERROR"] + results["FOLDER_ERROR"], 0)
+        self.assertEqual((self.root / "Empty/mine.txt").read_bytes(), b"made here")
+        self.assertTrue((self.root / "Empty 2/link").is_symlink())
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_folder_deleted_on_drive_with_something_new_here_keeps_the_folder(self):
+        # tests 12: the folder emptied into your trash is removed only if nothing else is left in it.
+        self.run_sync()
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_bytes(b"outside")
+        (self.root / "Photos/link").symlink_to(outside)  # never sent: Photos is not created again on Drive
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertEqual(statuses["Photos/link"], "LOCAL_ONLY")
+        self.assertNotIn("Photos", statuses)
+        self.assertEqual(results["FILE_ERROR"] + results["FOLDER_ERROR"], 0)
+        self.assertFalse((self.root / "Photos/beach.jpg").exists())
+        self.assertTrue((self.root / "Photos/link").is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside")
+
     def test_mass_deletion_needs_a_check(self):
         for i in range(30):
             self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
