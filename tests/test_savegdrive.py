@@ -487,6 +487,41 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["a"]["content"], b"alpha from Drive")
         self.assertEqual(self.drive.uploads, [])
 
+    def test_broken_file_shortcut_skipped_not_whole_sync(self):
+        # An editor adds a shortcut to one of their files, syncs, then deletes that file.
+        self.drive.items.update({
+            "q4": {"id": "q4", "name": "Q4 numbers.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                   "parent": "docs", "shortcutDetails": {"targetId": "theirs", "targetMimeType": "text/plain"}},
+            "theirs": file_item("theirs", "numbers.txt", "elsewhere", b"numbers"),
+        })
+        self.run_sync()
+        self.assertEqual((self.root / "Docs/Q4 numbers.txt").read_bytes(), b"numbers")
+        del self.drive.items["theirs"]
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200)):
+            plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertIn("Docs/Q4 numbers.txt: shortcut target not available, skipped", output.getvalue())
+        self.assertEqual(statuses["Docs/Q4 numbers.txt"], "SKIPPED")
+        self.assertEqual(statuses["Docs/a.txt"], "UPDATE")
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.apply(plan, state)
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha v2")
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+        # The copy synced before stays here, and is not sent to Drive as a new file.
+        self.assertEqual((self.root / "Docs/Q4 numbers.txt").read_bytes(), b"numbers")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertNotIn("Q4 numbers.txt", {item["name"] for item in self.drive.items.values()
+                                             if item["mimeType"] != savegdrive.SHORTCUT_MIME_TYPE})
+
+        # Any other Drive error still stops the run.
+        with mock.patch.object(savegdrive, "resolve_file_shortcut", side_effect=http_error(500)):
+            with self.assertRaises(HttpError):
+                self.preview()
+
     def test_folder_shortcut_content_only_comes_down(self):
         # My Drive holds a shortcut to someone else's folder: its content never goes back up.
         self.drive.items.update({

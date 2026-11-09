@@ -2852,7 +2852,26 @@ def collect_plan(
         return
 
     shortcut = item["mimeType"] == SHORTCUT_MIME_TYPE or item.get("readonly")
-    item = resolve_file_shortcut(service, item)
+    try:
+        item = resolve_file_shortcut(service, item)
+    except HttpError as error:
+        if error.status_code not in {403, 404}:
+            raise
+        # Target deleted or no longer shared: skip this one shortcut, not the whole sync.
+        # Its path stays a Drive file, so a copy synced before is neither sent nor trashed.
+        warn(f"{relative_path.as_posix()}: shortcut target not available, skipped")
+        plan.append(
+            {
+                "status": "SKIPPED",
+                "kind": "FILE",
+                "item": dict(item, readonly=True),
+                "relative_path": relative_path,
+                "destination": destination,
+                "local_sha256": None,
+                "local_stat": local_stat(destination),
+            }
+        )
+        return
     if shortcut:
         item = dict(item, readonly=True)  # the target may live anywhere: only downloaded
     relative_path = relative_parent / local_name(item)
