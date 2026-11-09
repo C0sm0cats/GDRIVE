@@ -18,7 +18,7 @@ import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import httplib2
 from google.auth.exceptions import GoogleAuthError, TransportError
@@ -3487,12 +3487,6 @@ def classify_file(service, item, relative_path, destination, state):
     return "CONFLICT", current_sha256, None
 
 
-def tracked_below(state, relative_path):
-    """Records of the files synced below relative_path."""
-    prefix = relative_path.as_posix() + "/"
-    return [record for record in state["files"].values() if record.get("path", "").startswith(prefix)]
-
-
 def synced_here_before(state, relative_path, folder_id, tracked_folders):
     """This Drive folder was synced at this path: gone here, it was deleted here."""
     known_id = state.get("folders", {}).get(relative_path.as_posix())
@@ -4537,6 +4531,24 @@ def space_line(plan, destination_root):
 
 def deletion_count(plan, state):
     """Files the plan deletes (a folder counts the synced files below it), and the synced files in play."""
+    deleted_folders = {entry["relative_path"].as_posix() for entry in plan
+                       if entry["status"] in DELETIONS and entry["kind"] == "FOLDER" and "files_below" not in entry}
+    in_play = {entry["relative_path"].as_posix() for entry in plan}
+    below = Counter()
+    synced = 0  # an older selection's files, still in the state, are not in play
+    for record in state["files"].values():  # one pass: each path's folders, not each folder's whole state
+        path = record.get("path")
+        if not path:
+            continue
+        played = path in in_play or "." in in_play
+        cut = path.rfind("/")
+        while cut > 0:
+            path = path[:cut]
+            if path in deleted_folders:
+                below[path] += 1
+            played = played or path in in_play
+            cut = path.rfind("/")
+        synced += played
     count = 0
     for entry in plan:
         if entry["status"] not in DELETIONS:
@@ -4544,22 +4556,18 @@ def deletion_count(plan, state):
         if "files_below" in entry:
             count += max(1, entry["files_below"])  # a whole folder deleted on Drive: its files, counted at the plan
         elif entry["kind"] == "FOLDER":
-            count += max(1, len(tracked_below(state, entry["relative_path"])))
+            count += max(1, below[entry["relative_path"].as_posix()])
         else:
             count += 1
-    in_play = {entry["relative_path"].as_posix() for entry in plan}
-    synced = sum(  # an older selection's files, still in the state, are not in play
-        1 for record in state["files"].values()
-        if record.get("path") and (record["path"] in in_play
-                                   or not in_play.isdisjoint(parent.as_posix() for parent in
-                                                             PurePosixPath(record["path"]).parents))
-    )
     return count, synced
 
 
-def needs_deletion_check(plan, state):
-    count, synced = deletion_count(plan, state)
+def too_many_deletions(count, synced):
     return count > MASS_DELETION_FILES or (count > MASS_DELETION_MIN and synced and count > synced * MASS_DELETION_SHARE)
+
+
+def needs_deletion_check(plan, state):
+    return too_many_deletions(*deletion_count(plan, state))
 
 
 def plan_notes(plan, terminal=False):
@@ -5045,8 +5053,8 @@ class PreviewScreen(Screen):
         self.refresh_plan()
 
     def action_confirm(self):
-        if self.state is not None and needs_deletion_check(self.plan, self.state):
-            count, _ = deletion_count(self.plan, self.state)
+        count, synced = deletion_count(self.plan, self.state) if self.state is not None else (0, 0)
+        if self.state is not None and too_many_deletions(count, synced):
 
             def answered(yes):
                 if yes:
@@ -5786,8 +5794,8 @@ def ask(question):
 
 def confirm_in_terminal(args, plan, state):
     """The terminal preview's answer: always yes with --yes, unless it deletes too much."""
-    if needs_deletion_check(plan, state):
-        count, _ = deletion_count(plan, state)
+    count, synced = deletion_count(plan, state)
+    if too_many_deletions(count, synced):
         if args.yes and not args.allow_deletions:
             console.print(
                 f"[red]✗[/] This sync deletes {plural(count, 'file')}: refused with --yes. Check it in the "

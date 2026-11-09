@@ -4293,6 +4293,24 @@ class DeletionScalingTest(unittest.TestCase):
     def test_build_plan_reads_the_state_once_for_all_folders(self):
         self.assertEqual(self.plan_moved_folders(2), self.plan_moved_folders(30))
 
+    def confirm_folder_deletions(self, count):
+        # perf 13: one pass over the state per deleted folder, twice, froze `y` 2.5 to 4.3 s on 500 folders.
+        state = self.state(count, 2)
+        plan = [{"status": "TRASH_REMOTE", "kind": "FOLDER", "relative_path": Path(f"Old{folder}")}
+                for folder in range(count)]
+        plan.append({"status": "UNCHANGED", "kind": "FILE", "relative_path": Path("Old0x/kept.txt")})
+        args = mock.Mock(yes=True, allow_deletions=True)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            self.assertTrue(savegdrive.confirm_in_terminal(args, plan, state))
+        self.assertEqual(savegdrive.deletion_count(plan, state), (2 * count, 2 * count + 1))
+        state["files"].passes = 0
+        savegdrive.confirm_in_terminal(args, plan, state)
+        return state["files"].passes
+
+    def test_deletion_check_reads_the_state_once_for_all_folders(self):
+        self.assertEqual(self.confirm_folder_deletions(2), 1)
+        self.assertEqual(self.confirm_folder_deletions(30), 1)
+
 
 class CountingPath(type(Path())):
     """A trashed folder path that counts the comparisons made with it."""
