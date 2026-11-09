@@ -1084,6 +1084,11 @@ def initialize_managed_destination(destination):
         if not destination.is_dir():
             raise ValueError("The final destination is not a directory.")
     else:
+        # Only the folder itself is created: a missing parent may be an unmounted disk.
+        if not destination.parent.is_dir():
+            raise ValueError(
+                f"The parent folder {destination.parent} does not exist: create it first."
+            )
         destination.mkdir(parents=False)
     fd = lock_folder(destination)
     try:

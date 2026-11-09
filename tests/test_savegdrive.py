@@ -3305,7 +3305,7 @@ class SyncTest(unittest.TestCase):
         target = Path(self.temp.name) / "Once"
         self.assertEqual(savegdrive.resolve_destination(str(target)), target)
         self.assertTrue(savegdrive.has_valid_state(target))
-        with self.assertRaises(OSError):
+        with self.assertRaisesRegex(ValueError, "does not exist: create it first"):
             savegdrive.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
 
         # The default ~/GDrive, and --download-path=~/x, which the shell leaves unexpanded after "=".
@@ -3320,6 +3320,20 @@ class SyncTest(unittest.TestCase):
             self.assertEqual(savegdrive.resolve_destination("~/x"), home / "x")
         self.assertTrue(savegdrive.has_valid_state(home / "GDrive"))
         self.assertEqual(list(workdir.iterdir()), [])
+
+    def test_download_path_with_missing_parent_says_create_it_first(self):
+        # A missing parent may be an unmounted disk: it is not created, and the message says so.
+        target = Path(self.temp.name) / "Backups" / "GDrive"
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["savegdrive", "--download-path", str(target)]), \
+                mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)), \
+                mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")):
+            with self.assertRaises(SystemExit) as raised:
+                savegdrive.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn(f"The parent folder {target.parent} does not exist: create it first.", output.getvalue())
+        self.assertNotIn("Errno", output.getvalue())
+        self.assertFalse(target.parent.exists())
 
     def test_folder_synced_with_my_drive_refuses_another_folder_id(self):
         self.run_sync()  # My Drive, in a folder made before the Drive root was recorded

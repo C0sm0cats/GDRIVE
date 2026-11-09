@@ -133,7 +133,7 @@ on the first run of a new version and then every 30 days. To upgrade them now:
 
 Files are synced with `~/GDrive` by default; use `--download-path PATH` for
 another folder, or press `f` in the tree to change it for the session. The
-folder is created if it does not exist. It must be:
+folder is created if it does not exist (its parent folder must exist). It must be:
 
 - new;
 - empty; or
