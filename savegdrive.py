@@ -188,7 +188,17 @@ def oauth_flow():
             "(OAuth client ID, Desktop app) and save it there as credentials.json.[/]"
         )
         sys.exit(1)
-    return InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
+    try:
+        return InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
+    except ValueError as error:
+        # A service account key, a web/other JSON, or a truncated file (JSONDecodeError is a ValueError).
+        detail = f" (invalid JSON: {error})" if isinstance(error, json.JSONDecodeError) else ""
+        console.print(
+            f"[red]✗[/] {escape(str(CREDENTIALS_PATH))} is not a Google OAuth client file{escape(detail)}.\n"
+            "  [dim]In Google Cloud Console → APIs & Services → Credentials, create an OAuth client ID "
+            "of type Desktop app (not a service account), download it and save it there as credentials.json.[/]"
+        )
+        sys.exit(1)
 
 
 def open_quietly(url):

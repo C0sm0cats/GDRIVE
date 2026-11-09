@@ -3359,6 +3359,21 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Errno", output.getvalue())
         self.assertFalse(target.parent.exists())
 
+    def test_wrong_credentials_file_says_what_to_download_instead_of_a_traceback(self):
+        # A service account key and a truncated file: both common first-install mistakes.
+        credentials = Path(self.temp.name) / "credentials.json"
+        for content in ('{"type": "service_account", "project_id": "p"}', '{"installed": {"client_id" "x"'):
+            credentials.write_text(content)
+            output = io.StringIO()
+            with mock.patch.object(savegdrive, "CREDENTIALS_PATH", credentials), \
+                    mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)):
+                with self.assertRaises(SystemExit) as raised:
+                    savegdrive.oauth_flow()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn(f"{credentials} is not a Google OAuth client file", output.getvalue())
+            self.assertIn("OAuth client ID of type Desktop app", output.getvalue())
+            self.assertNotIn("web or installed app", output.getvalue())
+
     def test_again_without_a_previous_selection_names_download_path_and_creates_nothing(self):
         # A typo in the path, or a folder never synced (self.root: no selection yet): no folder made, no sign-in.
         for target in (Path(self.temp.name) / "Wrok", self.root):
