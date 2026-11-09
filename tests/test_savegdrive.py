@@ -1,4 +1,5 @@
 import fcntl
+import html
 import io
 import json
 import os
@@ -4964,6 +4965,50 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                     self.assertRegex(shown, rf"(?m)^(.* )? {re.escape(view.name)}( |$)", (size, lines))
                 self.assertTrue(all(len(line) <= row.size.width for line in lines), lines)
             await pilot.press("q")
+
+    async def test_selection_state_and_unchanged_status_stay_readable_on_the_dark_tui(self):
+        # design 5: the unchecked ☐, "Nothing selected" and "unchanged"/"skipped" were bright_black,
+        # rendered #625e4c: 2.8:1 on the dark background, under the 4.5:1 of readable text.
+        def luminance(color):
+            channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            r, g, b = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+        def contrasts(svg, words):
+            """(text, contrast with the background under it) of each SVG text that contains one of words."""
+            fills = dict(re.findall(r"\.(terminal-[\w-]+-r\d+) \{ fill: (#[0-9a-f]{6})", svg))
+            cells = [(round(float(y) / 24.4), float(x), float(x) + float(w), fill) for fill, x, y, w in
+                     re.findall(r'<rect fill="(#[0-9a-f]{6})" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)"', svg)]
+            found = []
+            for cls, x, y, text in re.findall(r'<text class="([^"]+)" x="([\d.]+)" y="([\d.]+)"[^>]*>([^<]*)<', svg):
+                text = html.unescape(text).replace("\xa0", " ")
+                if cls not in fills or not any(word in text for word in words):
+                    continue
+                row, x = round((float(y) - 18.5) / 24.4), float(x)
+                ground = next(fill for cell_row, x0, x1, fill in cells if cell_row == row and x0 <= x < x1)
+                light, dark = sorted((luminance(fills[cls]), luminance(ground)), reverse=True)
+                found.append((text.strip(), round((light + 0.05) / (dark + 0.05), 1)))
+            return found
+
+        app = self.make_app()
+        async with app.run_test(size=(110, 27)) as pilot:
+            await pilot.pause()
+            found = contrasts(app.export_screenshot(), ("☐", "Nothing selected"))
+            await pilot.press("q")
+        self.assertTrue(any("☐" in text for text, _ in found), found)
+        self.assertTrue(any("Nothing selected" in text for text, _ in found), found)
+        self.assertTrue(all(ratio >= 4.5 for _, ratio in found), found)
+
+        plan = [{"status": status, "relative_path": Path(f"{status.lower()}.txt"), "kind": "FILE",
+                 "item": {"name": f"{status.lower()}.txt", "size": "10", "mimeType": "text/plain"},
+                 "destination": self.root / "x.txt"}
+                for status in ("NEW", "UNCHANGED", "SKIPPED")]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(110, 27)) as pilot:
+            await pilot.pause()
+            found = contrasts(app.export_screenshot(), ("unchanged", "skipped"))
+        self.assertTrue(any("1 unchanged" in text for text, _ in found), found)
+        self.assertTrue(all(ratio >= 4.5 for _, ratio in found), found)
 
     async def test_view_that_failed_to_load_is_tried_again_when_switching_back(self):
         # ux 34: one network error on a view's first listing left it in error for the whole session.

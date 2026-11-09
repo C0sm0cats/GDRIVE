@@ -920,6 +920,9 @@ def plural(count, word):
 
 
 SELECTION_BOXES = {"x": "☑ ", "*": "◩ "}  # selection state -> checkbox; anything else is "☐ "
+# Gray text that must stay readable on the dark TUI (5.4:1 on #081525); bright_black is 2.8:1, kept
+# only for what is grayed out on purpose (items that cannot be downloaded).
+MUTED = "#7d8ca3"
 
 
 def selected_path(entry):
@@ -2486,7 +2489,7 @@ class DriveSelectorApp(App):
         label = Text()
         label.append(
             SELECTION_BOXES.get(state, "☐ "),
-            style="bold bright_green" if state != " " else "bright_black",
+            style="bold bright_green" if state != " " else MUTED,
         )
         mark = self.marks.get(entry["index"])
         if mark:
@@ -2559,7 +2562,7 @@ class DriveSelectorApp(App):
             if total_bytes:
                 text.append(f" · {human_size(total_bytes)}", style="dim")
         else:
-            text.append("Nothing selected", style="bright_black")
+            text.append("Nothing selected", style=MUTED)
         if self.filter_terms:
             text.append("   filter: ", style="dim")
             text.append(" ".join(self.filter_terms), style="bold #f59e0b")
@@ -4192,11 +4195,11 @@ STATUS_STYLES = {
     "UPLOAD": ("bright_cyan", "↑ changed", "↑ Changed"),
     "TRASH_REMOTE": ("magenta", "↑ to Drive trash", "Deleted here"),
     "TRASH_LOCAL": ("bright_magenta", "↓ to your trash", "Deleted on Drive"),
-    "UNCHANGED": ("bright_black", "unchanged", "Unchanged"),
+    "UNCHANGED": (MUTED, "unchanged", "Unchanged"),
     "CONFLICT": ("yellow", "conflict", "Conflict"),
     "KEEP_BOTH": ("bright_yellow", "keep both", "Keep both"),
     "LOCAL_ONLY": ("blue", "local only", "Local only"),
-    "SKIPPED": ("bright_black", "skipped", "Skipped"),
+    "SKIPPED": (MUTED, "skipped", "Skipped"),
 }
 ACTIONS = {"NEW", "UPDATE", "UPLOAD_NEW", "UPLOAD", "TRASH_REMOTE", "TRASH_LOCAL", "KEEP_BOTH"}
 DOWNLOADS = {"NEW", "UPDATE", "KEEP_BOTH"}
@@ -4262,7 +4265,7 @@ def set_keep_both(plan, entries, keep):
 
 # Printed output lands on the terminal's own background, light or dark: words and numbers keep its default
 # color (bold or dim at most), and only marks are colored, in bold when the color is too pale on white.
-TERMINAL_WORD_STYLES = {"yellow": "bold", "bright_yellow": "bold", "bright_black": "dim", "red": "red"}
+TERMINAL_WORD_STYLES = {"yellow": "bold", "bright_yellow": "bold", MUTED: "dim", "red": "red"}
 TERMINAL_MARK_STYLES = {"yellow": "bold", "bright_yellow": "bold", "bright_green": "bold", "bright_cyan": "bold"}
 
 
@@ -5485,7 +5488,7 @@ RESULT_LABELS = [
     (("FILE_NEW",), "green", "downloaded", "downloaded"),
     (("FILE_UPDATE",), "cyan", "updated from Drive", "updated from Drive"),
     (("FILE_UPLOAD_NEW", "FILE_UPLOAD"), "bright_cyan", "sent to Drive", "sent to Drive"),
-    (("FILE_UNCHANGED", "FOLDER_UNCHANGED"), "bright_black", "unchanged", "unchanged"),
+    (("FILE_UNCHANGED", "FOLDER_UNCHANGED"), MUTED, "unchanged", "unchanged"),
     (("FOLDER_NEW",), "green", "folder created here", "folders created here"),
     (("FOLDER_UPLOAD_NEW",), "bright_cyan", "folder created on Drive", "folders created on Drive"),
     (("FILE_TRASH_REMOTE", "FOLDER_TRASH_REMOTE"), "magenta", "moved to the Drive trash", "moved to the Drive trash"),
@@ -5493,7 +5496,7 @@ RESULT_LABELS = [
     (("FILE_KEEP_BOTH",), "bright_yellow", "conflict kept both ways", "conflicts kept both ways"),
     (("FILE_CONFLICT", "FOLDER_CONFLICT"), "yellow", "conflict kept", "conflicts kept"),
     (("FILE_LOCAL_ONLY", "FOLDER_LOCAL_ONLY"), "blue", "local-only item kept", "local-only items kept"),
-    (("FILE_SKIPPED", "FOLDER_SKIPPED"), "bright_black", "skipped", "skipped"),
+    (("FILE_SKIPPED", "FOLDER_SKIPPED"), MUTED, "skipped", "skipped"),
     (("FILE_ERROR", "FOLDER_ERROR"), "red", "error", "errors"),
 ]
 
