@@ -2639,6 +2639,19 @@ def tracked_below(state, relative_path):
     return [record for record in state["files"].values() if record.get("path", "").startswith(prefix)]
 
 
+def tracked_folder_paths(state):
+    """Folders (posix paths) holding synced files: one pass, so a plan tests them without rereading the state."""
+    folders = set()
+    for record in state["files"].values():
+        path = record.get("path", "")
+        while "/" in path:
+            path = path.rpartition("/")[0]
+            if path in folders:
+                break  # its parents are in too
+            folders.add(path)
+    return folders
+
+
 def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, seen=frozenset()):
     """True when every Drive file below the folder was synced and has not changed since."""
     for child in list_children(service, folder_id, cache):
@@ -2667,11 +2680,14 @@ def collect_plan(
     plan,
     cache,
     ancestor_folder_ids=frozenset(),
+    tracked_folders=None,
 ):
     mime_type = effective_mime_type(item)
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
 
+    if tracked_folders is None:
+        tracked_folders = tracked_folder_paths(state)  # build_plan computes it once for all
     if mime_type == FOLDER_MIME_TYPE:
         folder_id = effective_id(item)
         status = "UNCHANGED" if destination.is_dir() else "NEW"
@@ -2686,7 +2702,10 @@ def collect_plan(
             and item["mimeType"] != SHORTCUT_MIME_TYPE
             and not is_readonly_path(relative_path)
             and can(item, "canTrash")
-            and (tracked_below(state, relative_path) or relative_path.as_posix() in state.get("folders", {}))
+            and (
+                relative_path.as_posix() in tracked_folders
+                or relative_path.as_posix() in state.get("folders", {})
+            )
             and remote_subtree_unchanged(service, folder_id, relative_path, state, cache)
         ):
             status = "TRASH_REMOTE"  # synced before, the whole folder was deleted here
@@ -2711,6 +2730,7 @@ def collect_plan(
                 plan,
                 cache,
                 ancestor_folder_ids | {folder_id},
+                tracked_folders,
             )
         return
 
@@ -2900,6 +2920,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
         cache,
     )
     plan = []
+    tracked_folders = tracked_folder_paths(state)
     for selection in selections:
         before = len(plan)
         collect_plan(
@@ -2910,6 +2931,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             state,
             plan,
             cache,
+            tracked_folders=tracked_folders,
         )
         for _ in range(len(plan) - before):
             on_item()
@@ -3526,16 +3548,23 @@ def trash_local(path):
     send2trash(str(path))
 
 
-def forget_below(state, relative_path):
-    """Drop the records of relative_path and of everything below it, files and folders."""
-    prefix = relative_path.as_posix()
-    for key in [
-        key for key, record in state["files"].items()
-        if record.get("path") == prefix or record.get("path", "").startswith(prefix + "/")
-    ]:
+def forget_all_below(state, relative_paths):
+    """Drop the records of each of relative_paths and of everything below them, files and folders, in one pass."""
+    prefixes = {relative_path.as_posix() for relative_path in relative_paths}
+    if not prefixes:
+        return
+
+    def gone(path):
+        while path:
+            if path in prefixes:
+                return True
+            path = path.rpartition("/")[0]
+        return False
+
+    for key in [key for key, record in state["files"].items() if gone(record.get("path", ""))]:
         del state["files"][key]
     folders = state.setdefault("folders", {})
-    for path in [path for path in folders if path == prefix or path.startswith(prefix + "/")]:
+    for path in [path for path in folders if gone(path)]:
         del folders[path]
 
 
@@ -3557,6 +3586,8 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
 
     def record(entry, item, local_sha256):
         state["files"][state_key(item, entry["relative_path"])] = state_record(dict(entry, item=item), local_sha256)
+
+    forgotten = []  # deleted paths, forgotten in one pass before the state is saved
 
     # 1. Folders: created here, then on Drive (parents first).
     folder_ids = {}
@@ -3732,7 +3763,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                     report("[red]✗[/]", f"{relative}: {error}")
                 else:
                     results[f"{entry['kind']}_TRASH_REMOTE"] += 1
-                    forget_below(state, entry["relative_path"])
+                    forgotten.append(entry["relative_path"])
                     report("[magenta]✗[/]", f"{relative} → Drive trash")
 
         # 5. Deleted on Drive: your copies go to your system trash; folders left empty by it go too.
@@ -3748,7 +3779,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 report("[red]✗[/]", f"{relative.as_posix()}: {error}")
                 continue
             results[f"{entry['kind']}_TRASH_LOCAL"] += 1
-            forget_below(state, relative)
+            forgotten.append(relative)
             emptied.add(relative.parent)
             report("[bright_magenta]✗[/]", f"{relative.as_posix()} → your trash")
         remote_folders = {path for path in folder_ids}
@@ -3764,6 +3795,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        forget_all_below(state, forgotten)
         save_state(destination_root, state)
     return results
 

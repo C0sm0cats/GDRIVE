@@ -1163,6 +1163,76 @@ class SyncTest(unittest.TestCase):
         self.assertIn(savegdrive.LEGACY_REMOTE_CACHE_NAME, savegdrive.RESERVED_NAMES)
 
 
+class CountingFiles(dict):
+    """state["files"] that counts the passes over it."""
+    passes = 0
+
+    def items(self):
+        self.passes += 1
+        return super().items()
+
+    def values(self):
+        self.passes += 1
+        return super().values()
+
+
+class DeletionScalingTest(unittest.TestCase):
+    """Deletions and moved folders read the state once, not once per file or folder (perf 1)."""
+
+    def state(self, folders, per_folder):
+        files = CountingFiles(
+            (f"id-{folder}-{index}", {"path": f"Old{folder}/f{index}.txt"})
+            for folder in range(folders) for index in range(per_folder)
+        )
+        files["keep"] = {"path": "Old0x/kept.txt"}  # same start as Old0, not below it
+        return {"files": files, "folders": {"Old0": "d0", "Old0/sub": "s0", "Old0x": "k"}}
+
+    def apply_local_trash(self, count):
+        state = self.state(1, count)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = [
+                {"status": "TRASH_LOCAL", "kind": "FILE", "item": None, "state_key": f"id-0-{index}",
+                 "relative_path": Path(f"Old0/f{index}.txt"), "destination": root / f"Old0/f{index}.txt"}
+                for index in range(count)
+            ]
+            with mock.patch.object(savegdrive, "trash_local", lambda path: None), \
+                    mock.patch.object(savegdrive, "save_state", lambda *args: None), \
+                    mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                savegdrive.apply_plan(None, plan, root, state)
+        self.assertEqual(dict(state["files"]), {"keep": {"path": "Old0x/kept.txt"}})
+        return state["files"].passes
+
+    def test_apply_plan_forgets_deletions_in_one_pass(self):
+        self.assertEqual(self.apply_local_trash(3), self.apply_local_trash(40))
+
+    def test_forget_all_below_drops_paths_and_everything_below(self):
+        state = self.state(3, 2)
+        savegdrive.forget_all_below(state, [Path("Old0"), Path("Old1/f0.txt")])
+        self.assertEqual(sorted(record["path"] for record in state["files"].values()),
+                         ["Old0x/kept.txt", "Old1/f1.txt", "Old2/f0.txt", "Old2/f1.txt"])
+        self.assertEqual(state["folders"], {"Old0x": "k"})
+
+    def plan_moved_folders(self, count):
+        state = self.state(count, 2)
+        selections = [
+            {"item": {"id": f"d{folder}", "name": f"Old{folder}", "mimeType": FOLDER,
+                      "capabilities": {"canTrash": True, "canAddChildren": True}}, "relative_parent": Path()}
+            for folder in range(count)
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(savegdrive, "prefetch_folders", lambda *args: None), \
+                mock.patch.object(savegdrive, "list_children", lambda *args: []), \
+                mock.patch.object(savegdrive, "remote_subtree_unchanged", lambda *args: True):
+            state["files"].passes = 0
+            plan = savegdrive.build_plan(None, selections, [Path()], Path(temp), state, {})
+        self.assertEqual({entry["status"] for entry in plan if entry["kind"] == "FOLDER"}, {"TRASH_REMOTE"})
+        return state["files"].passes
+
+    def test_build_plan_reads_the_state_once_for_all_folders(self):
+        self.assertEqual(self.plan_moved_folders(2), self.plan_moved_folders(30))
+
+
 class UploadTest(unittest.TestCase):
     def test_upload_file_sends_every_chunk(self):
         class Request:
