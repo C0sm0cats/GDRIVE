@@ -316,7 +316,7 @@ tree and `./run-savegdrive.sh --help` list them all with these descriptions.
 | `↑` `↓` | Move |
 | `←` `→` | Collapse / expand a folder, or go to the parent folder / first child |
 | `enter` | Collapse / expand a folder |
-| `e` | Expand the whole view; again: collapse it all (shift+space: below the cursor) |
+| `e` | Expand the whole view; again: collapse it all (shift+e: below the cursor) |
 | `pgup` `pgdn` | Scroll a page (home / end: top / bottom) |
 | `tab` | Next view: My Drive, Shared with me, each shared drive, then Trash |
 | `shift+tab` | Previous view |
@@ -341,7 +341,7 @@ tree and `./run-savegdrive.sh --help` list them all with these descriptions.
 | `↑` `↓` | Move |
 | `←` `→` | Collapse / expand a folder, or go to the parent folder / first child |
 | `enter` | Collapse / expand a folder |
-| `e` | Expand the whole view; again: collapse it all (shift+space: below the cursor) |
+| `e` | Expand the whole view; again: collapse it all (shift+e: below the cursor) |
 | `pgup` `pgdn` | Scroll a page (home / end: top / bottom) |
 | `tab` | Next view: My Drive, Shared with me, each shared drive, then Trash |
 | `shift+tab` | Previous view |

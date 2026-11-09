@@ -1369,7 +1369,7 @@ TREE_MOVE = ("Move", [
     ("↑ ↓", "move", "move"),
     ("← →", "fold / unfold", "collapse / expand a folder, or go to the parent folder / first child"),
     ("enter", "fold / unfold", "collapse / expand a folder"),
-    ("e", "unfold all", "expand the whole view; again: collapse it all (shift+space: below the cursor)"),
+    ("e", "unfold all", "expand the whole view; again: collapse it all (shift+e: below the cursor)"),
     ("pgup pgdn", "scroll", "scroll a page (home / end: top / bottom)"),
 ])
 TREE_VIEW = ("View", [
@@ -1861,7 +1861,7 @@ class DriveTree(Tree):
         Binding("left", "app.collapse_or_parent", "Collapse", show=False),
         Binding("right", "app.expand_or_child", "Expand", show=False),
         Binding("e", "app.unfold_view", "Unfold all", show=False),
-        Binding("shift+space", "app.expand_all", "Expand below", show=False),
+        Binding("E", "app.expand_all", "Expand below", show=False, key_display="shift+e"),
     ]
 
 

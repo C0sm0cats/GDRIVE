@@ -4764,7 +4764,7 @@ class SignInTest(unittest.TestCase):
 
 
 class KeyListTest(unittest.TestCase):
-    NAMES = {"question_mark": "?", "slash": "/", "escape": "esc", "B": "shift+b", "T": "shift+t", "X": "shift+x",
+    NAMES = {"question_mark": "?", "slash": "/", "escape": "esc", "B": "shift+b", "E": "shift+e", "T": "shift+t", "X": "shift+x",
              "up": "↑", "down": "↓", "left": "←", "right": "→"}
 
     def listed(self, context):
@@ -5911,6 +5911,27 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("e")
             tree = app.query_one(Tree)
             self.assertTrue(all(node.is_expanded for node in tree.root.children if node.allow_expand))
+            await pilot.press("q")
+
+    async def test_shift_e_expands_below_the_cursor(self):
+        # ux 37: xterm, VTE and Konsole send shift+space as a plain space, so the help names shift+e,
+        # which every terminal sends (shift+space was only seen as such with the kitty keyboard protocol).
+        self.assertIn("shift+e: below the cursor", savegdrive.TREE_MOVE[1][3][2])
+        app = self.make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            tree = app.query_one(Tree)
+            await pilot.press("down")
+            docs = tree.cursor_node
+            self.assertTrue(docs.allow_expand)
+            self.assertFalse(docs.is_expanded)
+            await pilot.press("E")
+            await pilot.pause()
+            self.assertTrue(docs.is_expanded)
+            self.assertEqual(app.selections, [])
+            others = [node for node in tree.root.children if node is not docs and node.allow_expand]
+            self.assertTrue(others)
+            self.assertFalse(any(node.is_expanded for node in others))
             await pilot.press("q")
 
 
