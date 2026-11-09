@@ -1426,6 +1426,27 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         columns = {line.index(" 5 B") for line in lines if " 5 B" in line}
         self.assertEqual(len(columns), 1, lines)
 
+    async def test_preview_rows_stay_visible_in_80x24(self):
+        def entry(status, name, **extra):
+            return {
+                "status": status, "relative_path": Path(name), "kind": "FILE",
+                "item": {"name": name, "size": "10"}, "destination": self.root / name, **extra,
+            }
+        plan = [  # every note at once: they would push the table out of view
+            entry("CONFLICT", "a.txt"),
+            entry("KEEP_BOTH", "b.txt", local_copy=self.root / "b (local).txt", copy_goes_up=False),
+            entry("TRASH_REMOTE", "c.txt"),
+            entry("TRASH_LOCAL", "d.txt"),
+            entry("LOCAL_ONLY", "e.txt", item=None),
+        ]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#preview-table")
+            self.assertGreaterEqual(table.region.height, 6)  # border, header and some rows
+            keys = app.screen.query_one(savegdrive.KeyBar)
+            self.assertLessEqual(keys.region.bottom, 24)
+
     async def test_session_destination(self):
         app = self.make_app()
         with tempfile.TemporaryDirectory() as temp:

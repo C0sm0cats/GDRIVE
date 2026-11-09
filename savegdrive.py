@@ -3168,6 +3168,7 @@ class PreviewScreen(Screen):
 
     #preview-table {
         height: 1fr;
+        min-height: 6;
         margin: 1 2 0 2;
         border: round #38bdf8;
         background: #081525;
@@ -3185,6 +3186,8 @@ class PreviewScreen(Screen):
 
     #preview-notes {
         height: auto;
+        max-height: 30%;
+        overflow-y: auto;
         margin: 0 2;
         padding: 0 1;
         color: #94a3b8;
