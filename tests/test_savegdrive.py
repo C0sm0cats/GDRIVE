@@ -560,6 +560,163 @@ class SyncTest(unittest.TestCase):
             self.assertTrue(savegdrive.confirm_in_terminal(args, plan, state))
         shutil.rmtree(self.root / "Photos")
 
+    def deletion_plan(self):
+        plan, state = self.preview()
+        return plan, state, savegdrive.deletion_count(plan, state), savegdrive.needs_deletion_check(plan, state)
+
+    def test_folder_deleted_here_counts_its_files(self):
+        for i in range(30):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")  # one folder in the plan, 31 synced files gone
+        _, _, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (31, 35))
+        self.assertTrue(check)
+
+    def test_deleting_more_than_a_quarter_needs_a_check(self):
+        for i in range(36):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        self.run_sync()
+        for i in range(11):  # 11 of 41: fewer than 20, more than a quarter
+            (self.root / f"Photos/m{i}.txt").unlink()
+        _, _, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (11, 41))
+        self.assertTrue(check)
+
+    def test_mass_deletion_on_drive_needs_a_check(self):
+        for i in range(30):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        self.run_sync()
+        for key in ["p"] + [f"m{i}" for i in range(30)]:
+            del self.drive.items[key]
+        plan, state, counts, check = self.deletion_plan()
+        self.assertEqual(counts, (31, 35))
+        self.assertTrue(check)
+        args = mock.Mock(yes=True, allow_deletions=False)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            with self.assertRaises(SystemExit):
+                savegdrive.confirm_in_terminal(args, plan, state)
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_mass_deletion_in_the_terminal_needs_the_word_delete(self):
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Docs")  # 3 of 5 synced files
+        plan, state, _, check = self.deletion_plan()
+        self.assertTrue(check)
+        args = mock.Mock(yes=False, allow_deletions=False)
+        for answer, expected in [("y", False), ("yes", False), ("delete", True)]:
+            quiet = Console(file=io.StringIO())
+            with mock.patch.object(savegdrive, "console", quiet), \
+                    mock.patch.object(quiet, "input", return_value=answer):
+                self.assertEqual(savegdrive.confirm_in_terminal(args, plan, state), expected, answer)
+
+    def sync_everything(self):
+        """A first sync like the tree's, which also saves the selection for --again."""
+        plan, state = self.preview()
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [("root", Path())], self.root, state, cache, "0")
+
+    def run_main(self, *options, isatty=False):
+        self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
+        argv = ["savegdrive", "--download-path", str(self.root), "--jobs", "1", *options]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(savegdrive, "authenticate", lambda: None), \
+                mock.patch.object(savegdrive, "build", lambda *args, **kwargs: self.drive), \
+                mock.patch.object(savegdrive, "signed_in_account", lambda service: None), \
+                mock.patch.object(savegdrive, "console", Console(file=io.StringIO())), \
+                mock.patch.object(sys.stdin, "isatty", lambda: isatty), \
+                mock.patch.object(sys.stdout, "isatty", lambda: isatty):
+            savegdrive.main()
+
+    def test_again_with_yes_refuses_a_mass_deletion(self):
+        self.sync_everything()
+        import shutil
+        shutil.rmtree(self.root / "Docs")  # 3 of 5 synced files
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main("--again", "--yes")
+        self.assertEqual(raised.exception.code, 1)
+        self.assertFalse(self.drive.items["docs"].get("trashed"))
+
+    def test_tree_with_yes_refuses_a_mass_deletion(self):
+        self.sync_everything()
+        import asyncio
+        import shutil
+        shutil.rmtree(self.root / "Docs")
+
+        def run(app):
+            async def drive_it():
+                async with app.run_test() as pilot:
+                    await pilot.press("a", "d")
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+            asyncio.run(drive_it())
+            return app.return_value
+
+        with mock.patch.object(savegdrive.DriveSelectorApp, "run", run):
+            with self.assertRaises(SystemExit) as raised:
+                self.run_main("--yes")
+        self.assertEqual(raised.exception.code, 1)
+        self.assertFalse(self.drive.items["docs"].get("trashed"))
+
+    def test_preview_asks_to_type_delete_for_a_mass_deletion(self):
+        self.sync_everything()
+        import asyncio
+        import shutil
+        shutil.rmtree(self.root / "Docs")
+        self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
+        cache = {}
+        views = [savegdrive.DriveView("My Drive", "root")]
+        savegdrive.load_view(self.drive, views[0], cache)
+        app = savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), self.drive, None, cache)
+        screens = []
+
+        async def drive_it():
+            async with app.run_test() as pilot:
+                await pilot.press("a", "d")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await pilot.press("y")
+                await pilot.pause()
+                screens.append(app.screen)
+        asyncio.run(drive_it())
+        self.assertIsInstance(screens[0], savegdrive.ConfirmScreen)
+        self.assertEqual(screens[0].word, "delete")
+        self.assertIsNone(app.return_value)
+        self.assertFalse(self.drive.items["docs"].get("trashed"))
+
+    def test_again_preview_asks_to_type_delete_for_a_mass_deletion(self):
+        self.sync_everything()
+        import asyncio
+        import shutil
+        shutil.rmtree(self.root / "Docs")
+        screens = []
+
+        def run(app):
+            async def drive_it():
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await pilot.press("y")
+                    await pilot.pause()
+                    screens.append(app.screen)
+            asyncio.run(drive_it())
+            return app.return_value
+
+        with mock.patch.object(savegdrive.PreviewApp, "run", run):
+            self.run_main("--again", isatty=True)
+        self.assertIsInstance(screens[0], savegdrive.ConfirmScreen)
+        self.assertEqual(screens[0].word, "delete")
+        self.assertFalse(self.drive.items["docs"].get("trashed"))
+
     def test_parallel_downloads(self):
         for i in range(20):
             self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", f"file {i}".encode())
