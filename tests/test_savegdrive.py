@@ -1,3 +1,4 @@
+import fcntl
 import io
 import json
 import os
@@ -1822,6 +1823,25 @@ class SyncTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             savegdrive.initialize_managed_destination(other)
         self.assertEqual(savegdrive.initialize_managed_destination(self.root), self.root)
+
+    def test_two_runs_never_sync_the_same_folder(self):
+        # This run holds self.root: another process cannot take it.
+        script = "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        other_run = subprocess.run([sys.executable, "-c", script, str(self.root)], capture_output=True, text=True)
+        self.assertNotEqual(other_run.returncode, 0)
+        self.assertIn("BlockingIOError", other_run.stderr)
+        # A folder another run holds is refused, before its state is read or written.
+        busy = Path(self.temp.name) / "Busy"
+        savegdrive.initialize_managed_destination(busy)
+        savegdrive.initialize_managed_destination(self.root)  # f back: Busy is released
+        state_before = (busy / savegdrive.STATE_FILE_NAME).read_bytes()
+        fd = os.open(busy, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.assertRaisesRegex(ValueError, "Another SaveGDrive run is using this folder"):
+            savegdrive.initialize_managed_destination(busy)
+        self.assertEqual((busy / savegdrive.STATE_FILE_NAME).read_bytes(), state_before)
+        self.assertEqual(savegdrive.FOLDER_LOCK["path"], self.root)
 
     def test_gdrive_pull_folder_is_adopted(self):
         legacy = Path(self.temp.name) / "Legacy"

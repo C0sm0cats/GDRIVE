@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import hashlib
 import json
 import mimetypes
@@ -881,27 +882,59 @@ def claim_drive_root(destination, drive_root):
         )
 
 
+FOLDER_LOCK = {}  # the managed folder this run syncs, locked until it exits: {"path": Path, "fd": int}
+
+
+def lock_folder(destination):
+    """Lock the managed folder (flock on the folder itself), so two runs never sync it at once.
+
+    Returns the new lock's descriptor, or None when this run already holds that folder."""
+    if FOLDER_LOCK.get("path") == destination:
+        return None
+    fd = os.open(destination, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise ValueError("Another SaveGDrive run is using this folder: wait for it to finish.") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def initialize_managed_destination(destination):
     if destination.exists():
         if not destination.is_dir():
             raise ValueError("The final destination is not a directory.")
+    else:
+        destination.mkdir(parents=False)
+    fd = lock_folder(destination)
+    try:
         migrate_legacy_state(destination)
         if has_valid_state(destination):
             claim_drive_root(destination, DRIVE_ROOT)
-            return destination
-        if any(destination.iterdir()):
+        elif any(destination.iterdir()):
             raise ValueError(
                 "This destination already contains files but has no "
                 f"{STATE_FILE_NAME}. Choose a different managed folder that "
                 "is empty or does not exist yet."
             )
-    else:
-        destination.mkdir(parents=False)
-
-    state = {"version": STATE_VERSION, "files": {}}
-    if DRIVE_ROOT is not None:
-        state["drive_root"] = DRIVE_ROOT
-    save_state(destination, state)
+        else:
+            state = {"version": STATE_VERSION, "files": {}}
+            if DRIVE_ROOT is not None:
+                state["drive_root"] = DRIVE_ROOT
+            save_state(destination, state)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    if fd is not None:
+        # Keep one lock: the previous folder's (before f) is released.
+        previous = FOLDER_LOCK.get("fd")
+        FOLDER_LOCK.update(path=destination, fd=fd)
+        if previous is not None:
+            os.close(previous)
     return destination
 
 
