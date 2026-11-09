@@ -1463,6 +1463,21 @@ class SyncTest(unittest.TestCase):
         (self.root / "notes.txt").unlink()
         self.assertIsNone(marks()["notes.txt"])
 
+    def test_google_doc_edited_on_drive_comes_down(self):
+        # A Google Doc has no md5: only its modifiedTime says it changed on Drive.
+        self.run_sync()
+        self.drive.items["report"].update(content=b"docx bytes v2", modifiedTime="2025-02-03T04:05:06.000Z")
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        report = next(node for node in nodes if node["display_path"] == "Docs/Report")
+        marks = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        self.assertEqual(marks.get(report["index"]), "changed")
+
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "UPDATE")
+        self.assertEqual((self.root / "Docs/Report.docx").read_bytes(), b"docx bytes v2")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "UNCHANGED")
+
     def test_again(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
