@@ -2723,6 +2723,8 @@ def classify_file(service, item, relative_path, destination, state):
         remote_changed = signature != record.get("remote_signature")
         if not local_changed:
             return ("UPDATE" if remote_changed else "UNCHANGED"), current_sha256
+        if remote_changed and item.get("md5Checksum") and file_hash(destination, "md5") == item["md5Checksum"]:
+            return "UNCHANGED", current_sha256  # same content both sides (a transfer whose state was not saved)
         if remote_changed or readonly or not sends_back(item):
             return "CONFLICT", current_sha256
         return "UPLOAD", current_sha256
@@ -4032,11 +4034,21 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             pass
         return item, local_sha256
 
+    def remember(entry, item, local_sha256):
+        if entry.get("state_key"):
+            state["files"].pop(entry["state_key"], None)
+        record(entry, item, local_sha256)
+        if entry.get("changed_meanwhile"):
+            state["files"][state_key(item, entry["relative_path"])].pop("local_mtime_ns", None)
+
     executor = ThreadPoolExecutor(max_workers=max(1, jobs))
+    futures = {}
+    handled = set()
     try:
         with progress:
             futures = {executor.submit(transfer, entry): entry for entry in transfers}
             for future in as_completed(futures):
+                handled.add(future)
                 entry = futures[future]
                 relative = entry["relative_path"].as_posix()
                 status = entry["status"]
@@ -4047,11 +4059,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                     report("[red]✗[/]", f"{relative}: {error_text(error)}")
                 else:
                     results[f"FILE_{status}"] += 1
-                    if entry.get("state_key"):
-                        state["files"].pop(entry["state_key"], None)
-                    record(entry, item, local_sha256)
-                    if entry.get("changed_meanwhile"):
-                        state["files"][state_key(item, entry["relative_path"])].pop("local_mtime_ns", None)
+                    remember(entry, item, local_sha256)
                     if status == "KEEP_BOTH":
                         report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
                     else:
@@ -4119,6 +4127,9 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        for future, entry in futures.items():  # finished but not read yet when the run stopped (Ctrl+C...)
+            if future not in handled and future.done() and not future.cancelled() and future.exception() is None:
+                remember(entry, *future.result())
         forget_all_below(state, forgotten)
         save_state(destination_root, state)
     return results

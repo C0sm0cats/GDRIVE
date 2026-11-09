@@ -1663,6 +1663,51 @@ class SyncTest(unittest.TestCase):
                 savegdrive.download_file_atomically(self.drive, entry)
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), [savegdrive.STATE_FILE_NAME])
 
+    def interrupted_while_reading_the_first_result(self):
+        """Ctrl+C while the loop reads the first finished transfer: the others are finished but not read yet."""
+        import concurrent.futures
+
+        def stop_after_the_first(futures):
+            concurrent.futures.wait(futures)
+            yield next(iter(futures))
+            raise KeyboardInterrupt
+
+        self.run_sync()
+        for item_id, name, parent in [("a", "a.txt", "docs"), ("b", "b.txt", "docs"), ("p", "beach.jpg", "photos")]:
+            self.drive.items[item_id].update(file_item(item_id, name, parent, b"v2 of " + name.encode(),
+                                                       modifiedTime="2026-03-01T00:00:00.000Z"))
+        (self.root / "notes.txt").write_bytes(b"notes, edited here")
+        plan, state = self.preview()
+        with mock.patch.object(savegdrive, "as_completed", stop_after_the_first):
+            with self.assertRaises(KeyboardInterrupt):
+                self.apply(plan, state, jobs=4)
+
+    def test_transfers_finished_before_ctrl_c_are_saved(self):
+        self.interrupted_while_reading_the_first_result()
+        saved = {record["path"]: record for record in savegdrive.load_state(self.root)["files"].values()}
+        for item_id, path in [("a", "Docs/a.txt"), ("b", "Docs/b.txt"), ("p", "Photos/beach.jpg"), ("n", "notes.txt")]:
+            with self.subTest(path=path):
+                self.assertEqual(saved[path]["remote_signature"],
+                                 savegdrive.remote_signature(self.drive.public(self.drive.items[item_id])))
+        statuses, _ = self.run_sync()
+        self.assertEqual({statuses[path] for path in ("Docs/a.txt", "Docs/b.txt", "Photos/beach.jpg", "notes.txt")},
+                         {"UNCHANGED"})
+
+    def test_same_content_changed_on_both_sides_is_not_a_conflict(self):
+        self.run_sync()
+        # Sent and downloaded, but the state could not be written (disk full): both sides look changed.
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2",
+                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+        (self.root / "Docs/a.txt").write_bytes(b"alpha v2")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2",
+                                               modifiedTime="2026-03-01T00:00:00.000Z"))
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UNCHANGED")
+        self.assertEqual(statuses["Docs/b.txt"], "CONFLICT")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UNCHANGED")
+
     def test_destination_must_be_empty_or_managed(self):
         other = Path(self.temp.name) / "Other"
         other.mkdir()
