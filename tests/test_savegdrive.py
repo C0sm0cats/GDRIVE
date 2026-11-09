@@ -1708,6 +1708,27 @@ class SyncTest(unittest.TestCase):
                     mock.patch.object(quiet, "input", return_value=answer):
                 self.assertEqual(savegdrive.confirm_in_terminal(args, plan, state), expected, answer)
 
+    def test_no_answer_in_the_terminal_cancels(self):
+        """--again without --yes and without a terminal: an empty stdin is a no, not an EOFError."""
+        self.run_sync()
+        (self.root / "Docs/a.txt").write_text("changed here")
+        plan, state, _, check = self.deletion_plan()
+        self.assertFalse(check)
+        self.assertTrue(savegdrive.has_actions(plan))
+        import shutil
+        shutil.rmtree(self.root / "Docs")
+        shutil.rmtree(self.root / "Photos")
+        deletions, deletion_state, _, check = self.deletion_plan()
+        self.assertTrue(check)
+        args = mock.Mock(yes=False, allow_deletions=False)
+        for plan, state in [(plan, state), (deletions, deletion_state)]:
+            out = io.StringIO()
+            quiet = Console(file=out)
+            with mock.patch.object(savegdrive, "console", quiet), \
+                    mock.patch.object(quiet, "input", side_effect=EOFError):
+                self.assertFalse(savegdrive.confirm_in_terminal(args, plan, state))
+            self.assertIn("Cancelled. Nothing was changed.", out.getvalue())
+
     def sync_everything(self):
         """A first sync like the tree's, which also saves the selection for --again."""
         plan, state = self.preview()

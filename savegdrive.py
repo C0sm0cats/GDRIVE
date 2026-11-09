@@ -5299,6 +5299,15 @@ def run_sync(args, service, make_service, plan, selections, scopes, roots, desti
     return results
 
 
+def ask(question):
+    """The terminal's answer, or "" when there is none: stdin at its end (cron, Ctrl+D) is a no."""
+    try:
+        return console.input(question)
+    except EOFError:
+        console.print("\n[dim]No answer: add --yes to run without a terminal.[/]")
+        return ""
+
+
 def confirm_in_terminal(args, plan, state):
     """The terminal preview's answer: always yes with --yes, unless it deletes too much."""
     if needs_deletion_check(plan, state):
@@ -5311,13 +5320,13 @@ def confirm_in_terminal(args, plan, state):
             raise SystemExit(1)
         if not args.yes:
             console.print(f"[yellow]![/] This sync deletes {plural(count, 'file')}.")
-            if console.input("  Type [bold]delete[/] to go on: ").strip() != "delete":
+            if ask("  Type [bold]delete[/] to go on: ").strip() != "delete":
                 console.print("[dim]Cancelled. Nothing was changed.[/]")
                 return False
             return True
     if args.yes or not has_actions(plan):
         return True
-    if console.input("\nProceed? [y/N] ").strip().lower() not in {"y", "yes"}:
+    if ask("\nProceed? [y/N] ").strip().lower() not in {"y", "yes"}:
         console.print("[dim]Cancelled. Nothing was changed.[/]")
         return False
     return True
