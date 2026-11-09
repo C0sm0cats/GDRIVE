@@ -2329,7 +2329,12 @@ class SyncTest(unittest.TestCase):
             return results
 
         def run(app):
-            if after_sync:  # the tree back after the sync: look at it, then quit
+            if after_sync:  # the tree back after the sync: let it list the view, look at it, then quit
+                async def look():
+                    async with app.run_test() as pilot:
+                        await app.workers.wait_for_complete()
+                        await pilot.pause()
+                asyncio.run(look())
                 trees.append([node["display_path"] for node in app.views[0].nodes])
                 return None
 
@@ -2348,6 +2353,45 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(any(item["name"] == "new.txt" for item in self.drive.items.values()))
         self.assertIn("Docs/new.txt", trees[0])  # the sync's own upload is in the tree
         self.assertEqual(listings[after_sync[0]:], [])  # from the Drive changes, no folder listed again
+
+    def test_tree_comes_back_with_the_error_when_drive_fails_right_after_a_sync(self):
+        # ux 11, ux 32: the view is listed again by the tree ("loading…", then the error on the view),
+        # not by main in a silent terminal, where a network error ended the tool on ✗ after a sync that worked.
+        self.sync_everything()
+        import asyncio
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        run_sync = savegdrive.run_sync
+        synced, labels = [], []
+
+        def failing_sync(*args, **kwargs):
+            results = run_sync(*args, **kwargs)
+            synced.append(True)
+            args[9].clear()  # listings to redo, and the network gone
+            self.drive.list = mock.Mock(side_effect=TimeoutError("timed out"))
+            return results
+
+        def run(app):
+            async def drive_it():
+                async with app.run_test() as pilot:
+                    if synced:  # the tree back after the sync
+                        await app.workers.wait_for_complete()
+                        await pilot.pause()
+                        labels.append(str(app.query_one("#drive-tree").root.label))
+                        await pilot.press("q")
+                        return
+                    await pilot.press("down", "space", "d")  # Docs: sends new.txt
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    await pilot.press("y")
+            asyncio.run(drive_it())
+            return app.return_value
+
+        with mock.patch.object(savegdrive.DriveSelectorApp, "run", run), \
+                mock.patch.object(savegdrive, "run_sync", failing_sync):
+            output = self.run_main(isatty=True)
+        self.assertTrue(any(item["name"] == "new.txt" for item in self.drive.items.values()))
+        self.assertNotIn("✗", output)
+        self.assertEqual(labels, ["My Drive  timed out"])
 
     def test_tree_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()

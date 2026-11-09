@@ -5681,7 +5681,8 @@ def main():
                     token = refresh_listings(service, cache, token)
                     for view_ in views:
                         view_.nodes, view_.error, view_.sorted_by = None, None, "name"
-                    load_view(service, view, cache)
+                # The tree lists the view again itself: "loading…" on the view, then the tree or the
+                # error there. A failure here would end the tool on a ✗ right after a sync that worked.
         if failed:
             raise SystemExit(1)
     except KeyboardInterrupt:
