@@ -3137,6 +3137,23 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
         )
     ]  # deleted here, two Drive folders on this path, synced at another path or too deep: nothing below goes anywhere
+
+    def gone_from_both_sides(path, remote):
+        return (
+            path_is_in_scope(path, scopes)
+            and path not in remote
+            and not any(path == trashed or trashed in path.parents for trashed in trashed_remote)
+            and not os.path.lexists(destination_root / path)
+        )
+
+    # Gone from Drive and from here since the last sync: forget it (saved only if the sync is applied), so what
+    # is restored or made again there later counts as new. Kept below a folder going to the Drive trash: counted.
+    for key, record in list(state["files"].items()):
+        if record.get("path") and gone_from_both_sides(Path(record["path"]), remote_files):
+            del state["files"][key]
+    for path_text in list(state.get("folders", {})):
+        if gone_from_both_sides(Path(path_text), remote_directories):
+            del state["folders"][path_text]
     tracked = tracked_files_by_path(state)
     synced_folders = {Path(path) for path in state.get("folders", {})}
     tracked_directories = {

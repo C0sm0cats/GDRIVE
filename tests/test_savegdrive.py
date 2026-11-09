@@ -754,6 +754,26 @@ class SyncTest(unittest.TestCase):
         self.assertEqual({path: status for path, status in statuses.items() if status not in {"UNCHANGED", "SKIPPED"}},
                          {})
 
+    def test_deleted_on_both_sides_then_made_again_here_is_sent(self):
+        self.run_sync()
+        del self.drive.items["a"]
+        os.replace(self.root / "Docs/a.txt", self.trash / "a.txt")  # deleted on Drive and here
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        self.run_sync()
+        os.replace(self.trash / "a.txt", self.root / "Docs/a.txt")  # restored from the system trash
+        (self.root / "Photos").mkdir()
+        (self.root / "Photos/new.jpg").write_bytes(b"made here")
+        statuses, results = self.run_sync()
+        for path in ("Docs/a.txt", "Photos", "Photos/new.jpg"):
+            self.assertEqual(statuses[path], "UPLOAD_NEW", path)
+        self.assertEqual(results["FILE_ERROR"] + results["FOLDER_ERROR"], 0)
+        names = {item["name"]: item for item in self.drive.items.values() if not item.get("trashed")}
+        self.assertEqual(names["a.txt"]["content"], b"alpha")
+        self.assertEqual(names["new.jpg"]["parent"], names["Photos"]["id"])
+
     def test_picked_folder_renamed_on_drive_sends_the_changes_back(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
