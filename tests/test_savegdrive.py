@@ -28,9 +28,14 @@ DOC = "application/vnd.google-apps.document"
 FORM = "application/vnd.google-apps.form"
 
 
-def http_error(status):
+def http_error(status, reason=None):
     response = mock.Mock(status=status, reason="error")
-    return HttpError(response, b"{}")
+    if reason is None:
+        return HttpError(response, b"{}")
+    # The documented Drive API error body, e.g. a 403 userRateLimitExceeded.
+    body = {"error": {"code": status, "message": "Error",
+                      "errors": [{"domain": "usageLimits", "reason": reason, "message": "Error"}]}}
+    return HttpError(response, json.dumps(body).encode())
 
 
 def parse_fields(fields):
@@ -400,6 +405,17 @@ class ListingTest(unittest.TestCase):
             savegdrive.list_folders(drive, ["docs"], cache)
         self.assertEqual(len(cache["docs"]), 4)
 
+    def test_retries_403_rate_limits(self):
+        for reason in ("userRateLimitExceeded", "rateLimitExceeded"):
+            with self.subTest(reason=reason):
+                drive = demo_drive()
+                drive.failures["docs"] = [http_error(403, reason)]
+                with mock.patch.object(savegdrive.time, "sleep"):
+                    cache = {}
+                    savegdrive.list_folders(drive, ["docs"], cache)
+                self.assertEqual(len(cache["docs"]), 4)
+                self.assertEqual(drive.failures["docs"], [])
+
     def test_gives_up_after_retries(self):
         drive = demo_drive()
         drive.failures["docs"] = [http_error(503) for _ in range(10)]
@@ -414,6 +430,14 @@ class ListingTest(unittest.TestCase):
         drive.failures["docs"] = [http_error(404)]
         with self.assertRaises(HttpError):
             savegdrive.list_folders(drive, ["docs"], {})
+
+    def test_raises_403_without_rate_limit(self):
+        drive = demo_drive()
+        drive.failures["docs"] = [http_error(403, "insufficientFilePermissions"), http_error(429)]
+        with mock.patch.object(savegdrive.time, "sleep"):
+            with self.assertRaises(HttpError) as raised:
+                savegdrive.list_folders(drive, ["docs"], {})
+        self.assertEqual(raised.exception.status_code, 403)
 
     def test_tree_order_and_totals(self):
         nodes, browsed = savegdrive.collect_drive_tree(demo_drive(), "root", {})
