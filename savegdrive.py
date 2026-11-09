@@ -1733,6 +1733,15 @@ def drive_url(item):
     return f"https://drive.google.com/file/d/{effective_id(item)}/view"
 
 
+def view_url(view):
+    """The Drive page of a whole view: its root line has no item of its own."""
+    if view.root_id == SHARED_WITH_ME:
+        return "https://drive.google.com/drive/shared-with-me"
+    if view.root_id == TRASH:
+        return "https://drive.google.com/drive/trash"
+    return f"https://drive.google.com/drive/folders/{view.root_id}"
+
+
 class HelpScreen(ModalScreen):
     CSS = """
     HelpScreen {
@@ -2519,6 +2528,11 @@ class DriveSelectorApp(App):
         node = self.current_node()
         return None if node is None else node.data
 
+    def on_view_root(self):
+        """The cursor is on the root line of the view (My Drive, Shared with me…), which has no item."""
+        node = self.current_node()
+        return node is not None and node is self.query_one("#drive-tree", Tree).root
+
     def toggle_entry(self, entry):
         if entry is None:
             return
@@ -2579,6 +2593,10 @@ class DriveSelectorApp(App):
         add_selected_items(self.selections, [self.selection_candidate(other) for other in [entry, *twins]])
 
     def action_toggle_current(self):
+        if self.on_view_root():
+            # The cursor starts here: space on the whole view selects all of it, like a.
+            self.action_select_all()
+            return
         self.toggle_entry(self.current_entry())
 
     def action_activate_current(self):
@@ -2707,12 +2725,15 @@ class DriveSelectorApp(App):
     def action_open_in_drive(self):
         entry = self.current_entry()
         if entry is None:
-            return
+            if not self.on_view_root():
+                return
+            url, name = view_url(self.view), self.view.name
+        else:
+            url, name = drive_url(entry["item"]), entry["item"]["name"]
         # A launched opener does not prove a browser opened (xdg-open over SSH): always show the URL
-        url = drive_url(entry["item"])
         if open_quietly(url):
             self.notify(
-                f"Opening {printable(entry['item']['name'])} in your browser: {url}",
+                f"Opening {printable(name)} in your browser: {url}",
                 markup=False,
                 timeout=30,
             )
@@ -2764,6 +2785,14 @@ class DriveSelectorApp(App):
             return [entry["item"] for entry in selected]
         entry = self.current_entry()
         return [] if entry is None else [entry["item"]]
+
+    def no_drive_targets(self):
+        if self.on_view_root():
+            self.notify(
+                "This line is the whole view: move the cursor to an item, or select items with space.",
+                severity="warning",
+                markup=False,
+            )
 
     def describe(self, items):
         if len(items) == 1:
@@ -2827,6 +2856,7 @@ class DriveSelectorApp(App):
             return
         items = self.drive_targets()
         if not items:
+            self.no_drive_targets()
             return
         if self.view.root_id != TRASH:
             allowed = [item for item in items if can(item, "canTrash")]
@@ -2859,6 +2889,7 @@ class DriveSelectorApp(App):
             return
         items = self.drive_targets()
         if not items:
+            self.no_drive_targets()
             return
         ids = [item["id"] for item in items]
         what = self.describe(items)

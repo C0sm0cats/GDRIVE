@@ -5550,6 +5550,42 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 app.clear_notifications()
                 await pilot.pause()
 
+    async def test_keys_on_the_view_root_line_act_on_the_whole_view(self):
+        # ux 27: the cursor starts on "My Drive": space selects the view, o opens it, x says why it does nothing
+        drive = demo_drive()
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+
+        def toasts():
+            return " ".join(toast.render().plain for toast in app.screen.query(Toast))
+
+        async with app.run_test(size=(140, 30), notifications=True) as pilot:
+            tree = app.query_one(Tree)
+            self.assertIs(tree.cursor_node, tree.root)
+            await pilot.press("space")
+            self.assertEqual(sorted(self.selected(app)), ["Docs", "Photos", "notes.txt"])
+            await pilot.press("space")
+            self.assertEqual(self.selected(app), [])
+            with mock.patch.object(savegdrive, "open_quietly", return_value=True) as opener:
+                await pilot.press("o")
+            await pilot.pause()
+            opener.assert_called_once_with("https://drive.google.com/drive/folders/root")
+            self.assertIn("https://drive.google.com/drive/folders/root", toasts())
+            app.clear_notifications()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+            self.assertIn("move the cursor to an item", toasts())
+            app.clear_notifications()
+            await pilot.press("tab")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIs(tree.cursor_node, tree.root)
+            with mock.patch.object(savegdrive, "open_quietly", return_value=True) as opener:
+                await pilot.press("o")
+            await pilot.pause()
+            opener.assert_called_once_with("https://drive.google.com/drive/shared-with-me")
+
     async def test_restore_ignores_the_selection_of_other_views(self):
         drive = demo_drive()
         app = self.trash_view_app(drive)
