@@ -5450,7 +5450,7 @@ def trash_remote_entries(service, plan, state, results, report, forgotten):
         else:
             results[f"{entry['kind']}_TRASH_REMOTE"] += 1
             forgotten.append(entry["relative_path"])
-            report("[magenta]✗[/]", f"{relative} → Drive trash")
+            report("[magenta]↑[/]", f"{relative} → Drive trash")
 
 
 def trash_local_entries(plan, results, report, forgotten):
@@ -5474,7 +5474,7 @@ def trash_local_entries(plan, results, report, forgotten):
         results[f"{entry['kind']}_TRASH_LOCAL"] += 1
         forgotten.append(relative)
         emptied.add(relative.parent)
-        report("[bright_magenta]✗[/]", f"{relative.as_posix()} → your trash")
+        report("[bright_magenta]↓[/]", f"{relative.as_posix()} → your trash")
     return emptied
 
 

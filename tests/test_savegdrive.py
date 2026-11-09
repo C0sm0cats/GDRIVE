@@ -1206,8 +1206,10 @@ class SyncTest(unittest.TestCase):
         preview = next(line for line in lines if line.startswith("Preview "))
         self.assertIn("1 ↑ to Drive trash", preview)
         self.assertIn("1 ↓ to your trash", preview)
-        self.assertIn("✗ Docs/b.txt → Drive trash", lines)
-        self.assertIn("✗ Photos/beach.jpg → your trash", lines)
+        # design 17: a successful deletion takes the preview's arrow; ✗ stays for errors only.
+        self.assertIn("↑ Docs/b.txt → Drive trash", lines)
+        self.assertIn("↓ Photos/beach.jpg → your trash", lines)
+        self.assertEqual([line for line in lines if line.startswith("✗")], [])
         done = next(line for line in lines if line.startswith("Done "))
         self.assertIn("1 moved to the Drive trash", done)
         self.assertIn("1 moved to your trash", done)
