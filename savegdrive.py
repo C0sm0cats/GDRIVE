@@ -729,9 +729,13 @@ def display_date(item):
 
 
 def header_text(account, destination, prefix=None):
-    parts = [part for part in (prefix, account) if part]
+    # The folder comes before the account: a narrow header cuts the account, not
+    # where the sync writes and deletes.
+    parts = [prefix] if prefix else []
     if destination is not None:
         parts.append(f"syncs with {short_path(destination)}")
+    if account:
+        parts.append(account)
     return " · ".join(parts)
 
 
@@ -3999,6 +4003,8 @@ class PreviewScreen(Screen):
         name, keep = self.filters[self.filter_index]
         rows = [entry for entry in self.plan if keep(entry)]
         summary = Text.from_markup(f"[bold]Preview[/]  {plan_summary(self.plan)}")
+        summary.append("\nDestination: ", style="dim")
+        summary.append(short_path(self.destination))
         space, fits = space_line(self.plan, self.destination)
         if space and fits:
             summary.append(f"\n{space}", style="dim")

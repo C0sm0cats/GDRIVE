@@ -2301,7 +2301,7 @@ class SyncTest(unittest.TestCase):
         home = Path.home()
         self.assertEqual(
             savegdrive.header_text("you@gmail.com", home / "GDrive", "preview"),
-            "preview · you@gmail.com · syncs with ~/GDrive",
+            "preview · syncs with ~/GDrive · you@gmail.com",
         )
         self.assertEqual(savegdrive.header_text(None, Path("/data/x")), "syncs with /data/x")
 
@@ -3367,6 +3367,21 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(table.get_row_at(0)[1].plain,
                              f"{path}  (yours → Copy (local).docx)")
+
+    async def test_preview_shows_the_local_folder_in_80x24(self):
+        destination = Path.home() / "Documents" / "Google Drive"
+        plan = [{
+            "status": "NEW", "relative_path": Path("a.txt"), "kind": "FILE",
+            "item": {"name": "a.txt", "size": "10"}, "destination": destination / "a.txt",
+        }]
+        app = savegdrive.PreviewApp(plan, destination, "jean.dupont@gmail.com")
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            # A narrow header cuts the account, not where the sync writes and deletes.
+            header = f"{app.title} — {app.screen.sub_title}"[:80]
+            self.assertIn("syncs with ~/Documents/Google Drive", header)
+            summary = str(app.screen.query_one("#preview-summary").render())
+            self.assertIn("Destination: ~/Documents/Google Drive", summary)
 
     async def test_preview_rows_stay_visible_in_80x24(self):
         def entry(status, name, **extra):
