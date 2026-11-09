@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -3617,8 +3618,12 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 FAKE_PYTHON = """#!/bin/sh
 case "$1" in
     -V) echo "Python $FAKE_PY_VERSION"; exit 0 ;;
-    -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;; esac; exit 0 ;;
-    -m) {mkdir} -p "$3/bin" && {cp} "$0" "$3/bin/python"; exit $? ;;
+    -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;; esac
+        [ "$FAKE_IMPORTS_OK" = 1 ]; exit $? ;;
+    -m) case "$2" in
+            venv) {mkdir} -p "$3/bin" && {cp} "$0" "$3/bin/python"; exit $? ;;
+            pip) echo "$*" >> "$FAKE_PIP_LOG"; exit "$FAKE_PIP_RC" ;;
+        esac; exit 1 ;;
 esac
 echo "ran $*"
 """
@@ -3628,21 +3633,37 @@ echo "ran $*"
 class LauncherTest(unittest.TestCase):
     """run-savegdrive.sh, run against a fake interpreter so no venv or pip is involved."""
 
-    def run_launcher(self, names, version_ok=True):
+    PACKAGES = "google-api-python-client google-auth google-auth-oauthlib send2trash textual"
+
+    def run_launcher(self, names, version_ok=True, venv=False, stamp=None, stamp_age_days=0,
+                     imports_ok=True, pip_rc=0):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         shutil.copy(Path(__file__).resolve().parent.parent / "run-savegdrive.sh", root)
         (root / "savegdrive.py").write_text("")
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        os.symlink(shutil.which("dirname"), bin_dir / "dirname")
+        for tool in ("dirname", "find"):
+            os.symlink(shutil.which(tool), bin_dir / tool)
         fake = FAKE_PYTHON.format(mkdir=shutil.which("mkdir"), cp=shutil.which("cp"))
         for name in names:
             (bin_dir / name).write_text(fake)
             (bin_dir / name).chmod(0o755)
+        if venv:
+            (root / ".venv" / "bin").mkdir(parents=True)
+            (root / ".venv" / "bin" / "python").write_text(fake)
+            (root / ".venv" / "bin" / "python").chmod(0o755)
+        if stamp is not None:
+            stamp_path = root / ".venv" / ".savegdrive-deps"
+            stamp_path.write_text(stamp + "\n")
+            when = time.time() - stamp_age_days * 86400
+            os.utime(stamp_path, (when, when))
         env = {
             "PATH": str(bin_dir),
             "FAKE_PY_OK": "1" if version_ok else "0",
             "FAKE_PY_VERSION": "3.12.0" if version_ok else "3.10.22",
+            "FAKE_IMPORTS_OK": "1" if imports_ok else "0",
+            "FAKE_PIP_LOG": str(root / "pip.log"),
+            "FAKE_PIP_RC": str(pip_rc),
         }
         result = subprocess.run(
             [shutil.which("sh"), str(root / "run-savegdrive.sh"), "--help"],
@@ -3667,6 +3688,45 @@ class LauncherTest(unittest.TestCase):
         self.assertIn("3.11 or newer", result.stderr)
         self.assertIn("3.10.22", result.stderr)
         self.assertFalse((root / ".venv").exists())
+
+    def pip_calls(self, root):
+        log = root / "pip.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_launcher_upgrades_an_existing_venv_without_stamp(self):
+        # A .venv from before the stamp (e.g. 1.1.0) whose imports all work.
+        result, root = self.run_launcher(["python3"], venv=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.pip_calls(root),
+            ["-m pip install -U --upgrade-strategy eager " + self.PACKAGES],
+        )
+        self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
+        self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_upgrades_on_old_or_different_stamp_only(self):
+        result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES, stamp_age_days=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pip_calls(root), [])
+        for stamp, age in ((self.PACKAGES, 31), ("google-api-python-client textual", 1)):
+            with self.subTest(stamp=stamp, age=age):
+                result, root = self.run_launcher(["python3"], venv=True, stamp=stamp, stamp_age_days=age)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.pip_calls(root)), 1)
+                self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
+
+    def test_launcher_keeps_working_venv_when_upgrade_fails(self):
+        result, root = self.run_launcher(["python3"], venv=True, pip_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not update", result.stderr)
+        self.assertIn("savegdrive.py --help", result.stdout)
+        self.assertFalse((root / ".venv" / ".savegdrive-deps").exists())
+
+    def test_launcher_fails_when_install_fails_and_imports_are_missing(self):
+        result, root = self.run_launcher(["python3"], imports_ok=False, pip_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("savegdrive.py --help", result.stdout)
+        self.assertFalse((root / ".venv" / ".savegdrive-deps").exists())
 
 
 if __name__ == "__main__":

@@ -110,6 +110,21 @@ chmod +x run-savegdrive.sh
 
 The first run of the runner creates `.venv` and installs the dependencies.
 
+## Updating
+
+```bash
+git pull
+./run-savegdrive.sh --help
+```
+
+The runner upgrades the dependencies, including the packages they depend on,
+on the first run of a new version and then every 30 days. To upgrade them now:
+
+```bash
+.venv/bin/python -m pip install -U --upgrade-strategy eager \
+    google-api-python-client google-auth google-auth-oauthlib send2trash textual
+```
+
 ## First run
 
 ```bash
