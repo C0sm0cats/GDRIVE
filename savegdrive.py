@@ -3406,6 +3406,50 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         elif destination.is_file() and scope not in remote_files:
             add_local_entry(scope, "FILE")
 
+    # An item picked alone and deleted here may have been renamed or moved next to it: the new name is outside
+    # the selection, so it is not sent. Listed as local only, so the preview does not hide it.
+    beside_picked = sorted({
+        entry["relative_path"].parent
+        for entry in plan
+        if entry["status"] == "TRASH_REMOTE" and not path_is_in_scope(entry["relative_path"].parent, scopes)
+    }, key=lambda path: path.as_posix())
+    for parent in beside_picked:
+        directory = destination_root / parent
+        if not directory.is_dir():
+            continue
+        for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
+            relative_path = parent / child.name
+            kind = "FOLDER" if child.is_dir() else "FILE"
+            if (
+                relative_path.parts[0] in RESERVED_NAMES
+                or (parent == Path() and child.name in VIEW_DIRS)
+                or child.is_symlink()
+                or child.name.endswith(PART_SUFFIX)
+                or not (child.is_dir() or child.is_file())
+                or path_is_in_scope(relative_path, scopes)
+                or relative_path in planned_local_paths
+                or relative_path in remote_files
+                or relative_path in remote_directories
+                or relative_path in tracked
+                or relative_path in tracked_directories
+                or drive_spelling(child, relative_path, kind) is not None
+            ):
+                continue
+            plan.append(
+                {
+                    "status": "LOCAL_ONLY",
+                    "kind": kind,
+                    "item": None,
+                    "relative_path": relative_path,
+                    "destination": child,
+                    "state_key": None,
+                    "local_sha256": None,
+                    "local_stat": None,
+                    "outside_selection": True,
+                }
+            )
+            planned_local_paths.add(relative_path)
+
 
 def moved_scopes(state, selections):
     """Where items of the last selection were, when they are picked again at another path (renamed or moved
@@ -3699,7 +3743,12 @@ def plan_notes(plan):
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
     if "TRASH_LOCAL" in statuses:
         notes.append("Deleted on Drive since the last sync: your copies go to your system trash.")
-    if "LOCAL_ONLY" in statuses:
+    if any(entry.get("outside_selection") for entry in plan):
+        notes.append(
+            "Not in your selection, so not sent: new here next to an item deleted here (renamed or moved?). "
+            "Select its parent folder in the tree, or the whole view, to send it."
+        )
+    if any(entry["status"] == "LOCAL_ONLY" and not entry.get("outside_selection") for entry in plan):
         notes.append(
             "Local only: Drive has nowhere to put them (top of Shared with me, Trash, or a folder shared with you "
             "read only); left as they are."

@@ -194,7 +194,10 @@ Some rules keep it safe:
   the other side follows.
 
 Renaming or moving a file on one side shows as a deletion and a new file: the
-content arrives at its new place, the old one goes to the trash. On Drive, the
+content arrives at its new place, the old one goes to the trash. Within the
+selection only: an item picked alone and renamed here goes to the Drive trash,
+and its new name, outside the selection, is listed as not sent until you select
+its parent folder. On Drive, the
 file then starts a new version history and loses its sharing.
 
 Only files whose size or date changed since the last sync are read again to

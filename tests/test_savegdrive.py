@@ -1072,6 +1072,34 @@ class SyncTest(unittest.TestCase):
         self.assertIn(b"retouched here", [item.get("content") for item in self.drive.items.values()])
         self.assertEqual((self.root / "Photos 2026/beach.jpg").read_bytes(), b"jpeg")
 
+    def test_picked_items_renamed_here_show_their_new_name_as_not_sent(self):
+        # Photos and notes.txt picked alone, synced, then renamed here: the old names go to the Drive trash,
+        # and the new ones, outside the selection, are listed rather than hidden.
+        self.sync_picked("Photos", "notes.txt")
+        (self.root / "Photos").rename(self.root / "Photos-old")
+        (self.root / "notes.txt").rename(self.root / "notes-2026.txt")
+        state = savegdrive.load_state(self.root)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            selections, scopes = savegdrive.last_selection(self.drive, state, {})
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, {})
+        by_path = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertEqual(by_path["Photos"]["status"], "TRASH_REMOTE")
+        self.assertEqual(by_path["notes.txt"]["status"], "TRASH_REMOTE")
+        for path in ("Photos-old", "notes-2026.txt"):
+            self.assertEqual(by_path[path]["status"], "LOCAL_ONLY")
+            self.assertTrue(by_path[path].get("outside_selection"))
+        self.assertNotIn("Photos-old/beach.jpg", by_path)
+        notes = savegdrive.plan_notes(plan)
+        self.assertTrue(any(note.startswith("Not in your selection, so not sent") for note in notes))
+        self.assertFalse(any(note.startswith("Local only:") for note in notes))
+        self.assertEqual(savegdrive.plan_notes([e for e in plan if not e.get("outside_selection")]),
+                         [note for note in notes if not note.startswith("Not in your selection")])
+        # Nothing is sent for them.
+        uploads_before = len(self.drive.uploads)
+        self.apply(plan, state)
+        self.assertEqual(len(self.drive.uploads), uploads_before)
+        self.assertTrue((self.root / "Photos-old/beach.jpg").exists())
+
     def test_picked_items_moved_on_drive_into_another_pick_are_synced_once(self):
         # Docs, Photos and notes.txt picked; on Drive, Photos and notes.txt are moved into Docs, then --again.
         self.sync_picked("Docs", "Photos", "notes.txt")
