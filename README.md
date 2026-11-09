@@ -139,6 +139,9 @@ folder is created if it does not exist. It must be:
 - empty; or
 - an existing SaveGDrive folder containing `.savegdrive-state.json`.
 
+It must not be inside another SaveGDrive folder: that folder's sync would send it
+to Drive.
+
 A non-empty folder without that state file is refused to prevent accidental
 adoption or overwriting of unrelated data.
 

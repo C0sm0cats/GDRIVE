@@ -2733,6 +2733,23 @@ class SyncTest(unittest.TestCase):
             savegdrive.initialize_managed_destination(other)
         self.assertEqual(savegdrive.initialize_managed_destination(self.root), self.root)
 
+    def test_folder_inside_a_managed_folder_is_refused_and_never_sent(self):
+        self.run_sync()
+        # --download-path ~/GDrive/Work (or f): refused, before anything is created.
+        with self.assertRaisesRegex(ValueError, "already synced by SaveGDrive"):
+            savegdrive.initialize_managed_destination(self.root / "Work")
+        self.assertFalse((self.root / "Work").exists())
+        self.assertEqual(savegdrive.FOLDER_LOCK["path"], self.root)
+        # One made before this check: the outer folder's sync never sends it to Drive.
+        work = self.root / "Work"
+        (work / "Docs").mkdir(parents=True)
+        state = {"version": savegdrive.STATE_VERSION, "files": {}}
+        (work / savegdrive.STATE_FILE_NAME).write_text(json.dumps(state))
+        (work / "Docs/a.txt").write_bytes(b"alpha")
+        statuses, _ = self.run_sync()
+        self.assertEqual([path for path in statuses if path.split("/")[0] == "Work"], [])
+        self.assertNotIn(savegdrive.STATE_FILE_NAME, {item["name"] for item in self.drive.items.values()})
+
     def test_two_runs_never_sync_the_same_folder(self):
         # This run holds self.root: another process cannot take it.
         script = "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"

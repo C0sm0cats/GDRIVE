@@ -935,7 +935,18 @@ def lock_folder(destination):
     return fd
 
 
+def holds_state(directory):
+    """A SaveGDrive folder (or a GDrive Pull one): its own state file is there."""
+    return any((directory / name).is_file() for name in (STATE_FILE_NAME, LEGACY_STATE_FILE_NAME))
+
+
 def initialize_managed_destination(destination):
+    outer = next((parent for parent in destination.parents if holds_state(parent)), None)
+    if outer is not None:
+        raise ValueError(
+            f"This folder is inside {outer}, already synced by SaveGDrive: its next sync would send "
+            "this folder to Drive. Choose a folder outside it."
+        )
     if destination.exists():
         if not destination.is_dir():
             raise ValueError("The final destination is not a directory.")
@@ -3435,6 +3446,8 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 continue  # the Shared with me / Shared drives / Trash views have their own scopes
             if child.is_symlink():
                 continue
+            if child.is_dir() and holds_state(child):
+                continue  # another SaveGDrive folder, synced on its own
             if child.name.endswith(PART_SUFFIX):
                 if child.is_file():
                     with contextlib.suppress(OSError):
@@ -3491,6 +3504,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 or child.is_symlink()
                 or child.name.endswith(PART_SUFFIX)
                 or not (child.is_dir() or child.is_file())
+                or (child.is_dir() and holds_state(child))
                 or path_is_in_scope(relative_path, scopes)
                 or relative_path in planned_local_paths
                 or relative_path in remote_files
