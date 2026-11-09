@@ -187,6 +187,7 @@ class FakeDrive:
             if fileId not in self.items:
                 raise http_error(404)
             self.items[fileId]["trashed"] = body["trashed"]
+            self.change(fileId)
             return {}
 
         return FakeRequest(run)
@@ -235,12 +236,14 @@ def fake_upload(service, path, file_id=None, name=None, parent_id=None, stop=Non
     service.uploads.append(file_id)
     item.update(content=content, size=str(len(content)), md5Checksum=hashlib.md5(content).hexdigest(),
                 modifiedTime=f"2026-02-0{len(service.uploads) % 9 + 1}T00:00:00.000Z")
+    service.change(file_id)  # in Drive's changes feed, like any other change
     return service.public(item)
 
 
 def fake_create_folder(service, name, parent_id):
     folder_id = f"dir{len(service.items)}"
     service.items[folder_id] = {"id": folder_id, "name": name, "mimeType": FOLDER, "parent": parent_id}
+    service.change(folder_id)
     return {"id": folder_id, "name": name, "mimeType": FOLDER}
 
 
@@ -1344,6 +1347,50 @@ class SyncTest(unittest.TestCase):
                 mock.patch.object(sys.stdin, "isatty", lambda: isatty), \
                 mock.patch.object(sys.stdout, "isatty", lambda: isatty):
             savegdrive.main()
+
+    def test_again_after_an_upload_keeps_the_sent_file(self):
+        self.sync_everything()
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        self.run_main("--again", "--yes")  # sends it
+        sent = [item_id for item_id, item in self.drive.items.items() if item["name"] == "new.txt"]
+        self.assertEqual(len(sent), 1)
+        self.run_main("--again", "--yes")  # its saved listing replays the sync's own changes
+        self.assertEqual(list(self.trash.iterdir()), [])  # not taken for deleted on Drive
+        self.assertEqual((self.root / "Docs/new.txt").read_bytes(), b"made here")
+        self.assertFalse(self.drive.items[sent[0]].get("trashed"))
+
+    def sync_round(self, cache):
+        """One round of the tree's loop in main: same cache, listed again when the sync changed Drive."""
+        self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        self.apply(plan, state)
+        if savegdrive.changes_drive(plan):
+            cache.clear()
+            savegdrive.TRASHED_FOLDERS.clear()
+        return {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+
+    def test_next_round_after_an_upload_keeps_the_sent_file(self):
+        cache = {}
+        self.sync_round(cache)
+        (self.root / "Docs/new.txt").write_bytes(b"made here")
+        self.assertEqual(self.sync_round(cache)["Docs/new.txt"], "UPLOAD_NEW")
+        self.assertEqual(self.sync_round(cache)["Docs/new.txt"], "UNCHANGED")
+        self.assertTrue((self.root / "Docs/new.txt").exists())
+
+    def test_next_round_after_a_drive_trash_does_not_bring_the_file_back(self):
+        cache = {}
+        self.sync_round(cache)
+        (self.root / "Docs/a.txt").unlink()
+        self.assertEqual(self.sync_round(cache)["Docs/a.txt"], "TRASH_REMOTE")
+        self.assertNotIn("Docs/a.txt", self.sync_round(cache))
+        self.assertFalse((self.root / "Docs/a.txt").exists())
 
     def test_again_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
