@@ -5016,6 +5016,25 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(table.get_row_at(0)[1].plain,
                              f"{path}  (yours → Copy (local).docx)")
 
+    async def test_preview_keep_both_with_a_long_name_shows_file_and_copy_name(self):
+        # ux 28: at 80 columns a keep-both note longer than ITEM was cropped with the file name.
+        folder = "Docs/2026 Projects and Client Deliverables/Quarterly Financial Reports for the Board"
+        path = f"{folder}/Q3 final version approved by finance - signed.pdf"
+        copy = "Q3 final version approved by finance - signed (local).pdf"
+        plan = [{
+            "status": "KEEP_BOTH", "relative_path": Path(path), "kind": "FILE",
+            "item": {"name": Path(path).name, "size": "1234"}, "destination": self.root / path,
+            "local_copy": self.root / folder / copy, "copy_goes_up": True,
+        }]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#preview-table")
+            self.assertLessEqual(table.virtual_size.width, table.scrollable_content_region.width)
+            item = table.get_row_at(0)[1].plain
+            self.assertLessEqual(len(item), table.columns["item"].width)
+            self.assertRegex(item, r"^….*signed\.pdf  \(yours → .+….+ \(local\)\.pdf\)$")
+
     async def test_preview_size_column_shows_the_local_file_for_an_upload(self):
         # bugs 47: the SIZE cell of an upload came from the Drive item, the version being replaced.
         (self.root / "beach.jpg").write_bytes(b"x" * 5_000_000)

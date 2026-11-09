@@ -4494,19 +4494,40 @@ PREVIEW_VIEWS = [
 PREVIEW_ITEM_MIN = 20  # cells of the ITEM column of the preview, however narrow the screen
 
 
-def fit_path(path, suffix, width):
-    """The path cut on the left (…/folder/file) so that path and suffix fit in width cells."""
-    if Text(path + suffix).cell_len <= width:
-        return path + suffix
-    room = width - Text(suffix).cell_len - 1
-    if room < 1:
-        return path + suffix  # the table crops it
+def cut_left(text, width):
+    """The end of text, after …, in at most width cells."""
+    if Text(text).cell_len <= width:
+        return text
     kept = ""
-    for char in reversed(path):
-        if Text(char + kept).cell_len > room:
+    for char in reversed(text):
+        if Text(char + kept).cell_len > width - 1:
             break
         kept = char + kept
-    return "…" + kept + suffix
+    return "…" + kept
+
+
+def cut_middle(text, width):
+    """The start and the end of text, … between them, in at most width cells."""
+    if Text(text).cell_len <= width:
+        return text
+    head = text[:max(width - 1, 0) // 2]
+    while head and Text(head).cell_len > (width - 1) // 2:
+        head = head[:-1]
+    return head + cut_left(text[len(head):], width - Text(head).cell_len)
+
+
+def fit_path(path, suffix, width):
+    """Path and suffix in width cells: the path cut on the left (…/folder/file), and a suffix too long
+    to leave the file name in view cut in the middle, so both ends of each stay readable."""
+    if Text(path + suffix).cell_len <= width:
+        return path + suffix
+    path_room = min(width // 2, 20)  # cells the path keeps whatever the suffix
+    if width - Text(suffix).cell_len >= path_room:
+        return cut_left(path, width - Text(suffix).cell_len) + suffix
+    if path_room < 2:
+        return path + suffix  # the table crops it
+    path = cut_left(path, path_room)
+    return path + cut_middle(suffix, width - Text(path).cell_len)
 
 
 class PreviewScreen(Screen):
