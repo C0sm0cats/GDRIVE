@@ -3080,6 +3080,15 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=10)):
             self.assertFalse(savegdrive.space_line(plan, self.root)[1])
         self.assertEqual(savegdrive.space_line([], self.root), (None, True))
+        # tests 60: the terminal preview (--yes, --again) flags a download the disk cannot hold.
+        for free, warned in ((2_000_000, False), (10, True)):
+            output = io.StringIO()
+            with mock.patch.object(savegdrive, "console", Console(file=output, width=200, highlight=False)), \
+                    mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=free)):
+                savegdrive.print_plan(plan, self.root)
+            line = next(line for line in output.getvalue().splitlines() if "to download" in line)
+            self.assertEqual("not enough disk space" in line, warned, line)
+            self.assertEqual(line.startswith("! "), warned, line)
 
     def test_header_text(self):
         home = Path.home()
@@ -4665,6 +4674,23 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             summary = str(app.screen.query_one("#preview-summary").render())
             self.assertIn("7 B to send to Drive", summary)
         self.assertEqual(savegdrive.upload_size(plan, self.root), 7)
+
+    async def test_preview_flags_a_download_the_disk_cannot_hold(self):
+        # tests 60: the summary line turns red with a warning only when the known download exceeds free space.
+        plan = [{
+            "status": "NEW", "relative_path": Path("big.iso"), "kind": "FILE",
+            "item": {"name": "big.iso", "size": "19"}, "destination": self.root / "big.iso",
+        }]
+        for free, warned in ((2_000_000, False), (10, True)):
+            app = savegdrive.PreviewApp(plan, self.root)
+            with mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=free)):
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await pilot.pause()
+                    summary = app.screen.query_one("#preview-summary").render()
+            line = next(line for line in summary.plain.splitlines() if "to download" in line)
+            self.assertEqual(line == "! 19 B to download · 10 B free: not enough disk space", warned, line)
+            red = [span for span in summary.spans if "red" in str(span.style)]
+            self.assertEqual(bool(red), warned, summary.spans)
 
     async def test_preview_shows_the_local_folder_in_80x24(self):
         destination = Path.home() / "Documents" / "Google Drive"
