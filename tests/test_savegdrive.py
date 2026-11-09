@@ -2164,6 +2164,23 @@ class SyncTest(unittest.TestCase):
             savegdrive.main()
         return output.file.getvalue()
 
+    def test_folder_id_copied_from_a_drive_link_opens_that_folder(self):
+        # ux 36: Drive's "Copy link" ends in ?usp=sharing or ?usp=drive_link; a full link works too.
+        opened = []
+
+        def drive_views(service, folder_id):
+            opened.append((folder_id, savegdrive.DRIVE_ROOT))
+            raise SystemExit(0)
+
+        self.addCleanup(setattr, savegdrive, "DRIVE_ROOT", savegdrive.DRIVE_ROOT)
+        values = ["docs?usp=sharing", "docs?usp=drive_link", " docs/ ",
+                  "https://drive.google.com/drive/folders/docs?usp=sharing", "docs"]
+        with mock.patch.object(savegdrive, "drive_views", drive_views):
+            for value in values:
+                with self.assertRaises(SystemExit):
+                    self.run_main("--folder-id", value, isatty=True)
+        self.assertEqual(opened, [("docs", "docs")] * len(values))
+
     def test_help_and_usage_errors_are_not_colored_for_a_dark_terminal(self):
         # Python 3.14 argparse colors options cyan and arguments yellow: invisible on a light terminal.
         for argv, stream in ((["savegdrive", "--help"], "stdout"), (["savegdrive", "--nope"], "stderr")):

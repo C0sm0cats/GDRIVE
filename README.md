@@ -489,7 +489,8 @@ ID can be used as the remote root:
 ./run-savegdrive.sh --folder-id DRIVE_FOLDER_ID
 ```
 
-The folder ID is the last part of the folder URL in Google Drive.
+The folder ID is the part of the folder URL after `folders/`, without `?usp=…`
+(a full folder link also works).
 
 ## Local files
 

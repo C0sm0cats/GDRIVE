@@ -5,6 +5,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -5618,6 +5619,11 @@ def result_notice(plan, results):
     return text
 
 
+def folder_id_arg(text):
+    """The --folder-id value reduced to the ID: Drive's "Copy link" ends in ?usp=sharing, a full link also works."""
+    return re.split(r"[?#]", text.strip())[0].rstrip("/").rsplit("/", 1)[-1] or "root"
+
+
 def destination_path(path_text):
     """The local folder's absolute path, nothing created."""
     destination = Path(path_text).expanduser()
@@ -5665,6 +5671,7 @@ def main():
         "--folder-id",
         default="root",
         metavar="ID",
+        type=folder_id_arg,
         help="Drive folder to browse (default: My Drive root).",
     )
     parser.add_argument(
