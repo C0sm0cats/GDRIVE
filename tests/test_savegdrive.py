@@ -2738,14 +2738,17 @@ class SyncTest(unittest.TestCase):
         self.drive.change("x")
         self.drive.items["n"]["trashed"] = True  # put in the Drive trash
         self.drive.change("n")
+        self.drive.items["form"]["parent"] = "unknown-folder"  # moved out of the listed folders
+        self.drive.change("form")
 
         self.assertGreater(len(self.drive.change_log), self.drive.changes_page_size)  # several pages
         replayed, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
         fresh = {}
         savegdrive.prefetch_folders(self.drive, ["root"], fresh)
         self.assertNotIn("n", [item["id"] for item in fresh["root"]])
+        self.assertNotIn("form", [item["id"] for item in replayed["docs"]])
         self.assertEqual(replayed, fresh)
-        self.assertEqual(new_token, "6")
+        self.assertEqual(new_token, "7")
         self.assertIsNone(savegdrive.apply_changes(self.drive, {"token": "expired", "folders": {}}))
 
     def test_again_reads_drive_changes_past_the_first_page(self):
