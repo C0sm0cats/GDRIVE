@@ -811,6 +811,58 @@ class SyncTest(unittest.TestCase):
         self.assertTrue((self.root / "Photos").is_dir())
         self.assertEqual(results["FILE_ERROR"], 0)
 
+    def test_folder_deleted_here_keeps_the_state_of_a_folder_named_like_it(self):
+        # "Photos 2" starts with "Photos": forgetting Photos must not forget what was synced in Photos 2.
+        self.drive.items["photos2"] = {"id": "photos2", "name": "Photos 2", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["x"] = file_item("x", "x.txt", "photos2", b"x")
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos"], "TRASH_REMOTE")
+        del self.drive.items["x"]  # a colleague deletes it on Drive
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos 2/x.txt"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Photos 2/x.txt").exists())
+        self.assertFalse(any(item["name"] == "x.txt" for item in self.drive.items.values()))
+
+    def test_new_drive_folder_named_like_the_start_of_a_synced_one_comes_down(self):
+        # "Project 2/y.txt" is below "Project 2", not below "Project": Project is new, not deleted here.
+        self.drive.items["project2"] = {"id": "project2", "name": "Project 2", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["y"] = file_item("y", "y.txt", "project2", b"y")
+        self.run_sync()
+        self.drive.items["project"] = {"id": "project", "name": "Project", "mimeType": FOLDER, "parent": "root"}
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Project"], "NEW")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["project"]))
+        self.assertTrue((self.root / "Project").is_dir())
+
+    def test_folder_deleted_here_counts_only_its_own_files(self):
+        # The files of "Photos 2" are not below "Photos": deleting Photos is one file, no mass-deletion check.
+        self.drive.items["photos2"] = {"id": "photos2", "name": "Photos 2", "mimeType": FOLDER, "parent": "root"}
+        for i in range(30):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos2", b"x")
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        plan, state = self.preview()
+        self.assertEqual(savegdrive.deletion_count(plan, state), (1, len(state["files"])))
+        self.assertFalse(savegdrive.needs_deletion_check(plan, state))
+
+    def test_empty_folder_named_like_a_deleted_one_is_still_tracked(self):
+        # Forgetting Photos must not forget the empty folder Photos 2: deleted here next, it goes to the Drive trash.
+        self.drive.items["photos2"] = {"id": "photos2", "name": "Photos 2", "mimeType": FOLDER, "parent": "root"}
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos"], "TRASH_REMOTE")
+        (self.root / "Photos 2").rmdir()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos 2"], "TRASH_REMOTE")
+        self.assertTrue(self.drive.is_trashed(self.drive.items["photos2"]))
+        self.assertFalse((self.root / "Photos 2").exists())
+
     def test_folder_deleted_on_drive_goes_to_your_trash(self):
         self.run_sync()
         for key in ["photos", "p"]:
