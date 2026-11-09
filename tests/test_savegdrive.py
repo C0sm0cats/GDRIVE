@@ -6096,6 +6096,27 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(node.is_expanded for node in tree.root.children if node.allow_expand))
             await pilot.press("q")
 
+    async def test_help_shows_its_keys_at_the_bottom(self):
+        # design 6: the help listed how to close and scroll it only at the end of its text, out of view in 80x24.
+        app = self.make_app()
+        for size in ((80, 24), (132, 43)):
+            async with app.run_test(size=size) as pilot:
+                await pilot.press("question_mark")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, savegdrive.HelpScreen)
+                keys = app.screen.query_one(savegdrive.KeyBar)
+                self.assertEqual(keys.context, "help")
+                shown = "\n".join(str(line) for line in keys.lines(keys.size.width))
+                self.assertIn("esc ? q close", shown)
+                self.assertIn("↑ ↓ scroll", shown)
+                self.assertGreater(keys.region.height, 0)
+                self.assertEqual(keys.region.bottom, size[1])
+                self.assertLessEqual(app.screen.query_one("#help").region.bottom, keys.region.y)
+                await pilot.press("escape")
+                self.assertNotIsInstance(app.screen, savegdrive.HelpScreen)
+                await pilot.press("q")
+            app = self.make_app()
+
     async def test_shift_e_expands_below_the_cursor(self):
         # ux 37: xterm, VTE and Konsole send shift+space as a plain space, so the help names shift+e,
         # which every terminal sends (shift+space was only seen as such with the kitty keyboard protocol).

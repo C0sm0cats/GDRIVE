@@ -1800,6 +1800,10 @@ class HelpScreen(ModalScreen):
     #help Static {
         width: 100%;
     }
+
+    HelpScreen KeyBar {
+        dock: bottom;
+    }
     """
 
     BINDINGS = [Binding("escape,q,question_mark,enter", "dismiss", "Close")]
@@ -1807,6 +1811,7 @@ class HelpScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="help"):
             yield Static(help_text())
+        yield KeyBar("help")
 
     def on_mount(self):
         self.query_one("#help").focus()
