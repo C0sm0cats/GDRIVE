@@ -2513,6 +2513,29 @@ class SyncTest(unittest.TestCase):
             savegdrive.print_plan(plan, self.root)
         self.assertIn("Docs/Report.docx  (Drive: Report · same local name as Report.docx)", output.getvalue())
 
+    def test_drive_names_cannot_send_terminal_sequences(self):
+        # security 5: a name chosen by whoever shares a file reaches the terminal through the preview, the
+        # report line of each transfer and warnings: its ESC sequences (title, clipboard, erase line) and
+        # line breaks must be shown, not sent.
+        hostile = "invoice.pdf\x1b]0;PWNED-TITLE\x1b\\\x1b]52;c;ZWNobyBoaQ==\x1b\\\x1b[1A\x1b[2K"
+        self.drive.items["evil"] = file_item("evil", hostile, "docs", b"evil")
+        self.drive.items["fake"] = file_item("fake", "a\n\u2713 0 errors\x9b2K", "docs", b"fake")
+        output = io.StringIO()
+        console = Console(file=output, width=400)  # not a terminal: Rich adds no ESC of its own
+        with mock.patch.object(savegdrive, "console", console):
+            plan, state = self.preview()
+            savegdrive.print_plan(plan, self.root)
+            savegdrive.apply_plan(self.drive, plan, self.root, state, 1, lambda: self.drive)
+            savegdrive.warn(f"Could not compare {hostile}: 500 Internal Error")
+        text = output.getvalue()
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x9b", text)
+        self.assertNotIn("\u2713 0 errors", [line.strip() for line in text.splitlines()])
+        self.assertIn("invoice.pdf\\x1b]0;PWNED-TITLE", text)
+        self.assertIn("a\\x0a\u2713 0 errors\\x9b2K", text)
+        self.assertIn("\x1b", (self.root / "Docs" / hostile).name)  # the file on disk keeps its Drive name
+        self.assertEqual(savegdrive.printable("tab\tstays"), "tab\tstays")
+
     def test_read_only_files_with_one_name_all_come_down(self):
         # Ann's folder, shared read only, holds two Scan.pdf: you cannot rename either on Drive.
         read_only = {"canEdit": False, "canTrash": False, "canAddChildren": False}
@@ -3556,6 +3579,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 
     def selected(self, app):
         return [savegdrive.selected_path(entry).as_posix() for entry in app.selections]
+
+    async def test_drive_names_cannot_send_terminal_sequences(self):
+        # security 5: the tree and the preview show a hostile name's ESC sequences instead of emitting them.
+        drive = demo_drive()
+        drive.items["evil"] = file_item("evil", "invoice.pdf\x1b]52;c;dHJlZS1jbGlw\x1b\\", "root", b"evil")
+        app = self.make_app(drive)
+        async with app.run_test(size=(120, 30)) as pilot:
+            entry = next(node.data for node in app.tree_nodes.values() if node.data["item"]["id"] == "evil")
+            label = next(node.label.plain for node in app.tree_nodes.values() if node.data is entry)
+            self.assertNotIn("\x1b", label)
+            self.assertIn("invoice.pdf\\x1b]52;c;", label)
+            app.toggle_entry(entry)
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
+            table = app.screen.query_one("DataTable")
+            items = [table.get_row_at(row)[1].plain for row in range(table.row_count)]
+            self.assertTrue(any("invoice.pdf\\x1b]52" in item for item in items), items)
+            self.assertFalse(any("\x1b" in item for item in items), items)
 
     async def test_select_expand_and_download(self):
         app = self.make_app()

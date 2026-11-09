@@ -127,13 +127,23 @@ VERBOSE = False
 DRIVE_ROOT = None
 
 
+def printable(text):
+    """text with its control characters (ESC, line breaks...) shown as \\xNN rather than sent to the terminal:
+    Drive names are chosen by whoever shares a file. Rich and Textual only drop BEL, BS, VT, FF and CR."""
+    if text.isprintable():
+        return text
+    return "".join(
+        f"\\x{ord(char):02x}" if char != "\t" and unicodedata.category(char) == "Cc" else char for char in text
+    )
+
+
 def debug(message):
     if VERBOSE:
-        console.print(f"[dim]  {escape(message)}[/]")
+        console.print(f"[dim]  {escape(printable(message))}[/]")
 
 
 def warn(message):
-    console.print(f"[yellow]![/] {escape(message)}")
+    console.print(f"[yellow]![/] {escape(printable(message))}")
 
 
 def error_text(error):
@@ -1522,7 +1532,8 @@ def name_column(nodes, base=Path()):
     widest = 0
     for node in nodes:
         prefix = 4 + (2 if node["item"]["mimeType"] == SHORTCUT_MIME_TYPE else 0)  # checkbox, mark
-        widest = max(widest, label_start(node, children_of, base) + prefix + Text(node["item"]["name"]).cell_len)
+        name = Text(printable(node["item"]["name"]))
+        widest = max(widest, label_start(node, children_of, base) + prefix + name.cell_len)
     return widest
 
 
@@ -2301,7 +2312,7 @@ class DriveSelectorApp(App):
         if column is None:
             column = self.label_column = self.name_column
         width = column - label_start(entry, self.children_of, self.view.base) - label.cell_len
-        name = Text(item["name"], style=name_style)
+        name = Text(printable(item["name"]), style=name_style)
         name.truncate(max(width, 4), overflow="ellipsis", pad=True)
         label.append_text(name)
 
@@ -2564,7 +2575,7 @@ class DriveSelectorApp(App):
         if entry is None:
             return
         if open_quietly(drive_url(entry["item"])):
-            self.notify(f"Opened {entry['item']['name']} in your browser.", markup=False)
+            self.notify(f"Opened {printable(entry['item']['name'])} in your browser.", markup=False)
         else:
             self.notify("Could not open a browser.", severity="error")
 
@@ -2616,7 +2627,7 @@ class DriveSelectorApp(App):
 
     def describe(self, items):
         if len(items) == 1:
-            return f"“{items[0]['name']}”"
+            return f"“{printable(items[0]['name'])}”"
         folders = sum(is_folder(item) for item in items)
         parts = []
         if folders:
@@ -3467,7 +3478,7 @@ def source_name(entry):
 def duplicate_label(entry):
     """`(Drive: Report · same local name as Report.docx)`: which Drive items clash, under their Drive names."""
     others = ", ".join(entry.get("same_local_name") or [])
-    return f"(Drive: {source_name(entry)} · same local name as {others or 'another item'})"
+    return printable(f"(Drive: {source_name(entry)} · same local name as {others or 'another item'})")
 
 
 def path_is_in_scope(relative_path, scopes):
@@ -3937,7 +3948,7 @@ def print_plan(plan, destination_root):
         table.add_column("SIZE", justify="right", no_wrap=True, style="dim")
         for entry in shown:
             style, label, _ = STATUS_STYLES[entry["status"]]
-            path = escape(entry["relative_path"].as_posix())
+            path = escape(printable(entry["relative_path"].as_posix()))
             if entry["kind"] == "FOLDER":
                 path = f"[bold]{path}/[/]"  # the color would be pale on a light terminal
             if entry.get("duplicate"):
@@ -4243,12 +4254,12 @@ class PreviewScreen(Screen):
         cells = []
         for entry in rows:
             style, label, _ = STATUS_STYLES[entry["status"]]
-            path = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
+            path = printable(entry["relative_path"].as_posix()) + ("/" if entry["kind"] == "FOLDER" else "")
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
             suffix = ""
             if entry["status"] == "KEEP_BOTH":
-                suffix = f"  (yours → {entry['local_copy'].name})"
+                suffix = f"  (yours → {printable(entry['local_copy'].name)})"
             elif entry.get("duplicate"):
                 suffix = f"  {duplicate_label(entry)}"
             size_cell = Text(size if size != "-" else "", style="dim", justify="right")
@@ -4311,7 +4322,7 @@ class PreviewScreen(Screen):
         set_keep_both(self.plan, [entry], keep)
         if keep and not entry.get("copy_goes_up", True):
             self.notify(
-                f"{entry['local_copy'].name} cannot go up: this folder is read only on Drive. "
+                f"{printable(entry['local_copy'].name)} cannot go up: this folder is read only on Drive. "
                 "It stays on your disk only.",
                 severity="warning",
                 markup=False,
@@ -4945,7 +4956,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
     )
 
     def report(mark, text):
-        progress.console.print(f"{mark} {escape(text)}")
+        progress.console.print(f"{mark} {escape(printable(text))}")
 
     forgotten = []  # deleted paths, forgotten in one pass before the state is saved
     folder_ids = create_folders(service, plan, state, results, report)
@@ -5225,7 +5236,7 @@ def main():
                     cache, token = {}, start_page_token(service)
                 kept = []
                 selections, local_scopes = last_selection(service, state, cache, kept)
-            names = ", ".join(escape(entry["item"]["name"]) for entry in selections[:5])
+            names = ", ".join(escape(printable(entry["item"]["name"])) for entry in selections[:5])
             more = f" and {len(selections) - 5} more" if len(selections) > 5 else ""
             who = f"{escape(account)} " if account else ""
             console.print(f"[bold]Again[/]  {names}{more} [dim]{who}→ {escape(str(destination_root))}[/]")
