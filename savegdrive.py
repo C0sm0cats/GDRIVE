@@ -791,6 +791,9 @@ def plural(count, word):
     return f"{count} {word}{'' if count == 1 else 's'}"
 
 
+SELECTION_BOXES = {"x": "☑ ", "*": "◩ "}  # selection state -> checkbox; anything else is "☐ "
+
+
 def selected_path(entry):
     return entry["relative_parent"] / local_name(entry["item"])
 
@@ -1895,6 +1898,7 @@ class DriveSelectorApp(App):
         self.label_column = None  # the name column of the labels shown, to redo them when the width changes
         self.label_index = None  # selection_index of self.selections for node_label; None when stale
         self.tree_nodes = {}
+        self.node_paths = {}  # index -> selected_path of its entry, for the tree nodes
         self.populated = set()
         self.filter_terms = []
         self.filter_ancestors = set()
@@ -2151,6 +2155,7 @@ class DriveSelectorApp(App):
                 allow_expand=entry["index"] in self.children_of,
             )
             self.tree_nodes[entry["index"]] = child
+            self.node_paths[entry["index"]] = selected_path(entry)
 
     def expand(self, tree_node):
         self.populate(tree_node)
@@ -2173,6 +2178,7 @@ class DriveSelectorApp(App):
         tree.clear()
         self.label_index = None
         self.tree_nodes = {}
+        self.node_paths = {}
         self.populated = set()
         self.populate(tree.root)
         tree.root.expand()
@@ -2227,7 +2233,7 @@ class DriveSelectorApp(App):
         state = indexed_selection_state(selected_path(entry), self.label_index)
         label = Text()
         label.append(
-            {"x": "☑ ", "*": "◩ "}.get(state, "☐ "),
+            SELECTION_BOXES.get(state, "☐ "),
             style="bold bright_green" if state != " " else "bright_black",
         )
         mark = self.marks.get(entry["index"])
@@ -2255,10 +2261,27 @@ class DriveSelectorApp(App):
         label.rstrip()
         return label
 
-    def refresh_node_labels(self):
+    def refresh_node_labels(self, selection_only=False):
+        """Relabel the populated nodes. selection_only: only the selection changed, so relabel just
+        the nodes whose checkbox changed (each set_label repaints, seconds on a large unfolded tree)."""
         self.label_index = None  # the selection changed
-        for tree_node in self.tree_nodes.values():
-            tree_node.set_label(self.node_label(tree_node.data))
+        if not selection_only:
+            for tree_node in self.tree_nodes.values():
+                tree_node.set_label(self.node_label(tree_node.data))
+        else:
+            self.label_index = paths, folders = selection_index(self.selections)
+            # indexed_selection_state, top down: a node is covered when its tree parent is a selected
+            # folder or covered itself (a child's relative_parent is its parent's path). Parents come
+            # first in tree_nodes, as they are populated before their children.
+            covers = {}  # index -> are its children covered by a selected folder
+            for index, tree_node in self.tree_nodes.items():
+                path = self.node_paths[index]
+                parent = tree_node.data["parent"]
+                covered = covers[parent] if parent in covers else not folders.isdisjoint(path.parents)
+                covers[index] = covered or path in folders
+                state = "x" if path in paths else "*" if covered else " "
+                if tree_node.label.plain[:1] != SELECTION_BOXES.get(state, "☐ ")[0]:
+                    tree_node.set_label(self.node_label(tree_node.data))
         self.update_selection_summary()
         self.update_views()
 
@@ -2319,7 +2342,7 @@ class DriveSelectorApp(App):
             return
         else:
             self.add_entry(entry)
-        self.refresh_node_labels()
+        self.refresh_node_labels(selection_only=True)
 
     def selection_candidate(self, entry):
         # Keep the view and totals, for the tab counts and the summary.
@@ -2431,11 +2454,11 @@ class DriveSelectorApp(App):
             ]
         else:
             add_selected_items(self.selections, [self.selection_candidate(entry) for entry in targets])
-        self.refresh_node_labels()
+        self.refresh_node_labels(selection_only=True)
 
     def action_clear_selection(self):
         self.selections.clear()
-        self.refresh_node_labels()
+        self.refresh_node_labels(selection_only=True)
 
     def action_start_filter(self):
         filter_input = self.query_one("#filter", Input)

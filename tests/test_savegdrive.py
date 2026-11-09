@@ -3501,6 +3501,41 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(tree.root.children), 3)
             await pilot.press("escape")
 
+    async def test_selection_relabels_only_the_nodes_whose_checkbox_changes(self):
+        # Each set_label repaints (seconds for every node of a large unfolded tree): space, a and c
+        # must relabel only the nodes whose checkbox changes, and get every one of them right.
+        drive = demo_drive()
+        drive.items["docs2"] = {"id": "docs2", "name": "Docs", "mimeType": FOLDER, "parent": "root"}
+        drive.items["c"] = file_item("c", "c.txt", "docs2", b"charlie")
+        app = self.make_app(drive)
+        async with app.run_test(size=(120, 30)) as pilot:
+            app.action_expand_all()
+            await pilot.pause()
+            labels = {index: node.label for index, node in app.tree_nodes.items()}
+            ids = {index: node.data["item"]["id"] for index, node in app.tree_nodes.items()}
+
+            def changed():
+                relabeled = {ids[index] for index, node in app.tree_nodes.items() if node.label is not labels[index]}
+                labels.update({index: node.label for index, node in app.tree_nodes.items()})
+                return relabeled
+
+            def boxes():
+                return {ids[index]: node.label.plain[0] for index, node in app.tree_nodes.items()}
+
+            entries = {ids[index]: node.data for index, node in app.tree_nodes.items()}
+            app.toggle_entry(entries["docs"])  # and its twin Docs
+            self.assertEqual(changed(), {"docs", "docs2", "a", "b", "report", "form", "c"})
+            self.assertEqual(boxes(), {"docs": "☑", "docs2": "☑", "a": "◩", "b": "◩", "report": "◩",
+                                       "form": "◩", "c": "◩", "photos": "☐", "p": "☐", "n": "☐"})
+            app.toggle_entry(entries["a"])  # included by Docs: nothing changes
+            self.assertEqual(changed(), set())
+            app.action_select_all()
+            self.assertEqual(changed(), {"photos", "p", "n"})
+            app.action_clear_selection()
+            self.assertEqual(changed(), set(ids.values()))
+            self.assertEqual(set(boxes().values()), {"☐"})
+            await pilot.press("escape")
+
     async def test_columns_are_aligned(self):
         app = self.make_app()
         async with app.run_test(size=(120, 20)) as pilot:
