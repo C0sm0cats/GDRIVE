@@ -384,6 +384,41 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(savegdrive.build_local_scopes(selections, {Path(): root_items}), [Path()])
 
 
+KILLED_SYNC = """
+import json, signal, sys, tempfile, types
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+tempfile.tempdir = sys.argv[2]
+tempfile.TemporaryDirectory = lambda: types.SimpleNamespace(name=tempfile.mkdtemp(), cleanup=lambda: None)  # kept for the parent
+import savegdrive
+import test_savegdrive as t
+
+case = t.SyncTest("test_first_run_then_unchanged")
+case.setUp()
+case.run_sync()
+for item_id, name in [("a", "a.txt"), ("b", "b.txt")]:
+    case.drive.items[item_id].update(t.file_item(item_id, name, "docs", name.encode() + b" v2",
+                                                 modifiedTime="2026-03-01T00:00:00.000Z"))
+print(json.dumps({"root": str(case.root),
+                  "a": savegdrive.remote_signature(case.drive.public(case.drive.items["a"]))}), flush=True)
+
+def fetch(service, item, file_handle, stop=None):
+    content = service.items[savegdrive.effective_id(item)]["content"]
+    if item["name"] != "b.txt":
+        file_handle.write(content)
+        return
+    file_handle.write(content[:3])
+    signal.raise_signal(getattr(signal, sys.argv[3]))  # the terminal closed, or the system shuts down
+    if stop is not None and stop.wait(10):
+        raise savegdrive.Stopped()
+    file_handle.write(content[3:])
+
+plan, state = case.preview()
+with mock.patch.object(savegdrive, "fetch_media", fetch):
+    case.apply(plan, state, jobs=1)
+"""
+
+
 class SyncTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1879,6 +1914,30 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs/a.txt", "Docs/b.txt", "Photos/beach.jpg", "notes.txt")},
                          {"UNCHANGED"})
+
+
+    def test_sigterm_or_sighup_saves_finished_transfers_and_removes_part_file(self):
+        tests_dir = Path(__file__).resolve().parent
+        for name in ("SIGTERM", "SIGHUP"):
+            with self.subTest(signal=name), tempfile.TemporaryDirectory() as temp:
+                result = subprocess.run(
+                    [sys.executable, "-c", KILLED_SYNC, str(tests_dir.parent), temp, name],
+                    env=dict(os.environ, PYTHONPATH=str(tests_dir)), capture_output=True, text=True, timeout=60,
+                )
+                self.assertIn("KeyboardInterrupt", result.stderr)  # the Ctrl+C path, not a silent death
+                shown = json.loads(result.stdout.splitlines()[0])
+                root = Path(shown["root"])
+                self.assertEqual(list(root.rglob(f"*{savegdrive.PART_SUFFIX}")), [])
+                saved = {record["path"]: record for record in savegdrive.load_state(root)["files"].values()}
+                self.assertEqual(saved["Docs/a.txt"]["remote_signature"], shown["a"])  # downloaded before: no conflict
+
+    def test_part_file_left_by_a_killed_run_is_removed(self):
+        self.run_sync()
+        left = self.root / "Docs" / f".b.txt{savegdrive.PART_SUFFIX}"
+        left.write_bytes(b"half")
+        statuses, _ = self.run_sync()
+        self.assertFalse(left.exists())
+        self.assertNotIn(f"Docs/{left.name}", statuses)
 
     def test_same_content_changed_on_both_sides_is_not_a_conflict(self):
         self.run_sync()

@@ -1,10 +1,12 @@
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import mimetypes
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -3293,7 +3295,12 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 and relative_path not in remote_directories
             ):
                 continue  # the Shared with me / Shared drives / Trash views have their own scopes
-            if child.name.endswith(PART_SUFFIX) or child.is_symlink():
+            if child.is_symlink():
+                continue
+            if child.name.endswith(PART_SUFFIX):
+                if child.is_file():
+                    with contextlib.suppress(OSError):
+                        child.unlink()  # left by a killed run (kill -9, power cut): ours, never complete
                 continue
             if any(relative_path == trashed or trashed in relative_path.parents for trashed in trashed_remote):
                 continue  # deleted here; Drive's copy goes to the Drive trash
@@ -4048,6 +4055,28 @@ def forget_all_below(state, relative_paths):
         del folders[path]
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)  # system shutdown, `timeout`, kill; the terminal closed
+
+
+def interrupt_on_stop_signal(signal_number, frame):
+    raise KeyboardInterrupt(signal.Signals(signal_number).name)
+
+
+@contextlib.contextmanager
+def stop_signals_interrupt():
+    """SIGTERM and SIGHUP take the Ctrl+C path (partial files removed, finished transfers saved), not a silent exit."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {number: signal.signal(number, interrupt_on_stop_signal) for number in STOP_SIGNALS}
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+@stop_signals_interrupt()
 def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
     """Apply the confirmed plan. Transfers run in jobs threads, each with its own Drive client."""
     results = Counter()
