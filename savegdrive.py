@@ -1014,7 +1014,8 @@ def build_local_scopes(selections, browsed_directories, bases=(Path(),)):
 
 
 def matches_filter(entry, terms):
-    haystack = entry["display_path"].casefold()
+    # Drive keeps names as uploaded: one from a Mac is often NFD, while the keyboard types NFC.
+    haystack = unicodedata.normalize("NFC", entry["display_path"]).casefold()
     return all(term in haystack for term in terms)
 
 
@@ -2402,7 +2403,7 @@ class DriveSelectorApp(App):
         self.update_selection_summary()
 
     def apply_filter(self, text):
-        self.filter_terms = text.casefold().split()
+        self.filter_terms = unicodedata.normalize("NFC", text).casefold().split()
         if not self.filter_terms:
             self.filter_visible = None
             self.filter_ancestors = set()

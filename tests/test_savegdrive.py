@@ -4892,6 +4892,22 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
         self.assertIsNone(app.return_value)
 
+    async def test_filter_finds_a_decomposed_drive_name_typed_as_shown(self):
+        # ux 30: a name uploaded from a Mac is in NFD ("e" + combining accent); the keyboard sends NFC.
+        drive = demo_drive()
+        drive.items["nfd"] = file_item("nfd", "Cafe\u0301 menu.pdf", "root", b"menu")
+        drive.items["nfc"] = file_item("nfc", "\u00c9t\u00e9 2025.jpg", "root", b"summer")
+        app = self.make_app(drive)
+        async with app.run_test() as pilot:
+            tree = app.query_one(Tree)
+            cafe, summer = ["Cafe\u0301 menu.pdf"], ["\u00c9t\u00e9 2025.jpg"]
+            for typed, expected in (("caf\u00e9", cafe), ("\u00e9t\u00e9", summer),  # typed in NFC
+                                    ("cafe\u0301", cafe), ("e\u0301te\u0301", summer)):  # pasted in NFD
+                app.apply_filter(typed)
+                await pilot.pause()
+                self.assertEqual([node.data["display_path"] for node in tree.root.children], expected, typed)
+            await pilot.press("q")
+
     async def test_filter_rebuilds_the_tree_once_typing_stops(self):
         # Each rebuild walks the whole tree (seconds on a large Drive): typing a filter must not
         # rebuild it after every character, only once typing stops or on enter.
