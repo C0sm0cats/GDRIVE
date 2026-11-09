@@ -4010,14 +4010,18 @@ def upload_file(service, path, file_id=None, name=None, parent_id=None, stop=Non
         chunksize=8 * 1024 * 1024,
         resumable=True,
     )
+    # Keep the file's own date on Drive (else Drive puts the upload time, which then comes back here).
+    modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="milliseconds")
+    modified = modified.replace("+00:00", "Z")
     if file_id:
         request = service.files().update(
-            fileId=file_id, media_body=media, fields=UPLOAD_FIELDS, supportsAllDrives=True
+            fileId=file_id, body={"modifiedTime": modified}, media_body=media, fields=UPLOAD_FIELDS,
+            supportsAllDrives=True,
         )
     else:
         request = service.files().create(
-            body={"name": name, "parents": [parent_id]}, media_body=media, fields=UPLOAD_FIELDS,
-            supportsAllDrives=True,
+            body={"name": name, "parents": [parent_id], "modifiedTime": modified}, media_body=media,
+            fields=UPLOAD_FIELDS, supportsAllDrives=True,
         )
     sent = 0
     response = None

@@ -2201,11 +2201,33 @@ class UploadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "x.bin"
             path.write_bytes(b"0123456789")
+            os.utime(path, (1563098400.25, 1563098400.25))
             item = savegdrive.upload_file(service, path, name="x.bin", parent_id="docs", on_bytes=sent.append)
         self.assertEqual(item["id"], "new")
         self.assertEqual(sum(sent), 10)
         body = service.files.return_value.create.call_args.kwargs["body"]
-        self.assertEqual(body, {"name": "x.bin", "parents": ["docs"]})
+        self.assertEqual(body, {"name": "x.bin", "parents": ["docs"], "modifiedTime": "2019-07-14T10:00:00.250Z"})
+
+    def test_upload_file_keeps_the_local_date(self):
+        # Without modifiedTime, Drive dates the file at the upload time, and that date comes back here.
+        service = mock.Mock()
+        files = service.files.return_value
+        files.update.return_value.next_chunk.return_value = (None, {"id": "a"})
+        files.create.return_value.next_chunk.return_value = (None, {"id": "b"})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "notes.txt"
+            path.write_bytes(b"x")
+            os.utime(path, (1563098400.25, 1563098400.25))
+            savegdrive.upload_file(service, path, file_id="a")
+            savegdrive.upload_file(service, path, name="notes.txt", parent_id="docs")
+        self.assertEqual(files.update.call_args.kwargs["body"], {"modifiedTime": "2019-07-14T10:00:00.250Z"})
+        self.assertEqual(files.create.call_args.kwargs["body"]["modifiedTime"], "2019-07-14T10:00:00.250Z")
+        item = {"modifiedTime": "2019-07-14T10:00:00.250Z"}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "notes.txt"
+            path.write_bytes(b"x")
+            savegdrive.set_remote_mtime(path, item)
+            self.assertEqual(path.stat().st_mtime, 1563098400.25)
 
     def test_upload_stops_on_ctrl_c(self):
         import threading
