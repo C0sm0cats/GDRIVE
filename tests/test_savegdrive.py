@@ -999,6 +999,40 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual(statuses["notes.txt"], "UNCHANGED")
 
+    def test_first_sync_different_file_is_a_conflict(self):
+        (self.root / "notes.txt").write_bytes(b"my own notes")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["notes.txt"], "CONFLICT")
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"my own notes")
+
+    def test_first_sync_identical_export_is_adopted(self):
+        (self.root / "Docs").mkdir()
+        (self.root / "Docs/Report.docx").write_bytes(b"docx bytes")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "UNCHANGED")
+
+    def test_first_sync_different_export_is_a_conflict(self):
+        (self.root / "Docs").mkdir()
+        (self.root / "Docs/Report.docx").write_bytes(b"my local report")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "CONFLICT")
+        self.assertEqual((self.root / "Docs/Report.docx").read_bytes(), b"my local report")
+
+    def test_first_sync_export_compare_error_is_a_conflict(self):
+        (self.root / "Docs").mkdir()
+        (self.root / "Docs/Report.docx").write_bytes(b"my local report")
+
+        def failing_fetch(service, item, file_handle, stop=None):
+            if savegdrive.effective_id(item) == "report":
+                raise http_error(403)
+            fake_fetch(service, item, file_handle, stop)
+
+        with mock.patch.object(savegdrive, "fetch_media", failing_fetch), \
+                mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "CONFLICT")
+        self.assertEqual((self.root / "Docs/Report.docx").read_bytes(), b"my local report")
+
     def test_interrupted_download_leaves_no_part_file(self):
         def interrupted(service, item, file_handle, stop=None):
             file_handle.write(b"partial")
