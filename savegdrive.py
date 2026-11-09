@@ -1413,7 +1413,7 @@ class ConfirmScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm"):
-            yield Static(self.message)
+            yield Static(self.message, markup=False)  # names may hold [brackets]
             if self.word:
                 yield Static(Text.assemble("Type ", (self.word, "bold #f59e0b"), " then enter, or esc to cancel."))
                 yield Input(id="confirm-word")
@@ -2197,7 +2197,7 @@ class DriveSelectorApp(App):
         if entry is None:
             return
         if open_quietly(drive_url(entry["item"])):
-            self.notify(f"Opened {entry['item']['name']} in your browser.")
+            self.notify(f"Opened {entry['item']['name']} in your browser.", markup=False)
         else:
             self.notify("Could not open a browser.", severity="error")
 
@@ -2217,7 +2217,7 @@ class DriveSelectorApp(App):
             self.update_sub_title()
             self.refresh_node_labels()
             self.check_last_sync()
-            self.notify(f"Syncing with {destination} for this session.")
+            self.notify(f"Syncing with {destination} for this session.", markup=False)
 
         self.push_screen(DestinationSetupScreen(initial), changed)
 
@@ -2280,9 +2280,9 @@ class DriveSelectorApp(App):
         self.busy = False
         if failed:
             first = next(iter(failed.values()))
-            self.notify(f"{plural(len(failed), 'item')} failed: {first}", severity="error")
+            self.notify(f"{plural(len(failed), 'item')} failed: {first}", severity="error", markup=False)
         else:
-            self.notify(done)
+            self.notify(done, markup=False)
         # Drive changed: reload every view from scratch, starting with this one; the selection goes.
         self.cache.clear()
         TRASHED_FOLDERS.clear()  # a restored folder lists its children as usual again
@@ -2305,6 +2305,7 @@ class DriveSelectorApp(App):
                 self.notify(
                     f"You cannot move {self.describe(items)} to the Drive trash: shared with you read only.",
                     severity="warning",
+                    markup=False,
                 )
                 return
             skipped = len(items) - len(allowed)
@@ -3406,6 +3407,7 @@ class PreviewScreen(Screen):
                 f"{entry['local_copy'].name} cannot go up: this folder is read only on Drive. "
                 "It stays on your disk only.",
                 severity="warning",
+                markup=False,
             )
         self.refresh_plan()
 

@@ -13,7 +13,8 @@ import savegdrive  # noqa: E402
 
 from googleapiclient.errors import HttpError  # noqa: E402
 from rich.console import Console  # noqa: E402
-from textual.widgets import Input, Tree  # noqa: E402
+from textual.widgets import Input, Static, Tree  # noqa: E402
+from textual.widgets._toast import Toast  # noqa: E402
 
 FOLDER = savegdrive.FOLDER_MIME_TYPE
 DOC = "application/vnd.google-apps.document"
@@ -1798,6 +1799,43 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         for item_id in ("docs", "a", "b", "report", "form"):
             self.assertIn(item_id, drive.items)
             self.assertNotIn("trashed", drive.items[item_id])
+
+    async def test_names_with_brackets_show_whole_in_questions_and_toasts(self):
+        name = "[DRAFT] Q3 [/] budget.xlsx"  # [DRAFT] would vanish as markup, [/] would crash
+        drive = demo_drive()
+        drive.items["n"]["name"] = name
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        tree = lambda: app.query_one(Tree)  # noqa: E731
+
+        def question():
+            return app.screen.query_one("#confirm").query(Static).first().render().plain
+
+        def toasts():
+            return [toast.render().plain for toast in app.screen.query(Toast)]
+
+        async with app.run_test(size=(140, 30), notifications=True) as pilot:
+            while (tree().cursor_node.data or {}).get("item", {}).get("id") != "n":
+                await pilot.press("down")
+            with mock.patch.object(savegdrive, "open_quietly", return_value=True):
+                await pilot.press("o")
+            await pilot.pause()
+            self.assertIn(f"Opened {name} in your browser.", toasts())
+
+            await pilot.press("x")
+            self.assertIn(f"Move “{name}” to the Google Drive trash?", question())
+            await pilot.press("y")
+            await self.wait(app, pilot)
+            self.assertTrue(drive.items["n"]["trashed"])
+            self.assertIn(f"Moved “{name}” to the Drive trash.", toasts())
+
+            await pilot.press("shift+tab")  # Trash
+            await self.wait(app, pilot)
+            await pilot.press("down", "r")
+            self.assertIn(f"Restore “{name}” on Google Drive", question())
+            await pilot.press("escape", "x")
+            self.assertIn(f"Delete “{name}” forever from Google Drive?", question())
+            await pilot.press("escape", "q")
 
     async def test_restore_ignores_the_selection_of_other_views(self):
         drive = demo_drive()
