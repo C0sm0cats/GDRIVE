@@ -1156,6 +1156,45 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Shared with me/Finance/q3.xlsx").read_bytes(), b"q3")
         self.assertFalse((self.root / "Shared with me/Finance/README.txt").exists())
 
+    def test_drive_folder_arriving_over_local_only_folder_gets_nothing(self):
+        # Your "Private" folder at the top of Shared with me is local only; a stranger then shares a
+        # "Private" folder with you, editable: your files must not go into it.
+        self.drive.items["s"] = file_item("s", "from Ann.pdf", "ann", b"pdf", shared=True)
+        views = savegdrive.drive_views(self.drive, "root")
+        self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        (self.root / "Shared with me/Private").mkdir()
+        (self.root / "Shared with me/Private/tax-2025.pdf").write_bytes(b"MY TAX RETURN")
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/Private"]["status"], "LOCAL_ONLY")
+        self.drive.items["evil"] = {"id": "evil", "name": "Private", "mimeType": FOLDER, "parent": "mallory",
+                                    "shared": True}
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/Private"]["status"], "CONFLICT")
+        self.assertEqual(plan["Shared with me/Private/tax-2025.pdf"]["status"], "LOCAL_ONLY")
+        self.assertTrue(any("local only folder" in note for note in savegdrive.plan_notes(list(plan.values()))))
+        self.assertEqual(self.drive.uploads, [])
+
+        # Your notes kept in "mine" inside a folder shared read only; its owner then adds an editable "mine".
+        self.drive.items["team"] = {"id": "team", "name": "Team", "mimeType": FOLDER, "parent": "ann",
+                                    "shared": True, "capabilities": {"canAddChildren": False, "canTrash": False}}
+        self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        (self.root / "Shared with me/Team/mine").mkdir()
+        (self.root / "Shared with me/Team/mine/notes.txt").write_bytes(b"MY PRIVATE NOTES")
+        self.drive.items["mine"] = {"id": "mine", "name": "mine", "mimeType": FOLDER, "parent": "team"}
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/Team/mine"]["status"], "CONFLICT")
+        self.assertEqual(plan["Shared with me/Team/mine/notes.txt"]["status"], "LOCAL_ONLY")
+        self.assertEqual(self.drive.uploads, [])
+
+        # A Drive folder synced before is still adopted: a new local file in it goes up.
+        self.drive.items["team"]["capabilities"] = {"canAddChildren": False, "canTrash": False}
+        self.drive.items["sub"] = {"id": "sub", "name": "sub", "mimeType": FOLDER, "parent": "team"}
+        self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        (self.root / "Shared with me/Team/sub/new.txt").write_bytes(b"new")
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/Team/sub"]["status"], "UNCHANGED")
+        self.assertEqual(plan["Shared with me/Team/sub/new.txt"]["status"], "UPLOAD_NEW")
+
     def test_names_differing_only_by_case_are_a_conflict(self):
         # A case-insensitive disk (macOS, exFAT...) stores these as one file: rename one on Drive.
         self.drive.items.update({

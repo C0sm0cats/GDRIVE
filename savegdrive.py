@@ -2778,6 +2778,14 @@ def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, se
     return True
 
 
+def local_folder_has_content(path):
+    """Anything in this local folder (unreadable counts as yes: it may hold your files)."""
+    try:
+        return any(path.iterdir())
+    except OSError:
+        return True
+
+
 def collect_plan(
     service,
     item,
@@ -2789,7 +2797,9 @@ def collect_plan(
     ancestor_folder_ids=frozenset(),
     tracked_folders=None,
     visited=None,
+    parent_closed=False,
 ):
+    """parent_closed: the Drive parent takes no new items (shared with you read only)."""
     mime_type = effective_mime_type(item)
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
@@ -2801,7 +2811,7 @@ def collect_plan(
         if item["mimeType"] == SHORTCUT_MIME_TYPE:
             item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
-        repeat = False
+        repeat = arrived = False
         if relative_path in RESERVED_PATHS:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
@@ -2822,6 +2832,17 @@ def collect_plan(
             and remote_subtree_unchanged(service, folder_id, relative_path, state, cache)
         ):
             status = "TRASH_REMOTE"  # synced before, the whole folder was deleted here
+        elif (
+            status == "UNCHANGED"
+            and (parent_closed or is_readonly_path(relative_path))
+            and state.get("folders", {}).get(relative_path.as_posix()) != folder_id
+            and relative_path.as_posix() not in tracked_folders
+            and local_folder_has_content(destination)
+        ):
+            # A Drive folder appeared over your local only folder (someone shared one by that name):
+            # syncing would send your files into it. Rename one of the two.
+            status = "CONFLICT"
+            arrived = True
         plan.append(
             {
                 "status": status,
@@ -2830,6 +2851,7 @@ def collect_plan(
                 "relative_path": relative_path,
                 "destination": destination,
                 "repeat": repeat,
+                "arrived": arrived,
             }
         )
         if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
@@ -2848,6 +2870,7 @@ def collect_plan(
                 ancestor_folder_ids | {folder_id},
                 tracked_folders,
                 visited,
+                not can(item, "canAddChildren"),
             )
         return
 
@@ -3134,7 +3157,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             remote_folders[entry["relative_path"]] = (
                 effective_id(entry["item"])
                 if can(entry["item"], "canAddChildren") and not entry["item"].get("readonly")
-                and not entry.get("duplicate")
+                and not entry.get("duplicate") and not entry.get("arrived")
                 else None
             )
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
@@ -3346,6 +3369,11 @@ def plan_notes(plan):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
         notes.append("Two Drive items with the same name in a folder: rename one on Drive (o opens it).")
+    if any(entry.get("arrived") for entry in plan):
+        notes.append(
+            "A Drive folder appeared over a local only folder of yours (someone shared one by that name): "
+            "nothing syncs in it, so your files stay off Drive. Rename one of the two."
+        )
     if any(entry.get("repeat") for entry in plan):
         notes.append(
             "A Drive folder reached through two paths (shortcuts) syncs at its first path only: "
