@@ -1834,7 +1834,7 @@ class DriveView:
         self.marks = {}
         self.name_column = 0  # widest label start + name: what the names need
         self.tail_width = 0  # widest size, date and format after the names
-        self.expanded = set()
+        self.expanded = set()  # local paths of the open folders: indexes change when the view is listed again
         self.error = None
 
     def load(self, nodes, browsed):
@@ -2325,12 +2325,12 @@ class DriveSelectorApp(App):
     def node_expanded(self, event):
         self.populate(event.node)
         if not self.filter_terms and event.node.data is not None:
-            self.expanded.add(event.node.data["index"])
+            self.expanded.add(selected_path(event.node.data))
 
     @on(Tree.NodeCollapsed, "#drive-tree")
     def node_collapsed(self, event):
         if not self.filter_terms and event.node.data is not None:
-            self.expanded.discard(event.node.data["index"])
+            self.expanded.discard(selected_path(event.node.data))
 
     def rebuild(self):
         tree = self.query_one("#drive-tree", Tree)
@@ -2342,10 +2342,13 @@ class DriveSelectorApp(App):
         self.populated = set()
         self.populate(tree.root)
         tree.root.expand()
-        to_expand = self.filter_ancestors if self.filter_terms else self.expanded
         for entry in self.nodes:  # parents come first, so each one is already in the tree
             index = entry["index"]
-            if index in to_expand and index in self.tree_nodes:
+            if self.filter_terms:
+                wanted = index in self.filter_ancestors
+            else:
+                wanted = index in self.tree_nodes and self.node_paths[index] in self.expanded
+            if wanted and index in self.tree_nodes:
                 self.expand(self.tree_nodes[index])
         target = None
         if current is not None and current in self.nodes:

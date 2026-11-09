@@ -4597,6 +4597,32 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(node.is_expanded for node in tree.root.children if node.allow_expand))
             await pilot.press("q")
 
+    async def test_open_folders_stay_open_after_a_sync_lists_drive_again(self):
+        # bugs 30: a new folder sent to Drive shifts the indexes of the listed again view.
+        def open_folders(app):
+            return sorted(savegdrive.selected_path(node.data).as_posix()
+                          for node in app.tree_nodes.values() if node.is_expanded)
+
+        drive = demo_drive()
+        app = self.make_app(drive)
+        async with app.run_test() as pilot:
+            photos = next(node for node in app.tree_nodes.values() if node.data["item"]["id"] == "photos")
+            photos.expand()
+            await pilot.pause()
+            self.assertEqual(open_folders(app), ["Photos"])
+            await pilot.press("q")
+        drive.items["archive"] = {"id": "archive", "name": "Archive", "mimeType": FOLDER, "parent": "root"}
+        drive.items["old"] = file_item("old", "old.txt", "archive", b"old")
+        view, cache = app.view, {}  # what main does after a sync that changed Drive
+        view.nodes, view.error, view.sorted_by = None, None, "name"
+        savegdrive.load_view(drive, view, cache)
+        again = savegdrive.DriveSelectorApp(app.views, self.root, savegdrive.load_state(self.root), drive, None,
+                                            cache, view=view)
+        async with again.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(open_folders(again), ["Photos"])
+            await pilot.press("q")
+
     async def test_last_selection_is_checked_at_start(self):
         drive = demo_drive()
         app = self.make_app(drive)
