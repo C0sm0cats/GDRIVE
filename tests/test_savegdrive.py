@@ -1437,6 +1437,40 @@ class SyncTest(unittest.TestCase):
             savegdrive.main()
         return output.file.getvalue()
 
+    def test_items_kept_from_the_trash_view_stay_with_again(self):
+        # Picked in the Trash view before Drive purges them, then a cron --again --yes: they stay here.
+        self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
+        self.drive.items.update({
+            "old": {"id": "old", "name": "Old", "mimeType": FOLDER, "parent": "root", "trashed": True},
+            "o": file_item("o", "old.txt", "old", b"old"),
+            "sub": {"id": "sub", "name": "Sub", "mimeType": FOLDER, "parent": "old"},
+            "deep": file_item("deep", "deep.txt", "sub", b"deep"),
+            "gone": file_item("gone", "gone.txt", "root", b"gone", trashed=True),
+        })
+        cache = {}
+        token = savegdrive.start_page_token(self.drive)
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, savegdrive.TRASH, cache,
+                                                       base=Path(savegdrive.TRASH_DIR))
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [], self.root, state, cache, token)
+        trash = self.root / savegdrive.TRASH_DIR
+        self.assertEqual((trash / "Old/Sub/deep.txt").read_bytes(), b"deep")  # the trashed folder's subfolders too
+        self.assertEqual((trash / "gone.txt").read_bytes(), b"gone")
+
+        savegdrive.TRASHED_FOLDERS.clear()  # a new run
+        self.run_main("--again", "--yes")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        for path in ("Old/old.txt", "Old/Sub/deep.txt", "gone.txt"):
+            self.assertTrue((trash / path).is_file(), path)
+
     def test_again_after_an_upload_keeps_the_sent_file(self):
         self.sync_everything()
         (self.root / "Docs/new.txt").write_bytes(b"made here")
@@ -3207,6 +3241,15 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await self.wait(app, pilot)
             self.assertFalse(drive.items["photos"]["trashed"])
             self.assertEqual(tree_names(), [])
+            await pilot.press("tab")  # back in My Drive, the restored folder lists its content again
+            await self.wait(app, pilot)
+            await pilot.press("e")
+            await self.wait(app, pilot)
+            photos = next(n for n in app.query_one(Tree).root.children if n.data["item"]["id"] == "photos")
+            self.assertEqual([n.data["item"]["name"] for n in photos.children], ["beach.jpg"])
+            await pilot.press("shift+tab")
+            await self.wait(app, pilot)
+            self.assertEqual(app.view.name, "Trash")
 
             drive.items["n"]["trashed"] = True
             app.drive_changed("", {})  # as if trashed elsewhere: reload
