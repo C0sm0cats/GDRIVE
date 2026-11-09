@@ -542,6 +542,29 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alphA")
         self.assertEqual(list(self.trash.iterdir()), [])
 
+    def test_edit_past_the_first_mib_is_seen(self):
+        big = b"x" * (3 * 1024 * 1024)
+        self.drive.items["v"] = file_item("v", "video.bin", "docs", big)
+        self.run_sync()
+        path = self.root / "Docs/video.bin"
+        before = path.stat().st_mtime_ns
+        path.write_bytes(big[:-1] + b"Y")  # same size, last byte changed
+        os.utime(path, ns=(before + 2_000_000_000, before + 2_000_000_000))
+        self.drive.items["v"].update(file_item("v", "video.bin", "docs", b"z" * len(big)))
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/video.bin"], "CONFLICT")
+        self.assertEqual(path.read_bytes()[-1:], b"Y")
+
+        self.drive.items["w"] = file_item("w", "log.bin", "docs", big)
+        self.run_sync()
+        path = self.root / "Docs/log.bin"
+        before = path.stat().st_mtime_ns
+        path.write_bytes(big[:-1] + b"Y")  # changed here only
+        os.utime(path, ns=(before + 2_000_000_000, before + 2_000_000_000))
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/log.bin"], "UPLOAD")
+        self.assertEqual(self.drive.items["w"]["content"][-1:], b"Y")
+
     def test_empty_folders_are_synced(self):
         self.run_sync()
         (self.root / "Empty here").mkdir()
