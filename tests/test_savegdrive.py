@@ -239,6 +239,20 @@ def file_item(item_id, name, parent, content, **extra):
     return item
 
 
+def crossed_shortcuts(levels):
+    """Team/L0, then in every level two shortcuts a and b to the next one; video.mp4 in the last."""
+    items = [{"id": "team", "name": "Team", "mimeType": FOLDER, "parent": "root"},
+             {"id": "l0", "name": "L0", "mimeType": FOLDER, "parent": "team"}]
+    for level in range(levels):
+        items.append({"id": f"l{level + 1}", "name": f"L{level + 1}", "mimeType": FOLDER, "parent": "elsewhere"})
+        for name in ("a", "b"):
+            items.append({"id": f"{name}{level}", "name": name, "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                          "parent": f"l{level}",
+                          "shortcutDetails": {"targetId": f"l{level + 1}", "targetMimeType": FOLDER}})
+    items.append(file_item("video", "video.mp4", f"l{levels}", b"video"))
+    return items
+
+
 def demo_drive():
     return FakeDrive([
         {"id": "docs", "name": "Docs", "mimeType": FOLDER, "parent": "root"},
@@ -335,6 +349,14 @@ class ListingTest(unittest.TestCase):
         ])
         nodes, _ = savegdrive.collect_drive_tree(drive, "root", {})
         self.assertEqual([node["display_path"] for node in nodes], ["Loop", "Loop/Back"])
+
+
+    def test_folder_reached_twice_is_loaded_once(self):
+        # Two shortcuts per level to the next one: 2^levels paths, but every folder is listed once.
+        nodes, _ = savegdrive.collect_drive_tree(FakeDrive(crossed_shortcuts(12)), "root", {})
+        self.assertLess(len(nodes), 50)
+        self.assertEqual([node["display_path"] for node in nodes].count("Team/L0/a/a/a/a/a/a/a/a/a/a/a/a/video.mp4"), 1)
+        self.assertEqual(sum(node["item"]["name"] == "video.mp4" for node in nodes), 1)
 
 
 class SelectionTest(unittest.TestCase):
@@ -496,6 +518,32 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("new.txt", {item["name"] for item in self.drive.items.values()})
         self.assertEqual((self.root / "Team/plan.txt").read_bytes(), b"plan")
         self.assertEqual((self.root / "Team/Sub/deep.txt").read_bytes(), b"deep")
+
+    def test_folder_reached_twice_syncs_once(self):
+        # Crossed shortcuts from an editor of a shared folder: one copy, not 2^levels.
+        self.drive.items.update({item["id"]: item for item in crossed_shortcuts(12)})
+        self.drive.items.update({
+            "sub": {"id": "sub", "name": "Sub", "mimeType": FOLDER, "parent": "team"},
+            "link": {"id": "link", "name": "Link", "mimeType": savegdrive.SHORTCUT_MIME_TYPE, "parent": "team",
+                     "shortcutDetails": {"targetId": "sub", "targetMimeType": FOLDER}},
+            "inside": file_item("inside", "inside.txt", "sub", b"inside"),
+        })
+        statuses, results = self.run_sync()
+        self.assertLess(len(statuses), 60)
+        self.assertEqual(results["FILE_NEW"], 7)  # the demo's 5, video.mp4 and inside.txt once each
+        self.assertEqual(len(list(self.root.rglob("video.mp4"))), 1)
+        self.assertEqual(statuses["Team/L0/a/b"], "SKIPPED")
+        self.assertEqual(statuses["Team/Sub"], "SKIPPED")  # already synced as Team/Link
+        self.assertEqual((self.root / "Team/Link/inside.txt").read_bytes(), b"inside")
+
+        # Whatever is on disk under the second path stays there: never sent, never trashed.
+        (self.root / "Team/Sub").mkdir()
+        (self.root / "Team/Sub/mine.txt").write_bytes(b"mine")
+        statuses, _ = self.run_sync()
+        self.assertNotIn("Team/Sub/mine.txt", statuses)
+        self.assertEqual((self.root / "Team/Sub/mine.txt").read_bytes(), b"mine")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual(self.drive.uploads, [])
 
     def test_deleted_on_one_side_but_changed_on_the_other_comes_back(self):
         self.run_sync()

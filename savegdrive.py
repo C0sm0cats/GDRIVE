@@ -555,6 +555,7 @@ def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folder
     nodes = []
     browsed_directories = {}
     level = [(root_folder_id, None, base, [], frozenset({root_folder_id}))]
+    visited = {root_folder_id}  # a folder reached twice (two shortcuts to it) is listed and opened once
 
     while level:
         list_folders(service, [folder_id for folder_id, *_ in level], cache)
@@ -574,7 +575,8 @@ def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folder
                     }
                 )
                 child_folder_id = effective_id(item)
-                if is_folder(item) and child_folder_id not in ancestors:
+                if is_folder(item) and child_folder_id not in ancestors and child_folder_id not in visited:
+                    visited.add(child_folder_id)
                     next_level.append(
                         (
                             child_folder_id,
@@ -2750,17 +2752,20 @@ def tracked_folder_paths(state):
     return folders
 
 
-def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, seen=frozenset()):
+def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, seen=None):
     """True when every Drive file below the folder was synced and has not changed since."""
+    if seen is None:
+        seen = {folder_id}  # every folder checked once: crossed shortcuts would make it exponential
     for child in list_children(service, folder_id, cache):
         child_path = relative_path / local_name(child)
         if not can(child, "canTrash"):
             return False  # not yours to trash (a colleague's file...): deleted here, it comes back
         if is_folder(child):
             child_id = effective_id(child)
-            if child_id in seen or not remote_subtree_unchanged(
-                service, child_id, child_path, state, cache, seen | {child_id}
-            ):
+            if child_id in seen:
+                return False  # a loop, or a folder also reached elsewhere: not safe to trash
+            seen.add(child_id)
+            if not remote_subtree_unchanged(service, child_id, child_path, state, cache, seen):
                 return False
             continue
         if is_unsupported(child):
@@ -2783,6 +2788,7 @@ def collect_plan(
     cache,
     ancestor_folder_ids=frozenset(),
     tracked_folders=None,
+    visited=None,
 ):
     mime_type = effective_mime_type(item)
     relative_path = relative_parent / local_name(item)
@@ -2795,10 +2801,13 @@ def collect_plan(
         if item["mimeType"] == SHORTCUT_MIME_TYPE:
             item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
+        repeat = False
         if relative_path in RESERVED_PATHS:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
             status = "SKIPPED"
+        elif visited is not None and folder_id in visited:
+            status, repeat = "SKIPPED", True  # already planned through another path (two shortcuts to it)
         elif destination.exists() and not destination.is_dir():
             status = "CONFLICT"
         elif (
@@ -2820,8 +2829,11 @@ def collect_plan(
                 "item": item,
                 "relative_path": relative_path,
                 "destination": destination,
+                "repeat": repeat,
             }
         )
+        if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
+            visited.add(folder_id)
         if status in {"CONFLICT", "SKIPPED", "TRASH_REMOTE"}:
             return
         for child in list_children(service, folder_id, cache):
@@ -2835,6 +2847,7 @@ def collect_plan(
                 cache,
                 ancestor_folder_ids | {folder_id},
                 tracked_folders,
+                visited,
             )
         return
 
@@ -2941,8 +2954,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
     }
     trashed_remote = [
         entry["relative_path"] for entry in plan
-        if entry["kind"] == "FOLDER" and (entry["status"] == "TRASH_REMOTE" or entry.get("duplicate"))
-    ]  # deleted here, or two Drive folders on this path: nothing below goes anywhere
+        if entry["kind"] == "FOLDER"
+        and (entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat"))
+    ]  # deleted here, two Drive folders on this path, or synced at another path: nothing below goes anywhere
     tracked = tracked_files_by_path(state)
     synced_folders = {Path(path) for path in state.get("folders", {})}
     tracked_directories = {
@@ -3074,6 +3088,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
     )
     plan = []
     tracked_folders = tracked_folder_paths(state)
+    visited = set()  # Drive folders already planned: each one syncs at its first path only
     for selection in selections:
         before = len(plan)
         collect_plan(
@@ -3085,6 +3100,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             plan,
             cache,
             tracked_folders=tracked_folders,
+            visited=visited,
         )
         for _ in range(len(plan) - before):
             on_item()
@@ -3308,6 +3324,11 @@ def plan_notes(plan):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
         notes.append("Two Drive items with the same name in a folder: rename one on Drive (o opens it).")
+    if any(entry.get("repeat") for entry in plan):
+        notes.append(
+            "A Drive folder reached through two paths (shortcuts) syncs at its first path only: "
+            "the others are skipped, and what is on your disk there is left as it is."
+        )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
     if "TRASH_LOCAL" in statuses:
