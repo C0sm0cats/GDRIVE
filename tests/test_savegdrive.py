@@ -798,6 +798,39 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(again_scopes, [Path("Photos")])  # gone from Drive: still scanned locally
         self.assertIsNone(savegdrive.last_selection(self.drive, {"files": {}}, {}))
 
+    def test_again_stops_on_a_drive_error(self):
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        by_path = {node["display_path"]: node for node in nodes}
+        selections = []
+        savegdrive.add_selected_item(selections, by_path["Docs"]["item"], by_path["Docs"]["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        savegdrive.remember_selection(state, selections, scopes)
+        savegdrive.save_state(self.root, state)
+
+        real_get = self.drive.get
+        for status in (401, 403, 500, 503):
+            with self.subTest(status=status):
+                def failing_get(fileId, **kwargs):
+                    if fileId != "docs":
+                        return real_get(fileId, **kwargs)
+
+                    def run():
+                        raise http_error(status)
+                    return FakeRequest(run)
+
+                self.drive.get = failing_get
+                with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                    with self.assertRaises(HttpError):  # not "no longer on Drive": its copies would be trashed
+                        savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
+        self.drive.get = real_get
+        del self.drive.items["docs"]  # a real 404: Docs becomes a local scope
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
+        self.assertEqual(again, [])
+        self.assertEqual(again_scopes, [Path("Docs")])
+
     def test_again_with_whole_view_takes_new_items(self):
         state = {"last_selection": {"roots": [{"id": "root", "base": "."}], "items": [], "scopes": ["."]}}
         self.drive.items["new"] = file_item("new", "new.txt", "root", b"new")
