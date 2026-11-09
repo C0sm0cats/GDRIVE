@@ -727,6 +727,29 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(self.drive.items["photos"]["trashed"])
         self.assertEqual(results["FOLDER_TRASH_REMOTE"], 1)
 
+    def test_folder_deleted_here_keeps_a_file_added_on_drive(self):
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        self.drive.items["pn"] = file_item("pn", "new.jpg", "photos", b"a colleague's photo")
+        statuses, _ = self.run_sync()
+        self.assertNotEqual(statuses["Photos"], "TRASH_REMOTE")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["photos"]))
+        self.assertFalse(self.drive.is_trashed(self.drive.items["pn"]))
+        self.assertEqual((self.root / "Photos/new.jpg").read_bytes(), b"a colleague's photo")
+
+    def test_folder_deleted_here_keeps_a_file_changed_on_drive(self):
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        self.drive.items["p"].update(file_item("p", "beach.jpg", "photos", b"jpeg v2",
+                                               modifiedTime="2025-06-01T00:00:00.000Z"))
+        statuses, _ = self.run_sync()
+        self.assertNotEqual(statuses["Photos"], "TRASH_REMOTE")
+        self.assertEqual(statuses["Photos/beach.jpg"], "NEW")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["photos"]))
+        self.assertEqual((self.root / "Photos/beach.jpg").read_bytes(), b"jpeg v2")
+
     def test_folder_deleted_here_keeps_its_google_form(self):
         self.drive.items["pf"] = {"id": "pf", "name": "Customer survey", "mimeType": FORM, "parent": "photos"}
         self.run_sync()
