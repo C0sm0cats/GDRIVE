@@ -894,6 +894,27 @@ def short_path(path):
     return f"~/{path.relative_to(home)}" if path.is_relative_to(home) and path != home else str(path)
 
 
+def tab_row(tabs, width, extra=None):
+    """Tabs on as many lines as needed, each tab whole: a row cut at the edge would hide the active one.
+
+    extra (a hint) only goes at the end of the last line, when it fits there.
+    """
+    row = Text()
+    used = 0
+    for tab in tabs:
+        if used and used + 1 + tab.cell_len > width:
+            row.append("\n")
+            used = 0
+        elif used:
+            row.append(" ")
+            used += 1
+        row.append_text(tab)
+        used += tab.cell_len
+    if extra is not None and used + extra.cell_len <= width:
+        row.append_text(extra)
+    return row
+
+
 def plural(count, word):
     return f"{count} {word}{'' if count == 1 else 's'}"
 
@@ -2026,7 +2047,7 @@ class DriveSelectorApp(App):
     }
 
     #views {
-        height: 1;
+        height: auto;
         margin: 1 2 0 2;
     }
 
@@ -2153,6 +2174,8 @@ class DriveSelectorApp(App):
         return min(self.view.name_column, max(width - self.view.tail_width, NAME_COLUMN_MIN))
 
     def on_resize(self, event):  # runs before App's own handler: self.size is still the old one
+        if self.query("#views"):
+            self.update_views(event.size.width)
         if self.view.nodes is None or self.label_column == self.fit_name_column(event.size.width):
             return
         self.label_column = self.fit_name_column(event.size.width)
@@ -2323,20 +2346,18 @@ class DriveSelectorApp(App):
         if view is self.view:
             self.show_view(view)
 
-    def update_views(self):
-        text = Text()
+    def update_views(self, screen_width=None):
+        widget = self.query_one("#views", Static)
+        tabs = []
         for view in self.views:
             selected = sum(
                 1 for entry in self.selections
                 if entry.get("view") is view
             )
             label = f" {view.name}" + (f" ({selected})" if selected else "") + " "
-            if view is self.view:
-                text.append(label, style="bold #07111f on #38bdf8")
-            else:
-                text.append(label, style="#93c5fd")
-            text.append(" ")
-        self.query_one("#views", Static).update(text)
+            tabs.append(Text(label, style="bold #07111f on #38bdf8" if view is self.view else "#93c5fd"))
+        width = (screen_width or self.size.width) - widget.styles.margin.width
+        widget.update(tab_row(tabs, width))
 
     def switch_view(self, step):
         if len(self.views) < 2 or self.busy:
@@ -4583,7 +4604,7 @@ class PreviewScreen(Screen):
     }
 
     #preview-filters {
-        height: 1;
+        height: auto;
         margin: 1 2 0 2;
     }
 
@@ -4681,20 +4702,18 @@ class PreviewScreen(Screen):
             summary.append(f"\n! {space}: not enough disk space", style="bold red")
         self.query_one("#preview-summary", Static).update(summary)
 
-        tabs = Text()
+        tabs = []
         for index, (tab_name, tab_keep) in enumerate(self.filters):
             label = f" {tab_name} ({sum(1 for entry in self.plan if tab_keep(entry))}) "
-            if index == self.filter_index:
-                tabs.append(label, style="bold #07111f on #f59e0b")
-            else:
-                tabs.append(label, style="#93c5fd")
-            tabs.append(" ")
-        if len(self.filters) > 1:
-            tabs.append(" tab", style="bold #f59e0b")
-            tabs.append(" next · ", style="dim")
-            tabs.append("shift+tab", style="bold #f59e0b")
-            tabs.append(" previous", style="dim")
-        self.query_one("#preview-filters", Static).update(tabs)
+            tabs.append(Text(label, style="bold #07111f on #f59e0b" if index == self.filter_index else "#93c5fd"))
+        # The key bar lists tab and shift+tab too: the hint goes only where it fits.
+        hint = Text.assemble("  ", ("tab", "bold #f59e0b"), (" next · ", "dim"),
+                             ("shift+tab", "bold #f59e0b"), (" previous", "dim")) if len(self.filters) > 1 else None
+        filters = self.query_one("#preview-filters", Static)
+        tab_lines = tab_row(tabs, self.app.size.width - filters.styles.margin.width, hint)
+        filters.update(tab_lines)
+        # A second line of tabs takes the gap above the table (its border still sets it apart), not a table row.
+        self.query_one("#preview-table").styles.margin = (0 if "\n" in tab_lines.plain else 1, 2, 0, 2)
 
         table = self.query_one(DataTable)
         row = table.cursor_row
@@ -4730,6 +4749,16 @@ class PreviewScreen(Screen):
             table.add_row(status, Text(item, style="cyan") if entry["kind"] == "FOLDER" else Text(item), size)
         if rows:
             table.move_cursor(row=min(row, len(rows) - 1))
+        self.call_after_refresh(self.fit_notes)
+
+    def fit_notes(self):
+        # Tabs on several lines come out of the notes (they scroll), never out of the table or the key bar.
+        notes = self.query_one("#preview-notes")
+        table = self.query_one("#preview-table")
+        used = sum(widget.outer_size.height + widget.styles.margin.height
+                   for widget in self.query("Header, #preview-summary, #preview-filters, KeyBar"))
+        free = self.size.height - used - table.styles.margin.height - int(table.styles.min_height.value)
+        notes.styles.max_height = max(1, min(self.size.height * 3 // 10, free))
 
     def on_resize(self, event):
         if self.rows is not None:  # filled: fit ITEM to the new width

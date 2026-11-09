@@ -2,6 +2,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -4939,6 +4940,31 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.view, views[0])
             await pilot.press("q")
 
+    async def test_every_view_tab_stays_visible_when_the_row_overflows(self):
+        # design 4: the tab row was one line high, so with several shared drives the active Trash tab was cut off.
+        drive = demo_drive()
+        drive.shared_drives = [{"id": f"d{n}", "name": name} for n, name in enumerate(
+            ("Engineering Platform", "Finance & Accounting", "Marketing Campaigns",
+             "Human Resources", "Customer Success", "Legal and Compliance"))]
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        async with app.run_test(size=(80, 24)) as pilot:
+            while app.view.name != "Trash":
+                await pilot.press("tab")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+            self.assertEqual(app.view.name, "Trash")
+            for size in ((80, 24), (110, 27)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause()
+                row = app.query_one("#views")
+                lines = ["".join(s.text for s in row.render_line(y)).rstrip() for y in range(row.size.height)]
+                shown = "\n".join(lines)
+                for view in views:
+                    self.assertRegex(shown, rf"(?m)^(.* )? {re.escape(view.name)}( |$)", (size, lines))
+                self.assertTrue(all(len(line) <= row.size.width for line in lines), lines)
+            await pilot.press("q")
+
     async def test_view_that_failed_to_load_is_tried_again_when_switching_back(self):
         # ux 34: one network error on a view's first listing left it in error for the whole session.
         drive = demo_drive()
@@ -5171,6 +5197,34 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             sizes = {table.get_row_at(index)[1].plain: table.get_row_at(index)[-1].plain
                      for index in range(table.row_count)}
         self.assertEqual(sizes, {"beach.jpg": "5.0 MB", "new.txt": "1.5 KB", "down.txt": "2.0 KB"})
+
+    async def test_preview_tabs_and_their_help_stay_visible_when_the_row_overflows(self):
+        # design 4: with many statuses the one-line tab row hid the active Conflict tab and the tab help.
+        statuses = ("NEW", "UPDATE", "UPLOAD_NEW", "UPLOAD", "TRASH_REMOTE", "TRASH_LOCAL", "UNCHANGED", "CONFLICT")
+        plan = [{
+            "status": status, "relative_path": Path(f"{status.lower()}.txt"), "kind": "FILE",
+            "item": {"name": f"{status.lower()}.txt", "size": "4"}, "destination": self.root / f"{status.lower()}.txt",
+        } for status in statuses]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            names = [name for name, _ in app.screen.filters]
+            await pilot.press(*["tab"] * names.index("Conflict"))
+            await pilot.pause()
+            for size in ((80, 24), (132, 43), (220, 55)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause()
+                row = app.screen.query_one("#preview-filters")
+                lines = ["".join(s.text for s in row.render_line(y)).rstrip() for y in range(row.size.height)]
+                shown = "\n".join(lines)
+                for name in names:
+                    self.assertIn(f" {name} (", shown, (size, lines))
+                self.assertTrue(all(len(line) <= row.size.width for line in lines), lines)
+                self.assertGreaterEqual(app.screen.query_one("#preview-table").region.height, 6)
+                self.assertLessEqual(app.screen.query_one(savegdrive.KeyBar).region.bottom, size[1])
+            # One line wide enough: the tab hint is there too (the key bar always lists tab and shift+tab).
+            self.assertEqual(len(lines), 1)
+            self.assertIn("tab next · shift+tab previous", shown)
 
     async def test_preview_survives_a_file_to_send_deleted_after_the_plan(self):
         (self.root / "kept.txt").write_bytes(b"x" * 7)
