@@ -107,7 +107,11 @@ class FakeChanges:
                 raise http_error(410)
             start = int(pageToken)
             end = start + min(kwargs.get("pageSize", 1000), self.drive.changes_page_size)
-            response = {"changes": self.drive.change_log[start:end]}
+            changes = self.drive.change_log[start:end]
+            if not kwargs.get("includeItemsFromAllDrives"):
+                # Like the API: shared drive items are left out unless asked for.
+                changes = [change for change in changes if not self.drive.in_shared_drive(change.get("fileId"))]
+            response = {"changes": changes}
             if end < len(self.drive.change_log):
                 response["nextPageToken"] = str(end)
             else:
@@ -168,6 +172,16 @@ class FakeDrive:
             public["parents"] = [item["parent"]]
         return public
 
+    def in_shared_drive(self, item_id):
+        drive_ids = {shared_drive["id"] for shared_drive in self.shared_drives}
+        seen = set()
+        while item_id is not None and item_id not in seen:
+            if item_id in drive_ids:
+                return True
+            seen.add(item_id)
+            item_id = self.items.get(item_id, {}).get("parent")
+        return False
+
     def is_trashed(self, item):
         while item is not None:
             if item.get("trashed"):
@@ -216,6 +230,8 @@ class FakeDrive:
                 return {"id": "root"}
             if fileId not in self.items:
                 raise http_error(404)
+            if not kwargs.get("supportsAllDrives") and self.in_shared_drive(fileId):
+                raise http_error(404)  # like the API: shared drive items are not found unless supported
             item = self.items[fileId]
             return dict(self.public(item), trashed=self.is_trashed(item))  # asked for by ITEM_FIELDS
 
@@ -1971,6 +1987,49 @@ class SyncTest(unittest.TestCase):
         savegdrive.prefetch_folders(self.drive, ["root"], fresh)
         self.assertEqual(replayed, fresh)
         self.assertEqual(new_token, "2")
+
+    def test_again_on_a_shared_drive_sees_a_colleague_change(self):
+        # A cron --again --yes on a Shared drive folder: Ann's edit must come back as a conflict, not be overwritten.
+        self.drive.shared_drives = [{"id": "team", "name": "Team"}]
+        self.drive.items.update({
+            "proj": {"id": "proj", "name": "Projects", "mimeType": FOLDER, "parent": "team"},
+            "t": file_item("t", "plan.txt", "proj", b"plan"),
+            "u": file_item("u", "budget.txt", "proj", b"budget"),
+        })
+        views = savegdrive.drive_views(self.drive, "root")
+        team = next(view for view in views if view.root_id == "team")
+        cache = {}
+        savegdrive.load_view(self.drive, team, cache)
+        selections = []
+        for entry in team.children_of.get(None, []):
+            savegdrive.add_selected_item(selections, entry["item"], entry["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, team.browsed, [team.base])
+        state = savegdrive.load_state(self.root)
+        token = savegdrive.start_page_token(self.drive)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [], self.root, state, cache, token)
+        local = self.root / "Shared drives/Team/Projects/plan.txt"
+        self.assertEqual(local.read_bytes(), b"plan")
+
+        self.drive.items["t"].update(file_item("t", "plan.txt", "proj", b"plan by Ann",
+                                               modifiedTime="2025-02-03T04:05:06.000Z"))
+        self.drive.change("t")
+        local.write_bytes(b"plan by me")
+
+        state = savegdrive.load_state(self.root)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            cache, token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
+            again, again_scopes = savegdrive.last_selection(self.drive, state, cache, [])
+            plan = savegdrive.build_plan(self.drive, again, again_scopes, self.root, state, cache,
+                                         roots=savegdrive.upload_roots([]))
+            savegdrive.apply_plan(self.drive, plan, self.root, state, 1, lambda: self.drive)
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses["Shared drives/Team/Projects/plan.txt"], "CONFLICT")
+        self.assertEqual(self.drive.items["t"]["content"], b"plan by Ann")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / "Shared drives/Team/Projects/budget.txt").read_bytes(), b"budget")
 
     def test_shared_views_get_their_own_folders(self):
         self.drive.items["s"] = file_item("s", "from Ann.pdf", "nobody", b"pdf", shared=True)
