@@ -1550,6 +1550,17 @@ class SyncTest(unittest.TestCase):
             savegdrive.main()
         return output.file.getvalue()
 
+    def test_help_and_usage_errors_are_not_colored_for_a_dark_terminal(self):
+        # Python 3.14 argparse colors options cyan and arguments yellow: invisible on a light terminal.
+        for argv, stream in ((["savegdrive", "--help"], "stdout"), (["savegdrive", "--nope"], "stderr")):
+            output = io.StringIO()
+            with self.subTest(argv=argv), mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(os.environ, {"FORCE_COLOR": "1", "PYTHON_COLORS": "1"}), \
+                    mock.patch.object(sys, stream, output), self.assertRaises(SystemExit):
+                savegdrive.main()
+            self.assertIn("--download-path", output.getvalue())
+            self.assertNotIn("\x1b", output.getvalue())
+
     def test_items_kept_from_the_trash_view_stay_with_again(self):
         # Picked in the Trash view before Drive purges them, then a cron --again --yes: they stay here.
         self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)

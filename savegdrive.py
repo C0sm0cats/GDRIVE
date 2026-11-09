@@ -4870,6 +4870,9 @@ def main():
         epilog="keys:\n" + "\n".join(help_lines()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Python 3.14 colors --help and usage errors in cyan and yellow, unreadable on a light terminal;
+    # an attribute, since color=False raises TypeError before 3.14.
+    parser.color = False
     parser.add_argument(
         "--download-path",
         metavar="PATH",
