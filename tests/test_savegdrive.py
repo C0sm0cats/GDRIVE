@@ -67,8 +67,14 @@ class FakeChanges:
         def run():
             if pageToken == "expired":
                 raise http_error(410)
-            changes = self.drive.change_log[int(pageToken):]
-            return {"changes": changes, "newStartPageToken": str(len(self.drive.change_log))}
+            start = int(pageToken)
+            end = start + min(kwargs.get("pageSize", 1000), self.drive.changes_page_size)
+            response = {"changes": self.drive.change_log[start:end]}
+            if end < len(self.drive.change_log):
+                response["nextPageToken"] = str(end)
+            else:
+                response["newStartPageToken"] = str(len(self.drive.change_log))
+            return response
 
         return FakeRequest(run)
 
@@ -90,6 +96,7 @@ class FakeDrive:
         self.batches = []
         self.failures = {}  # folder id -> errors raised by its next listings
         self.change_log = []
+        self.changes_page_size = 2  # small, so the changes feed comes in several pages
         self.shared_drives = list(shared_drives)
         self.uploads = []
 
@@ -1563,6 +1570,7 @@ class SyncTest(unittest.TestCase):
         self.drive.items["n"]["trashed"] = True  # put in the Drive trash
         self.drive.change("n")
 
+        self.assertGreater(len(self.drive.change_log), self.drive.changes_page_size)  # several pages
         replayed, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
         fresh = {}
         savegdrive.prefetch_folders(self.drive, ["root"], fresh)
@@ -1570,6 +1578,41 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(replayed, fresh)
         self.assertEqual(new_token, "6")
         self.assertIsNone(savegdrive.apply_changes(self.drive, {"token": "expired", "folders": {}}))
+
+    def test_again_reads_drive_changes_past_the_first_page(self):
+        token = savegdrive.start_page_token(self.drive)
+        cache = {}
+        nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
+        selections = []
+        for node in nodes:
+            if node["parent"] is None:
+                savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, browsed)
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                [("root", Path())], self.root, state, cache, token)
+
+        for index in range(5):  # changes elsewhere on Drive fill the first pages
+            self.drive.items[f"c{index}"] = file_item(f"c{index}", f"c{index}.txt", "photos", b"new")
+            self.drive.change(f"c{index}")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo from a colleague"))
+        self.drive.change("b")  # last: on the last page
+        (self.root / "Docs" / "b.txt").write_bytes(b"bravo edited here")
+        self.assertGreater(len(self.drive.change_log), self.drive.changes_page_size * 2)
+
+        state = savegdrive.load_state(self.root)
+        cache, new_token = savegdrive.apply_changes(self.drive, savegdrive.load_snapshot(self.root))
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            selections, scopes = savegdrive.last_selection(self.drive, state, cache, [])
+        roots = [(root["id"], Path(root["base"])) for root in state["last_selection"]["roots"]]
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache,
+                                     roots=savegdrive.upload_roots(roots))
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses["Docs/b.txt"], "CONFLICT")  # not UPLOAD over the colleague's version
+        self.assertEqual(statuses["Photos/c0.txt"], "NEW")
+        self.assertEqual(new_token, str(len(self.drive.change_log)))
 
     def test_changes_replay_skips_shared_drive_changes(self):
         cache = {}
