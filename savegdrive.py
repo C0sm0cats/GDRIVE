@@ -3280,6 +3280,24 @@ def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, se
     return True
 
 
+def symlink_on_path(destination_root, relative_path):
+    """A symbolic link at relative_path, or at one of its folders below destination_root: never followed."""
+    path = destination_root
+    for part in relative_path.parts:
+        path = path / part
+        if path.is_symlink():
+            return True
+    return False
+
+
+def has_symlink(destination_root, relative_path, ancestor_folder_ids):
+    """Symbolic links are never followed. Below the selection the walk stops at a link, so only the item itself
+    needs a look; a selected item (no ancestors) checks every folder above it too."""
+    if ancestor_folder_ids:
+        return (destination_root / relative_path).is_symlink()
+    return symlink_on_path(destination_root, relative_path)
+
+
 def local_folder_has_content(path):
     """Anything in this local folder (unreadable counts as yes: it may hold your files)."""
     try:
@@ -3313,12 +3331,13 @@ def collect_plan(
     if tracked_folders is None:
         tracked_folders = tracked_folder_paths(state)  # build_plan computes it once for all
     if mime_type == FOLDER_MIME_TYPE:
+        symlink = has_symlink(destination_root, relative_path, ancestor_folder_ids)
         folder_id = effective_id(item)
         if item["mimeType"] == SHORTCUT_MIME_TYPE:
             item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
         repeat = arrived = too_deep = False
-        if relative_path in RESERVED_PATHS:
+        if relative_path in RESERVED_PATHS or symlink:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
             status = "SKIPPED"
@@ -3365,6 +3384,7 @@ def collect_plan(
                 "arrived": arrived,
                 "too_deep": too_deep,
                 "comes_back": comes_back,
+                "symlink": symlink,
             }
         )
         if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
@@ -3412,14 +3432,17 @@ def collect_plan(
     if shortcut:
         item = dict(item, readonly=True)  # the target may live anywhere: only downloaded
     relative_path = relative_parent / local_name(item)
-    plan.append(file_entry(service, item, relative_path, destination_root / relative_path, state))
+    symlink = has_symlink(destination_root, relative_path, ancestor_folder_ids)
+    plan.append(file_entry(service, item, relative_path, destination_root / relative_path, state, symlink))
 
 
-def file_entry(service, item, relative_path, destination, state):
-    """The plan entry of a Drive file synced at relative_path."""
+def file_entry(service, item, relative_path, destination, state, symlink=None):
+    """The plan entry of a Drive file synced at relative_path (symlink: a symbolic link there, never followed)."""
+    if symlink is None:
+        symlink = destination.is_symlink()
     planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
     replaced_key = None
-    if relative_path in RESERVED_PATHS:
+    if relative_path in RESERVED_PATHS or symlink:
         status = "CONFLICT"
         current_sha256 = None
     elif is_unsupported(item):
@@ -3444,6 +3467,7 @@ def file_entry(service, item, relative_path, destination, state):
             "comes_back": status == "NEW"
             and not can(item, "canTrash")
             and tracked_record(state, item, relative_path) is not None,
+            "symlink": symlink,
         }
     )
 
@@ -3601,8 +3625,10 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         if entry["kind"] == "FOLDER"
         and (
             entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
+            or entry.get("symlink")
         )
-    }  # deleted here, two Drive folders on this path, synced at another path or too deep: nothing below goes anywhere
+    }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link here:
+    # nothing below goes anywhere
 
     def at_or_below_trashed(path):
         # One set lookup per parent: a scan of every trashed folder for each local path was quadratic
@@ -3657,7 +3683,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             return False
         return parent in new_folders or remote_folders.get(parent) is not None
 
-    def add_local_entry(relative_path, kind):
+    def add_local_entry(relative_path, kind, symlink=False):
         if relative_path in planned_local_paths:
             return
         destination = destination_root / relative_path
@@ -3665,7 +3691,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         tracked_key, current_sha256 = None, None
 
         planned_stat = None
-        if kind == "FOLDER" and relative_path in new_folders:
+        if symlink:
+            status = "LOCAL_ONLY"  # never followed: neither the link nor what it points to is sent or trashed
+        elif kind == "FOLDER" and relative_path in new_folders:
             status = "UPLOAD_NEW"  # gone from Drive, but what is in it goes up: created again
         elif kind == "FOLDER" and relative_path in synced_folders:
             status = "TRASH_LOCAL"  # an empty folder synced before, deleted on Drive
@@ -3696,9 +3724,21 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 "state_key": tracked_key,
                 "local_sha256": current_sha256,
                 "local_stat": planned_stat,
+                "symlink": symlink,
             }
         )
         planned_local_paths.add(relative_path)
+
+    def add_symlink_entry(child, relative_path):
+        """A symbolic link Drive has no item for: listed as local only, never followed."""
+        if (
+            relative_path in remote_files
+            or relative_path in remote_directories
+            or drive_spelling(child, relative_path, "FILE") is not None
+            or drive_spelling(child, relative_path, "FOLDER") is not None
+        ):
+            return  # planned with Drive's item: a conflict
+        add_local_entry(relative_path, "FOLDER" if child.is_dir() else "FILE", symlink=True)
 
     def scan_gone_folder(relative_path, directory):
         """A folder synced before and gone from Drive. Something changed or new in it goes up (the change wins
@@ -3755,6 +3795,8 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             ):
                 continue  # the Shared with me / Shared drives / Trash views have their own scopes
             if child.is_symlink():
+                if not at_or_below_trashed(relative_path):
+                    add_symlink_entry(child, relative_path)
                 continue
             if child.is_dir() and holds_state(child):
                 continue  # another SaveGDrive folder, synced on its own
@@ -3787,6 +3829,11 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
 
     for scope in scopes:
         destination = destination_root / scope
+        if symlink_on_path(destination_root, scope):
+            if destination.is_symlink() and not symlink_on_path(destination_root, scope.parent):
+                if not at_or_below_trashed(scope):
+                    add_symlink_entry(destination, scope)
+            continue  # never followed
         if scope != Path() and destination.is_dir() and scope not in remote_folders:
             scan_gone_folder(scope, destination)  # picked before, gone from Drive (--again)
         elif scope == Path() or destination.is_dir():
@@ -3943,6 +3990,7 @@ def can_keep_both(entry):
         and entry.get("item") is not None
         and entry["status"] in {"CONFLICT", "KEEP_BOTH"}
         and not entry.get("duplicate")
+        and not entry.get("symlink")
         and entry["destination"].is_file()
     )
 
@@ -4125,7 +4173,7 @@ def needs_deletion_check(plan, state):
 def plan_notes(plan):
     statuses = {entry["status"] for entry in plan}
     notes = []
-    if any(entry["status"] == "CONFLICT" and not entry.get("duplicate") for entry in plan):
+    if any(entry["status"] == "CONFLICT" and not entry.get("duplicate") and not entry.get("symlink") for entry in plan):
         notes.append(
             "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
             "A file you cannot edit on Drive (a Google Doc export, a file shared read only) and changed here is a "
@@ -4168,6 +4216,11 @@ def plan_notes(plan):
             "Deleted here, but Drive does not let you delete them (read only, not yours, or your shared drive "
             "role): downloaded again. Ask their owner or a manager to delete them."
         )
+    if any(entry.get("symlink") for entry in plan):
+        notes.append(
+            "Symbolic links are never followed: a link stays here only, and what it points to is not synced. "
+            "A link with the name of a Drive item is a conflict: nothing syncs there until you replace the link."
+        )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
     if "TRASH_LOCAL" in statuses:
@@ -4177,7 +4230,10 @@ def plan_notes(plan):
             "Not in your selection, so not sent: new here next to an item deleted here (renamed or moved?). "
             "Select its parent folder in the tree, or the whole view, to send it."
         )
-    if any(entry["status"] == "LOCAL_ONLY" and not entry.get("outside_selection") for entry in plan):
+    if any(
+        entry["status"] == "LOCAL_ONLY" and not entry.get("outside_selection") and not entry.get("symlink")
+        for entry in plan
+    ):
         notes.append(
             "Local only: Drive has nowhere to put them (top of Shared with me, Trash, or a folder shared with you "
             "read only); left as they are."

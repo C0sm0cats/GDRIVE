@@ -1371,13 +1371,59 @@ class SyncTest(unittest.TestCase):
         (self.root / "link").symlink_to(outside, target_is_directory=True)
         (self.root / "Docs/key").symlink_to(outside / ".ssh/id_rsa")
         names_before = {item["name"] for item in self.drive.items.values()}
+        plan, _ = self.preview()
+        # ux 19: the links are listed (local only) and a note says they are not followed, instead of nothing.
+        self.assertTrue(any("Symbolic links are never followed" in note for note in savegdrive.plan_notes(plan)))
         statuses, results = self.run_sync()
-        self.assertEqual([path for path in statuses if path == "link" or path.startswith("link/")], [])
-        self.assertNotIn("Docs/key", statuses)
+        self.assertEqual([path for path in statuses if path.startswith("link/")], [])
+        self.assertEqual((statuses["link"], statuses["Docs/key"]), ("LOCAL_ONLY", "LOCAL_ONLY"))
         self.assertEqual(self.drive.uploads, [])
         self.assertEqual({item["name"] for item in self.drive.items.values()}, names_before)
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertTrue((outside / ".ssh/id_rsa").exists())
+
+    def test_synced_folder_replaced_by_a_symlink_is_a_conflict_not_half_synced(self):
+        # bugs 39: Photos moved to another disk, a link left in its place. Before, new files there were never
+        # sent and deletions on Drive never came down, but downloads and deletions here went through the link.
+        self.run_sync()
+        elsewhere = Path(self.temp.name) / "other disk/Photos"
+        elsewhere.parent.mkdir()
+        os.replace(self.root / "Photos", elsewhere)
+        (self.root / "Photos").symlink_to(elsewhere, target_is_directory=True)
+        (elsewhere / "new.jpg").write_bytes(b"new here")
+        self.drive.items["d"] = file_item("d", "drive.jpg", "photos", b"from drive")
+        plan, _ = self.preview()
+        self.assertTrue(any("Symbolic links are never followed" in note for note in savegdrive.plan_notes(plan)))
+        self.assertFalse(any("Conflicts are left" in note for note in savegdrive.plan_notes(plan)))
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos"], "CONFLICT")
+        self.assertEqual([path for path in statuses if path.startswith("Photos/")], [])
+        self.assertFalse((elsewhere / "drive.jpg").exists())
+        self.drive.items["p"]["trashed"] = True  # deleted on Drive: nothing goes through the link either
+        (elsewhere / "beach.jpg").unlink()
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos"], "CONFLICT")
+        self.assertFalse(self.drive.items["d"].get("trashed"))
+        self.assertEqual(self.drive.uploads, [])
+        self.assertEqual(list(self.trash.iterdir()), [])
+        # A Drive file over a link, or picked below a linked folder: a conflict, never read nor replaced.
+        (self.root / "notes.txt").unlink()
+        (self.root / "notes.txt").symlink_to(elsewhere / "new.jpg")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["notes.txt"], "CONFLICT")
+        self.assertEqual((elsewhere / "new.jpg").read_bytes(), b"new here")
+        plan = savegdrive.build_plan(
+            self.drive, [{"item": self.drive.items["d"], "relative_parent": Path("Photos")}],
+            [Path("Photos/drive.jpg")], self.root, savegdrive.load_state(self.root), {},
+        )
+        self.assertEqual([(entry["relative_path"].as_posix(), entry["status"]) for entry in plan],
+                         [("Photos/drive.jpg", "CONFLICT")])
+        self.assertFalse(savegdrive.can_keep_both(plan[0]))
+        # The link replaced by the folder: syncs again.
+        (self.root / "Photos").unlink()
+        os.replace(elsewhere, self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Photos"], statuses["Photos/new.jpg"]), ("UNCHANGED", "UPLOAD_NEW"))
 
     def test_file_shortcut_and_trash_view_only_come_down(self):
         # Photos holds a shortcut to Docs/a.txt: deleting or editing it here must not touch a.txt on Drive.
@@ -2489,6 +2535,10 @@ class SyncTest(unittest.TestCase):
         self.drive.items["cl"]["name"] = "Clients"
         os.link(self.root / "Docs/report.txt", self.root / "Docs/Report.txt")
         (self.root / "Clients").symlink_to("clients")
+        # On that disk "Clients" is the folder itself, not a link: links are otherwise never followed.
+        patcher = mock.patch.object(savegdrive, "has_symlink", lambda *args: False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         (self.root / "clients/mine.txt").write_bytes(b"made here")
         for _ in range(2):
             statuses, _ = self.run_sync()

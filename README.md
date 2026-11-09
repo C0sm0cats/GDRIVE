@@ -195,6 +195,11 @@ Some rules keep it safe:
   files at the top of Shared with me or in the Trash view.
 - **Empty folders are synced too**: created, deleted or emptied on one side,
   the other side follows.
+- **Symbolic links are never followed**: a link stays local only, and what it
+  points to is not sent to Drive (move the folder itself into the synced
+  folder to back it up). A link with the name of a Drive item, such as a
+  synced folder moved to another disk, is a conflict: nothing syncs there
+  until the link is replaced by the folder or file.
 
 Renaming or moving a file on one side shows as a deletion and a new file: the
 content arrives at its new place, the old one goes to the trash. Within the
