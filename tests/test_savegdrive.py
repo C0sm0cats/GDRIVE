@@ -169,7 +169,8 @@ class FakeDrive:
                 return {"id": "root"}
             if fileId not in self.items:
                 raise http_error(404)
-            return self.public(self.items[fileId])
+            item = self.items[fileId]
+            return dict(self.public(item), trashed=self.is_trashed(item))  # asked for by ITEM_FIELDS
 
         return FakeRequest(run)
 
@@ -937,6 +938,31 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(len(self.drive.uploads), 2)
         picked = savegdrive.load_state(self.root)["last_selection"]["items"]
         self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs/a.txt", "notes.txt"])
+
+    def test_picked_items_trashed_then_restored_on_drive_come_back(self):
+        # Photos and notes.txt picked, put in the Drive trash, --again, then restored on Drive.
+        self.sync_picked("Docs", "Photos", "notes.txt")
+        for item_id in ("photos", "n"):
+            self.drive.items[item_id]["trashed"] = True
+            self.drive.change(item_id)
+        self.run_main("--again", "--yes")
+        self.assertFalse((self.root / "Photos").exists())
+        self.assertFalse((self.root / "notes.txt").exists())
+        for item_id in ("photos", "n"):
+            self.drive.items[item_id]["trashed"] = False
+            self.drive.change(item_id)
+        self.run_main("--again", "--yes")
+        self.run_main("--again", "--yes")
+        self.assertEqual((self.root / "Photos/beach.jpg").read_bytes(), b"jpeg")
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"notes")
+        picked = savegdrive.load_state(self.root)["last_selection"]["items"]
+        self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs", "Photos", "notes.txt"])
+        # Deleted for good: it leaves the selection.
+        del self.drive.items["n"]
+        self.drive.change("n")
+        self.run_main("--again", "--yes")
+        picked = savegdrive.load_state(self.root)["last_selection"]["items"]
+        self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs", "Photos"])
 
     def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
         self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}

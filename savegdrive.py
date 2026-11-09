@@ -1915,7 +1915,8 @@ class DriveSelectorApp(App):
             service = self.make_service()
             self.refresh_cache(service)
             state = load_state(destination)
-            selections, scopes = last_selection(service, state, self.cache)
+            kept = []
+            selections, scopes = last_selection(service, state, self.cache, kept)
             roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
             upload_roots = {base: (None if root_id in {SHARED_WITH_ME, TRASH} else root_id)
                             for root_id, base in roots}
@@ -1923,7 +1924,7 @@ class DriveSelectorApp(App):
             if self.keep_both:
                 set_keep_both(plan, plan, True)
             result = {"plan": plan, "selections": selections, "scopes": scopes, "destination": destination,
-                      "state": state, "roots": roots, "round": round_}
+                      "state": state, "roots": roots, "kept": kept, "round": round_}
         except Exception as error:  # a worker error would end the app: report it instead
             self.call_from_thread(self.last_sync_failed, round_, error_text(error))
             return
@@ -2636,8 +2637,11 @@ def moved_on_drive(saved_item, item):
     return bool(before) and bool(now) and set(before) != set(now)
 
 
-def remember_selection(state, selections, scopes, roots=()):
-    """Store the selection for --again; roots are views selected entirely, so new items there come too."""
+def remember_selection(state, selections, scopes, roots=(), kept=()):
+    """Store the selection for --again; roots are views selected entirely, so new items there come too.
+
+    kept are saved items now in the Drive trash, stored as they were: restored there, they come back.
+    """
     state["last_selection"] = {
         "roots": [{"id": root_id, "base": base.as_posix()} for root_id, base in roots],
         "items": [
@@ -2650,13 +2654,16 @@ def remember_selection(state, selections, scopes, roots=()):
                 "parent_id": entry.get("parent_id"),
             }
             for entry in selections
-        ],
+        ] + [dict(saved_item) for saved_item in kept],
         "scopes": [scope.as_posix() for scope in scopes],
     }
 
 
-def last_selection(service, state, cache):
-    """The previous run's selection with fresh Drive metadata; items gone from Drive stay as local scopes."""
+def last_selection(service, state, cache, kept=None):
+    """The previous run's selection with fresh Drive metadata; items gone from Drive stay as local scopes.
+
+    Saved items now in the Drive trash are added to kept, when given, to stay in the saved selection.
+    """
     saved = state.get("last_selection")
     if not saved or not (saved.get("items") or saved.get("roots")):
         return None
@@ -2693,6 +2700,8 @@ def last_selection(service, state, cache):
             if is_folder(item):
                 TRASHED_FOLDERS.add(effective_id(item))  # picked in the Trash view: list it from there
         elif item is None or item.get("trashed"):
+            if item is not None and kept is not None:
+                kept.append(saved_item)  # in the Drive trash: it may be restored there
             warn(f"{saved_item['path']} is no longer on Drive")
             scopes.append(Path(saved_item["path"]))
             continue
@@ -4437,9 +4446,10 @@ def reselect_sent(state, relative_path, item, parent_id):
     )
 
 
-def run_sync(args, service, make_service, plan, selections, scopes, roots, destination_root, state, cache, token):
+def run_sync(args, service, make_service, plan, selections, scopes, roots, destination_root, state, cache, token,
+             kept=()):
     """Apply a confirmed plan, save the selection for --again and the Drive snapshot, print the result."""
-    remember_selection(state, selections, scopes, roots)
+    remember_selection(state, selections, scopes, roots, kept)
     results = apply_plan(service, plan, destination_root, state, args.jobs, make_service)
     save_snapshot(
         destination_root, token, cache,
@@ -4627,7 +4637,8 @@ def main():
                     cache, token = replayed
                 else:
                     cache, token = {}, start_page_token(service)
-                selections, local_scopes = last_selection(service, state, cache)
+                kept = []
+                selections, local_scopes = last_selection(service, state, cache, kept)
             names = ", ".join(escape(entry["item"]["name"]) for entry in selections[:5])
             more = f" and {len(selections) - 5} more" if len(selections) > 5 else ""
             who = f"{escape(account)} " if account else ""
@@ -4656,7 +4667,7 @@ def main():
                 console.print("[dim]Cancelled. Nothing was changed.[/]")
                 return
             results = run_sync(args, service, make_service, plan, selections, local_scopes, roots,
-                               destination_root, state, cache, token)
+                               destination_root, state, cache, token, kept)
             if results["FILE_ERROR"] or results["FOLDER_ERROR"]:
                 raise SystemExit(1)
             return
@@ -4699,7 +4710,7 @@ def main():
                 if not confirm_in_terminal(args, plan, state):
                     break
             results = run_sync(args, service, make_service, plan, selections, local_scopes, roots,
-                               destination_root, state, cache, token)
+                               destination_root, state, cache, token, result.get("kept", ()))
             failed = failed or bool(results["FILE_ERROR"] or results["FOLDER_ERROR"])
             if args.yes:
                 break
