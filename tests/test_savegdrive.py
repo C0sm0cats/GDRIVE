@@ -3403,6 +3403,40 @@ class SyncTest(unittest.TestCase):
             self.assertIn("OAuth client ID of type Desktop app", output.getvalue())
             self.assertNotIn("web or installed app", output.getvalue())
 
+    def test_sign_in_cancelled_on_google_says_what_to_do_instead_of_a_traceback(self):
+        # Google sends the browser back with ?error=access_denied when the user cancels or refuses access.
+        import urllib.parse
+        import urllib.request
+        credentials = Path(self.temp.name) / "credentials.json"
+        credentials.write_text(json.dumps({"installed": {
+            "client_id": "id", "client_secret": "secret", "redirect_uris": ["http://localhost"],
+            "auth_uri": "https://accounts.example/auth", "token_uri": "https://accounts.example/token",
+        }}))
+        pages, browsers = [], []
+
+        def cancel_in_browser(url):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            back = f"{query['redirect_uri'][0]}?error=access_denied&state={query['state'][0]}"
+            # The local server answers only once open() has returned, so the browser runs beside it.
+            browser = threading.Thread(target=lambda: pages.append(urllib.request.urlopen(back).read().decode()))
+            browser.start()
+            browsers.append(browser)
+            return True
+
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "CREDENTIALS_PATH", credentials), \
+                mock.patch.object(savegdrive, "open_quietly", cancel_in_browser), \
+                mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)):
+            with self.assertRaises(SystemExit) as raised:
+                savegdrive.sign_in("Sign in to Google Drive in your browser.")
+        for browser in browsers:
+            browser.join(timeout=10)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("Sign-in did not finish: access_denied. Nothing was changed.", output.getvalue())
+        self.assertIn("Run again and allow access", output.getvalue())
+        self.assertEqual(len(pages), 1)
+        self.assertNotIn("signed in", pages[0])
+
     def test_again_without_a_previous_selection_names_download_path_and_creates_nothing(self):
         # A typo in the path, or a folder never synced (self.root: no selection yet): no folder made, no sign-in.
         for target in (Path(self.temp.name) / "Wrok", self.root):

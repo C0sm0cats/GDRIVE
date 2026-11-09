@@ -27,6 +27,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from oauthlib.oauth2.rfc6749.errors import OAuth2Error
 from rich.console import Console, Group
 from send2trash import send2trash
 from rich.markup import escape
@@ -177,7 +178,8 @@ def error_text(error):
 
 # --- Sign-in ---------------------------------------------------------------
 
-SIGN_IN_SUCCESS_PAGE = "savegdrive: signed in. You can close this tab."
+# run_local_server shows this page before checking Google's answer, so it must not claim success.
+SIGN_IN_SUCCESS_PAGE = "savegdrive: you can close this tab and go back to the terminal."
 
 
 def oauth_flow():
@@ -243,13 +245,22 @@ def sign_in(reason):
             return open_quietly(url)
 
     webbrowser.register("savegdrive", None, QuietBrowser("savegdrive"))
-    with console.status("[dim]Waiting for sign-in…[/]"):
-        creds = flow.run_local_server(
-            port=0,
-            browser="savegdrive",
-            authorization_prompt_message="",
-            success_message=SIGN_IN_SUCCESS_PAGE,
+    try:
+        with console.status("[dim]Waiting for sign-in…[/]"):
+            creds = flow.run_local_server(
+                port=0,
+                browser="savegdrive",
+                authorization_prompt_message="",
+                success_message=SIGN_IN_SUCCESS_PAGE,
+            )
+    except OAuth2Error as error:
+        # Cancel or refusal on Google's page comes back as ?error=access_denied.
+        console.print(
+            f"[red]✗[/] Sign-in did not finish: {escape(error.error or str(error))}. Nothing was changed.\n"
+            "  [dim]Run again and allow access; if Google warns the app is not verified, "
+            "choose Advanced, then continue to it.[/]"
         )
+        sys.exit(1)
     if not VERBOSE and console.is_terminal:
         console.file.write("\x1b[2F\x1b[J")  # erase the two prompt lines
     debug(f"Token expires {local_expiry(creds)}")
