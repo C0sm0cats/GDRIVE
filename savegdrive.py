@@ -17,7 +17,7 @@ import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httplib2
 from google.auth.exceptions import GoogleAuthError, TransportError
@@ -4221,7 +4221,13 @@ def deletion_count(plan, state):
             count += max(1, len(tracked_below(state, entry["relative_path"])))
         else:
             count += 1
-    synced = len(state["files"])
+    in_play = {entry["relative_path"].as_posix() for entry in plan}
+    synced = sum(  # an older selection's files, still in the state, are not in play
+        1 for record in state["files"].values()
+        if record.get("path") and (record["path"] in in_play
+                                   or not in_play.isdisjoint(parent.as_posix() for parent in
+                                                             PurePosixPath(record["path"]).parents))
+    )
     return count, synced
 
 

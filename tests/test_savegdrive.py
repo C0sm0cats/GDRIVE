@@ -520,13 +520,13 @@ class SyncTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.drive = demo_drive()
 
-    def preview(self):
-        """The plan the preview shows, and the state it was computed against."""
+    def preview(self, only=None):
+        """The plan the preview shows, and the state it was computed against (only: the top-level names chosen)."""
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
         selections = []
         for node in nodes:
-            if node["parent"] is None:
+            if node["parent"] is None and (only is None or node["item"]["name"] in only):
                 savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
         scopes = savegdrive.build_local_scopes(selections, browsed)
         state = savegdrive.load_state(self.root)
@@ -1674,6 +1674,25 @@ class SyncTest(unittest.TestCase):
         plan, state, counts, check = self.deletion_plan()
         self.assertEqual(counts, (25, 101))
         self.assertTrue(check)
+        args = mock.Mock(yes=True, allow_deletions=False)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            with self.assertRaises(SystemExit):
+                savegdrive.confirm_in_terminal(args, plan, state)
+
+    def test_deletion_share_counts_only_the_files_in_play_not_older_selections(self):
+        # bugs 44: Photos (100 files) synced before, then Docs alone; Docs emptied here is 100 % of what is in play.
+        for i in range(99):
+            self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", b"x")
+        for i in range(12):
+            self.drive.items[f"d{i}"] = file_item(f"d{i}", f"d{i}.txt", "docs", b"d")
+        self.apply(*self.preview(only={"Photos"}))
+        self.apply(*self.preview(only={"Docs"}))
+        for path in (self.root / "Docs").iterdir():
+            path.unlink()
+        plan, state = self.preview(only={"Docs"})
+        self.assertEqual(len(state["files"]), 115)
+        self.assertEqual(savegdrive.deletion_count(plan, state), (14, 15))  # Report.docx, an export, stays on Drive
+        self.assertTrue(savegdrive.needs_deletion_check(plan, state))
         args = mock.Mock(yes=True, allow_deletions=False)
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             with self.assertRaises(SystemExit):
