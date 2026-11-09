@@ -3116,8 +3116,11 @@ def collect_plan(
     if shortcut:
         item = dict(item, readonly=True)  # the target may live anywhere: only downloaded
     relative_path = relative_parent / local_name(item)
-    destination = destination_root / relative_path
+    plan.append(file_entry(service, item, relative_path, destination_root / relative_path, state))
 
+
+def file_entry(service, item, relative_path, destination, state):
+    """The plan entry of a Drive file synced at relative_path."""
     planned_stat = local_stat(destination)  # before hashing: an edit made while hashing changes it
     replaced_key = None
     if relative_path in RESERVED_PATHS:
@@ -3131,7 +3134,7 @@ def collect_plan(
             service, item, relative_path, destination, state
         )
 
-    plan.append(
+    return (
         {
             "status": status,
             "kind": "FILE",
@@ -3152,6 +3155,68 @@ def collect_plan(
 def same_name_key(path):
     """The name a case- or normalization-insensitive disk (macOS, exFAT...) sees: one file for all spellings."""
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def numbered_name(name, number):
+    """`Scan (2).pdf` for Scan.pdf and 2 (`.env (2)` for a dot file)."""
+    path = Path(name)
+    stem, suffix = path.stem, path.suffix
+    if name.startswith(".") and suffix == name:
+        stem, suffix = name, ""
+    return f"{stem} ({number}){suffix}"
+
+
+def number_readonly_duplicates(service, plan, state):
+    """Drive files sharing one local name that you may not rename on Drive (shared read only): the first keeps
+    the name, the others come down as `name (2).ext`, `name (3).ext`... They only come down, like any read-only
+    file. A file keeps the name it was synced under before, so later syncs find it again."""
+    groups = {}
+    for index, entry in enumerate(plan):
+        if entry["status"] != "SKIPPED":
+            groups.setdefault(same_name_key(entry["destination"]), []).append(index)
+    taken = set(groups)
+    synced_as = {}  # Drive id: the local paths it was synced under
+    for record_key, record in state["files"].items():
+        if record.get("path"):
+            synced_as.setdefault(record_key.partition("::")[0], set()).add(record["path"])
+    for indexes in list(groups.values()):
+        entries = [plan[index] for index in indexes]
+        if len(entries) < 2 or any(
+            entry["kind"] != "FILE" or entry.get("item") is None or can(entry["item"], "canEdit")
+            or entry["relative_path"] in RESERVED_PATHS
+            for entry in entries
+        ):
+            continue  # a file you may rename on Drive, or a folder: a duplicate to rename there
+        relative_path = entries[0]["relative_path"]
+        names = [relative_path.name] + [numbered_name(relative_path.name, number) for number in range(2, len(entries) + 1)]
+        indexes = sorted(indexes, key=lambda index: effective_id(plan[index]["item"]))
+        chosen = {}
+        for index in indexes:  # synced before under one of these names: it keeps it
+            for name in names:
+                path = (relative_path.parent / name).as_posix()
+                if name not in chosen.values() and path in synced_as.get(effective_id(plan[index]["item"]), ()):
+                    chosen[index] = name
+                    break
+        number = 1
+        for index in indexes:
+            if index in chosen:
+                continue
+            name = relative_path.name
+            while name in chosen.values() or (
+                name != relative_path.name and same_name_key(entries[0]["destination"].with_name(name)) in taken
+            ):
+                number += 1
+                name = numbered_name(relative_path.name, number)
+            chosen[index] = name
+        for index, name in chosen.items():
+            entry = plan[index]
+            taken.add(same_name_key(entry["destination"].with_name(name)))
+            if same_name_key(entry["destination"].with_name(name)) == same_name_key(entry["destination"]):
+                continue  # keeps its own name
+            plan[index] = file_entry(
+                service, entry["item"], entry["relative_path"].with_name(name), entry["destination"].with_name(name), state
+            )
+            plan[index]["numbered"] = True
 
 
 def mark_duplicate_targets(plan):
@@ -3489,6 +3554,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
         )
         for _ in range(len(plan) - before):
             on_item()
+    number_readonly_duplicates(service, plan, state)
     mark_duplicate_targets(plan)
     remote_folders = dict(roots if roots is not None else {Path(): "root"})
     for entry in plan:
@@ -3718,6 +3784,11 @@ def plan_notes(plan):
         notes.append(
             "Several Drive items get one local name (the same name, a Google Doc next to its .docx, "
             "a / turned into _...): none of them syncs until you rename one on Drive (o opens it)."
+        )
+    if any(entry.get("numbered") for entry in plan):
+        notes.append(
+            "Drive files with the same name that you cannot rename (shared read only) come down as "
+            "'name (2).ext', 'name (3).ext'..."
         )
     if any(entry.get("arrived") for entry in plan):
         notes.append(

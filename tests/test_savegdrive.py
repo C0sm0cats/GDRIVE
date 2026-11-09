@@ -2350,6 +2350,37 @@ class SyncTest(unittest.TestCase):
             savegdrive.print_plan(plan, self.root)
         self.assertIn("Docs/Report.docx  (Drive: Report · same local name as Report.docx)", output.getvalue())
 
+    def test_read_only_files_with_one_name_all_come_down(self):
+        # Ann's folder, shared read only, holds two Scan.pdf: you cannot rename either on Drive.
+        read_only = {"canEdit": False, "canTrash": False, "canAddChildren": False}
+        self.drive.items["course"] = {"id": "course", "name": "Course", "mimeType": FOLDER, "parent": "root",
+                                      "capabilities": read_only}
+        self.drive.items["scan2"] = file_item("scan2", "Scan.pdf", "course", b"second", capabilities=read_only)
+        self.drive.items["scan1"] = file_item("scan1", "Scan.pdf", "course", b"first", capabilities=read_only)
+        self.drive.items["d"] = file_item("d", "a.txt", "docs", b"yours")  # yours: rename one on Drive
+        plan, _ = self.preview()
+        by_path = {}
+        for entry in plan:
+            by_path.setdefault(entry["relative_path"].as_posix(), []).append(entry["status"])
+        self.assertEqual(by_path["Course/Scan.pdf"], ["NEW"])
+        self.assertEqual(by_path["Course/Scan (2).pdf"], ["NEW"])
+        self.assertEqual(by_path["Docs/a.txt"], ["CONFLICT", "CONFLICT"])
+        notes = savegdrive.plan_notes(plan)
+        self.assertTrue(any("rename one on Drive" in note for note in notes))
+        self.assertTrue(any("'name (2).ext'" in note for note in notes))
+
+        self.run_sync()
+        self.assertEqual((self.root / "Course/Scan.pdf").read_bytes(), b"first")
+        self.assertEqual((self.root / "Course/Scan (2).pdf").read_bytes(), b"second")
+        statuses, _ = self.run_sync()  # each one is found again under its name
+        self.assertEqual((statuses["Course/Scan.pdf"], statuses["Course/Scan (2).pdf"]), ("UNCHANGED", "UNCHANGED"))
+        # A third one with a smaller id: the two synced keep their names, the new one gets the next.
+        self.drive.items["scan0"] = file_item("scan0", "Scan.pdf", "course", b"third", capabilities=read_only)
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Course/Scan.pdf"], statuses["Course/Scan (2).pdf"]), ("UNCHANGED", "UNCHANGED"))
+        self.assertEqual(statuses["Course/Scan (3).pdf"], "NEW")
+        self.assertEqual((self.root / "Course/Scan (3).pdf").read_bytes(), b"third")
+
     def test_keep_both(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"edited locally")
