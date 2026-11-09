@@ -1554,6 +1554,24 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(plan["Shared with me/Team/sub"]["status"], "UNCHANGED")
         self.assertEqual(plan["Shared with me/Team/sub/new.txt"]["status"], "UPLOAD_NEW")
 
+    def test_editable_file_at_the_top_of_shared_with_me_goes_back_up(self):
+        # A colleague shares one file with you as an editor; another one only as a reader.
+        self.drive.items["budget"] = file_item("budget", "budget.xlsx", "ann", b"budget v1", shared=True,
+                                               capabilities={"canEdit": True, "canTrash": False})
+        self.drive.items["memo"] = file_item("memo", "memo.txt", "ann", b"memo v1", shared=True,
+                                             capabilities={"canEdit": False, "canTrash": False})
+        views = savegdrive.drive_views(self.drive, "root")
+        self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        (self.root / "Shared with me/budget.xlsx").write_bytes(b"budget v2 edited here")
+        (self.root / "Shared with me/memo.txt").write_bytes(b"memo edited here")
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/budget.xlsx"]["status"], "UPLOAD")
+        self.assertEqual(plan["Shared with me/memo.txt"]["status"], "CONFLICT")
+        self.assertEqual(self.drive.items["budget"]["content"], b"budget v2 edited here")
+        self.assertEqual(self.drive.items["memo"]["content"], b"memo v1")
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual(plan["Shared with me/budget.xlsx"]["status"], "UNCHANGED")
+
     def test_names_differing_only_by_case_are_a_conflict(self):
         # A case-insensitive disk (macOS, exFAT...) stores these as one file: rename one on Drive.
         self.drive.items.update({

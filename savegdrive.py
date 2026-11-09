@@ -2888,7 +2888,9 @@ def classify_file(service, item, relative_path, destination, state):
             return ("UPDATE" if remote_changed else "UNCHANGED"), current_sha256, None
         if remote_changed and item.get("md5Checksum") and file_hash(destination, "md5") == item["md5Checksum"]:
             return "UNCHANGED", current_sha256, None  # same content both sides (a transfer whose state was not saved)
-        if remote_changed or readonly or not sends_back(item):
+        # The top of Shared with me has no folder for new files, but a file you may edit goes back up.
+        download_only = item.get("readonly") or relative_path.parts[:1] == (TRASH_DIR,)
+        if remote_changed or download_only or not sends_back(item):
             return "CONFLICT", current_sha256, None
         return "UPLOAD", current_sha256, None
 
