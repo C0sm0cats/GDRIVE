@@ -86,6 +86,8 @@ LIST_FIELDS = (
 )
 API_BATCH_SIZE = 50  # Drive accepts 100 calls per batch, but throttles large ones
 API_RETRIES = 5
+# Drive nests folders 100 deep; only chains of folder shortcuts go deeper: past this they are skipped
+MAX_FOLDER_DEPTH = 200
 
 # Google-native files must be exported because they have no downloadable binary.
 EXPORT_FORMATS = {
@@ -575,7 +577,12 @@ def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folder
                     }
                 )
                 child_folder_id = effective_id(item)
-                if is_folder(item) and child_folder_id not in ancestors and child_folder_id not in visited:
+                if (
+                    is_folder(item)
+                    and child_folder_id not in ancestors
+                    and child_folder_id not in visited
+                    and len((relative_parent / local_name(item)).parts) < MAX_FOLDER_DEPTH  # a shortcut chain
+                ):
                     visited.add(child_folder_id)
                     next_level.append(
                         (
@@ -2764,6 +2771,8 @@ def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, se
             child_id = effective_id(child)
             if child_id in seen:
                 return False  # a loop, or a folder also reached elsewhere: not safe to trash
+            if len(child_path.parts) >= MAX_FOLDER_DEPTH:
+                return False  # a shortcut chain too deep to check
             seen.add(child_id)
             if not remote_subtree_unchanged(service, child_id, child_path, state, cache, seen):
                 return False
@@ -2811,11 +2820,13 @@ def collect_plan(
         if item["mimeType"] == SHORTCUT_MIME_TYPE:
             item = dict(item, readonly=True)  # the target may live anywhere: its content only comes down
         status = "UNCHANGED" if destination.is_dir() else "NEW"
-        repeat = arrived = False
+        repeat = arrived = too_deep = False
         if relative_path in RESERVED_PATHS:
             status = "CONFLICT"
         elif folder_id in ancestor_folder_ids:
             status = "SKIPPED"
+        elif len(relative_path.parts) >= MAX_FOLDER_DEPTH:
+            status, too_deep = "SKIPPED", True  # a chain of folder shortcuts: it would never end
         elif visited is not None and folder_id in visited:
             status, repeat = "SKIPPED", True  # already planned through another path (two shortcuts to it)
         elif destination.exists() and not destination.is_dir():
@@ -2852,6 +2863,7 @@ def collect_plan(
                 "destination": destination,
                 "repeat": repeat,
                 "arrived": arrived,
+                "too_deep": too_deep,
             }
         )
         if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
@@ -2997,8 +3009,10 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
     trashed_remote = [
         entry["relative_path"] for entry in plan
         if entry["kind"] == "FOLDER"
-        and (entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat"))
-    ]  # deleted here, two Drive folders on this path, or synced at another path: nothing below goes anywhere
+        and (
+            entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
+        )
+    ]  # deleted here, two Drive folders on this path, synced at another path or too deep: nothing below goes anywhere
     tracked = tracked_files_by_path(state)
     synced_folders = {Path(path) for path in state.get("folders", {})}
     tracked_directories = {
@@ -3378,6 +3392,11 @@ def plan_notes(plan):
         notes.append(
             "A Drive folder reached through two paths (shortcuts) syncs at its first path only: "
             "the others are skipped, and what is on your disk there is left as it is."
+        )
+    if any(entry.get("too_deep") for entry in plan):
+        notes.append(
+            f"Folders too deep (past {MAX_FOLDER_DEPTH} levels, through a chain of shortcuts) are skipped: "
+            "what is on your disk there is left as it is."
         )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")

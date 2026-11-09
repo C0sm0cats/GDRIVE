@@ -580,6 +580,42 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(list(self.trash.iterdir()), [])
         self.assertEqual(self.drive.uploads, [])
 
+    def test_shortcut_chain_too_deep_skipped_not_whole_sync(self):
+        # An editor of a shared folder chains 1000 folder shortcuts: Team/L0/a/a/.../deep.txt.
+        levels = 1000
+        self.drive.items.update({
+            "team": {"id": "team", "name": "Team", "mimeType": FOLDER, "parent": "root"},
+            "s0": {"id": "s0", "name": "L0", "mimeType": FOLDER, "parent": "team"},
+            "deep": file_item("deep", "deep.txt", f"s{levels}", b"deep"),
+        })
+        for level in range(levels):
+            self.drive.items[f"s{level + 1}"] = {"id": f"s{level + 1}", "name": f"s{level + 1}",
+                                                  "mimeType": FOLDER, "parent": "elsewhere"}
+            self.drive.items[f"a{level}"] = {
+                "id": f"a{level}", "name": "a", "mimeType": savegdrive.SHORTCUT_MIME_TYPE, "parent": f"s{level}",
+                "shortcutDetails": {"targetId": f"s{level + 1}", "targetMimeType": FOLDER}}
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        self.assertLessEqual(max(len(node["display_path"].split("/")) for node in nodes),
+                             savegdrive.MAX_FOLDER_DEPTH)
+
+        bound = Path("Team/L0", *["a"] * (savegdrive.MAX_FOLDER_DEPTH - 2))  # the first folder too deep
+        (self.root / bound).mkdir(parents=True)
+        (self.root / bound / "mine.txt").write_bytes(b"mine")
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses["Docs/a.txt"], "NEW")  # the rest still syncs
+        self.assertEqual(statuses[bound.as_posix()], "SKIPPED")
+        self.assertNotIn((bound / "a").as_posix(), statuses)
+        self.assertNotIn((bound / "mine.txt").as_posix(), statuses)  # below it: left as it is
+        self.assertTrue(any("too deep" in note for note in savegdrive.plan_notes(plan)))
+        self.apply(plan, state)
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha")
+        self.assertEqual((self.root / bound / "mine.txt").read_bytes(), b"mine")
+        self.assertEqual(self.drive.uploads, [])
+
+        # A whole deep chain deleted here is not checked past the bound, so never trashed on Drive.
+        self.assertFalse(savegdrive.remote_subtree_unchanged(self.drive, "s0", Path("Team/L0"), state, {}))
+
     def test_deleted_on_one_side_but_changed_on_the_other_comes_back(self):
         self.run_sync()
         (self.root / "Docs/a.txt").unlink()
