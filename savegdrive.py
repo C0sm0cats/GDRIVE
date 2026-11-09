@@ -2664,7 +2664,13 @@ def classify_file(service, item, relative_path, destination, state):
     readonly = is_readonly_path(relative_path) or item.get("readonly")
 
     if not destination.exists():
-        if record and signature == record.get("remote_signature") and not readonly and can(item, "canTrash"):
+        if (
+            record
+            and signature == record.get("remote_signature")
+            and not readonly
+            and can(item, "canTrash")
+            and effective_mime_type(item) not in EXPORT_FORMATS  # exports only come down: deleted here, it comes back
+        ):
             return "TRASH_REMOTE", None  # synced before, deleted here
         return "NEW", None
     if not destination.is_file():
@@ -2716,6 +2722,8 @@ def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, se
     """True when every Drive file below the folder was synced and has not changed since."""
     for child in list_children(service, folder_id, cache):
         child_path = relative_path / local_name(child)
+        if not can(child, "canTrash"):
+            return False  # not yours to trash (a colleague's file...): deleted here, it comes back
         if is_folder(child):
             child_id = effective_id(child)
             if child_id in seen or not remote_subtree_unchanged(
@@ -2724,7 +2732,9 @@ def remote_subtree_unchanged(service, folder_id, relative_path, state, cache, se
                 return False
             continue
         if is_unsupported(child):
-            continue
+            return False  # never came down (a Google Form...): deleting the folder here did not delete it
+        if effective_mime_type(child) in EXPORT_FORMATS:
+            return False  # exports only come down: deleting the folder here does not trash the Google Doc
         record = tracked_record(state, child, child_path)
         if not record or record.get("remote_signature") != remote_signature(child):
             return False

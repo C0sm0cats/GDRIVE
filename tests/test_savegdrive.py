@@ -486,6 +486,59 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(self.drive.items["photos"]["trashed"])
         self.assertEqual(results["FOLDER_TRASH_REMOTE"], 1)
 
+    def test_folder_deleted_here_keeps_its_google_form(self):
+        self.drive.items["pf"] = {"id": "pf", "name": "Customer survey", "mimeType": FORM, "parent": "photos"}
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos"], "NEW")
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_REMOTE")
+        self.assertEqual(statuses["Photos/Customer survey"], "SKIPPED")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["pf"]))
+
+    def test_export_deleted_here_comes_back(self):
+        self.drive.items["minutes"] = {"id": "minutes", "name": "Minutes", "mimeType": FOLDER, "parent": "root"}
+        self.drive.items["board"] = {"id": "board", "name": "Board", "mimeType": DOC, "parent": "minutes",
+                                     "content": b"board docx", "modifiedTime": "2025-01-02T03:04:05.000Z"}
+        self.run_sync()
+        import shutil
+        (self.root / "Docs/Report.docx").unlink()
+        shutil.rmtree(self.root / "Minutes")  # only exports inside
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/Report.docx"], "NEW")
+        self.assertEqual(statuses["Minutes"], "NEW")
+        self.assertEqual(statuses["Minutes/Board.docx"], "NEW")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["report"]))
+        self.assertFalse(self.drive.is_trashed(self.drive.items["board"]))
+        self.assertEqual((self.root / "Minutes/Board.docx").read_bytes(), b"board docx")
+
+    def test_folder_deleted_here_keeps_files_you_cannot_trash(self):
+        self.drive.items["drafts"] = {"id": "drafts", "name": "Drafts", "mimeType": FOLDER, "parent": "photos",
+                                      "capabilities": {"canTrash": False}}
+        self.drive.items["spec"] = file_item("spec", "spec.pdf", "photos", b"spec", capabilities={"canTrash": False})
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos"], "NEW")
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_REMOTE")
+        self.assertEqual(statuses["Photos/spec.pdf"], "NEW")  # a colleague's file comes back
+        self.assertFalse(self.drive.is_trashed(self.drive.items["spec"]))
+        self.assertFalse(self.drive.is_trashed(self.drive.items["drafts"]))
+        self.assertEqual((self.root / "Photos/spec.pdf").read_bytes(), b"spec")
+
+    def test_folder_you_cannot_trash_deleted_here_is_kept(self):
+        self.drive.items["photos"]["capabilities"] = {"canEdit": False, "canTrash": False, "canAddChildren": False}
+        self.run_sync()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos"], "NEW")
+        self.assertFalse(self.drive.items["photos"].get("trashed"))
+        self.assertTrue((self.root / "Photos").is_dir())
+        self.assertEqual(results["FILE_ERROR"], 0)
+
     def test_folder_deleted_on_drive_goes_to_your_trash(self):
         self.run_sync()
         for key in ["photos", "p"]:
@@ -665,7 +718,8 @@ class SyncTest(unittest.TestCase):
     def test_mass_deletion_in_the_terminal_needs_the_word_delete(self):
         self.run_sync()
         import shutil
-        shutil.rmtree(self.root / "Docs")  # 3 of 5 synced files
+        shutil.rmtree(self.root / "Docs")  # a.txt, b.txt: Report.docx is an export, it comes back
+        shutil.rmtree(self.root / "Photos")  # and beach.jpg: 3 of 5 synced files
         plan, state, _, check = self.deletion_plan()
         self.assertTrue(check)
         args = mock.Mock(yes=False, allow_deletions=False)
@@ -704,7 +758,8 @@ class SyncTest(unittest.TestCase):
     def test_again_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
         import shutil
-        shutil.rmtree(self.root / "Docs")  # 3 of 5 synced files
+        shutil.rmtree(self.root / "Docs")  # a.txt, b.txt: Report.docx is an export, it comes back
+        shutil.rmtree(self.root / "Photos")  # and beach.jpg: 3 of 5 synced files
         with self.assertRaises(SystemExit) as raised:
             self.run_main("--again", "--yes")
         self.assertEqual(raised.exception.code, 1)
@@ -714,7 +769,8 @@ class SyncTest(unittest.TestCase):
         self.sync_everything()
         import asyncio
         import shutil
-        shutil.rmtree(self.root / "Docs")
+        shutil.rmtree(self.root / "Docs")  # a.txt, b.txt: Report.docx is an export, it comes back
+        shutil.rmtree(self.root / "Photos")  # and beach.jpg: 3 of 5 synced files
 
         def run(app):
             async def drive_it():
@@ -735,7 +791,8 @@ class SyncTest(unittest.TestCase):
         self.sync_everything()
         import asyncio
         import shutil
-        shutil.rmtree(self.root / "Docs")
+        shutil.rmtree(self.root / "Docs")  # a.txt, b.txt: Report.docx is an export, it comes back
+        shutil.rmtree(self.root / "Photos")  # and beach.jpg: 3 of 5 synced files
         self.addCleanup(savegdrive.TRASHED_FOLDERS.clear)
         cache = {}
         views = [savegdrive.DriveView("My Drive", "root")]
@@ -761,7 +818,8 @@ class SyncTest(unittest.TestCase):
         self.sync_everything()
         import asyncio
         import shutil
-        shutil.rmtree(self.root / "Docs")
+        shutil.rmtree(self.root / "Docs")  # a.txt, b.txt: Report.docx is an export, it comes back
+        shutil.rmtree(self.root / "Photos")  # and beach.jpg: 3 of 5 synced files
         screens = []
 
         def run(app):
