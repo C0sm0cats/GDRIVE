@@ -1560,15 +1560,6 @@ class ConfirmScreen(ModalScreen):
         self.dismiss(answer)
 
 
-def prune_empty_dirs(directory, stop):
-    """Remove empty directories from directory up to stop, stop included."""
-    while directory.is_dir() and not any(directory.iterdir()):
-        directory.rmdir()
-        if directory == stop:
-            break
-        directory = directory.parent
-
-
 class DriveTree(Tree):
     # These replace Tree's own space / enter and go to the app, so the selection stays there.
     BINDINGS = [
@@ -4129,29 +4120,18 @@ def stop_signals_interrupt():
             signal.signal(number, handler)
 
 
-@stop_signals_interrupt()
-def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
-    """Apply the confirmed plan. Transfers run in jobs threads, each with its own Drive client."""
-    results = Counter()
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TextColumn("[dim]{task.fields[transfer]}[/]"),
-        console=console,
-        transient=True,
-    )
+def record_synced(state, entry, item, local_sha256):
+    """Save what this entry now is on both sides, under its new key, so the next run compares against it."""
+    if entry.get("state_key"):
+        state["files"].pop(entry["state_key"], None)
+    key = state_key(item, entry["relative_path"])
+    state["files"][key] = state_record(dict(entry, item=item), local_sha256)
+    if entry.get("changed_meanwhile"):
+        state["files"][key].pop("local_mtime_ns", None)  # saved again while sent: hash it again next time
 
-    def report(mark, text):
-        progress.console.print(f"{mark} {escape(text)}")
 
-    def record(entry, item, local_sha256):
-        state["files"][state_key(item, entry["relative_path"])] = state_record(dict(entry, item=item), local_sha256)
-
-    forgotten = []  # deleted paths, forgotten in one pass before the state is saved
-
-    # 1. Folders: created here, then on Drive (parents first).
+def create_folders(service, plan, state, results, report):
+    """Phase 1. Folders: created here, then on Drive (parents first). Returns the Drive id of each folder path."""
     folder_ids = {}
     for entry in plan:
         if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE":
@@ -4191,8 +4171,11 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         except DRIVE_CALL_ERRORS as error:
             results["FOLDER_ERROR"] += 1
             report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(error)}")
+    return folder_ids
 
-    # 2. Files that need no transfer.
+
+def settle_untransferred_files(plan, state, results, report):
+    """Phase 2. Files that need no transfer are counted and recorded. Returns the files to transfer."""
     transfers = []
     for entry in plan:
         if entry["kind"] != "FILE":
@@ -4208,17 +4191,74 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
                 set_remote_mtime(entry["destination"], entry["item"])  # same content: lets the tree mark it ✓
             except OSError:
                 pass
-            if entry.get("state_key"):
-                state["files"].pop(entry["state_key"], None)
-            record(entry, entry["item"], local_sha256)  # after the date: the next run reuses this hash
+            record_synced(state, entry, entry["item"], local_sha256)  # after the date: the next run reuses this hash
             results["FILE_UNCHANGED"] += 1
         elif status in {"CONFLICT", "SKIPPED", "LOCAL_ONLY"}:
             results[f"FILE_{status}"] += 1
         elif status in DOWNLOADS or status in UPLOADS:
             transfers.append(entry)
+    return transfers
 
-    # 3. Downloads and uploads.
-    stop = threading.Event()
+
+def transfer_entry(client, entry, folder_ids, stop, on_bytes):
+    """Download or upload one file with the Drive client client() gives. Returns (Drive item, local sha256)."""
+    destination = entry["destination"]
+    if entry["status"] == "KEEP_BOTH":
+        check_unchanged_since_plan(entry)
+        if os.path.lexists(entry["local_copy"]):
+            raise OSError(f"{entry['local_copy'].name} appeared here since the preview")
+        os.replace(destination, entry["local_copy"])  # your version steps aside
+
+        def still_free():
+            if os.path.lexists(destination):
+                raise OSError(CHANGED_SINCE_PREVIEW)
+
+        try:
+            download_file_atomically(client(), entry, stop, on_bytes, still_free)
+        except BaseException:
+            if not os.path.lexists(destination):
+                os.replace(entry["local_copy"], destination)
+            raise
+        return entry["item"], file_hash(destination)
+    if entry["status"] in DOWNLOADS:
+        download_file_atomically(client(), entry, stop, on_bytes, lambda: check_unchanged_since_plan(entry))
+        return entry["item"], file_hash(destination)
+    before = local_stat(destination)  # before hashing: an edit made from now on changes it
+    local_sha256 = file_hash(destination)
+    if entry["status"] == "UPLOAD":
+        current = client().files().get(
+            fileId=effective_id(entry["item"]), fields="id,mimeType,size,modifiedTime,md5Checksum",
+            supportsAllDrives=True,
+        ).execute(num_retries=API_RETRIES)
+        if remote_signature(current) != remote_signature(entry["item"]):
+            raise OSError("changed on Drive since the preview, not sent: compared again at the next sync")
+        item = upload_file(client(), destination, file_id=effective_id(entry["item"]),
+                           stop=stop, on_bytes=on_bytes)
+    else:
+        parent_id = folder_ids.get(entry["relative_path"].parent, entry.get("parent_id"))
+        if parent_id is None:
+            raise OSError("its folder could not be created on Drive")
+        item = upload_file(client(), destination, name=entry["relative_path"].name,
+                           parent_id=parent_id, stop=stop, on_bytes=on_bytes)
+    if local_stat(destination) != before:
+        entry["changed_meanwhile"] = True  # saved again while sent: keep its date, hash it again next time
+        return item, local_sha256
+    try:
+        set_remote_mtime(destination, item)  # same date on both sides: the tree marks it ✓
+    except OSError:
+        pass
+    return item, local_sha256
+
+
+TRANSFER_MARKS = {"NEW": "[green]↓[/]", "UPDATE": "[cyan]↓[/]", "UPLOAD_NEW": "[bright_green]↑[/]",
+                  "UPLOAD": "[bright_cyan]↑[/]"}
+
+
+def run_transfers(service, make_service, transfers, folder_ids, state, results, report, progress, executor,
+                  futures, handled, stop):
+    """Phase 3. Downloads and uploads, in the executor's threads, each with its own Drive client.
+    futures and handled are filled here and read by the caller, which records the transfers finished but
+    not read yet when the run stops."""
     lock = threading.Lock()
     clients = threading.local()
     started = time.monotonic()
@@ -4240,145 +4280,129 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
             clients.service = make_service()
         return clients.service
 
-    def transfer(entry):
-        destination = entry["destination"]
-        if entry["status"] == "KEEP_BOTH":
-            check_unchanged_since_plan(entry)
-            if os.path.lexists(entry["local_copy"]):
-                raise OSError(f"{entry['local_copy'].name} appeared here since the preview")
-            os.replace(destination, entry["local_copy"])  # your version steps aside
-
-            def still_free():
-                if os.path.lexists(destination):
-                    raise OSError(CHANGED_SINCE_PREVIEW)
-
+    with progress:
+        futures.update({executor.submit(transfer_entry, client, entry, folder_ids, stop, on_bytes): entry
+                        for entry in transfers})
+        for future in as_completed(futures):
+            handled.add(future)
+            entry = futures[future]
+            relative = entry["relative_path"].as_posix()
+            status = entry["status"]
             try:
-                download_file_atomically(client(), entry, stop, on_bytes, still_free)
-            except BaseException:
-                if not os.path.lexists(destination):
-                    os.replace(entry["local_copy"], destination)
-                raise
-            return entry["item"], file_hash(destination)
-        if entry["status"] in DOWNLOADS:
-            download_file_atomically(client(), entry, stop, on_bytes, lambda: check_unchanged_since_plan(entry))
-            return entry["item"], file_hash(destination)
-        before = local_stat(destination)  # before hashing: an edit made from now on changes it
-        local_sha256 = file_hash(destination)
-        if entry["status"] == "UPLOAD":
-            current = client().files().get(
-                fileId=effective_id(entry["item"]), fields="id,mimeType,size,modifiedTime,md5Checksum",
-                supportsAllDrives=True,
-            ).execute(num_retries=API_RETRIES)
-            if remote_signature(current) != remote_signature(entry["item"]):
-                raise OSError("changed on Drive since the preview, not sent: compared again at the next sync")
-            item = upload_file(client(), destination, file_id=effective_id(entry["item"]),
-                               stop=stop, on_bytes=on_bytes)
+                item, local_sha256 = future.result()
+            except DRIVE_CALL_ERRORS as error:
+                results["FILE_ERROR"] += 1
+                report("[red]✗[/]", f"{relative}: {error_text(error)}")
+            else:
+                results[f"FILE_{status}"] += 1
+                record_synced(state, entry, item, local_sha256)
+                if status == "UPLOAD_NEW":
+                    reselect_sent(state, entry["relative_path"], item,
+                                  folder_ids.get(entry["relative_path"].parent, entry.get("parent_id")))
+                if status == "KEEP_BOTH":
+                    report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
+                else:
+                    report(TRANSFER_MARKS[status], relative)
+            progress.advance(task)
+
+
+def trash_remote_entries(service, plan, state, results, report, forgotten):
+    """Phase 4. Deleted here: Drive's copies go to the Drive trash. Their paths are added to forgotten."""
+    trashed = []
+    for entry in plan:
+        if entry["status"] != "TRASH_REMOTE":
+            continue
+        if still_deleted_here(service, entry, state):
+            trashed.append(entry)
+            continue
+        results[f"{entry['kind']}_ERROR"] += 1
+        relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
+        changed_here = os.path.lexists(entry["destination"])
+        report("[red]✗[/]", f"{relative}: {CHANGED_SINCE_PREVIEW if changed_here else CHANGED_ON_DRIVE_SINCE_PREVIEW}")
+    if not trashed:
+        return
+    failed = trash_items(service, [entry["item"]["id"] for entry in trashed])
+    for entry in trashed:
+        relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
+        error = failed.get(entry["item"]["id"])
+        if error:
+            results[f"{entry['kind']}_ERROR"] += 1
+            report("[red]✗[/]", f"{relative}: {error}")
         else:
-            parent_id = folder_ids.get(entry["relative_path"].parent, entry.get("parent_id"))
-            if parent_id is None:
-                raise OSError("its folder could not be created on Drive")
-            item = upload_file(client(), destination, name=entry["relative_path"].name,
-                               parent_id=parent_id, stop=stop, on_bytes=on_bytes)
-        if local_stat(destination) != before:
-            entry["changed_meanwhile"] = True  # saved again while sent: keep its date, hash it again next time
-            return item, local_sha256
+            results[f"{entry['kind']}_TRASH_REMOTE"] += 1
+            forgotten.append(entry["relative_path"])
+            report("[magenta]✗[/]", f"{relative} → Drive trash")
+
+
+def trash_local_entries(plan, results, report, forgotten):
+    """Phase 5. Deleted on Drive: your copies go to your system trash. Their paths are added to forgotten.
+    Returns the folders that held them, which may now be empty."""
+    emptied = set()
+    for entry in plan:
+        if entry["status"] != "TRASH_LOCAL":
+            continue
+        relative = entry["relative_path"]
+        if not still_deleted_on_drive_unchanged_here(entry):
+            results[f"{entry['kind']}_ERROR"] += 1
+            report("[red]✗[/]", f"{relative.as_posix()}: {CHANGED_SINCE_PREVIEW}")
+            continue
         try:
-            set_remote_mtime(destination, item)  # same date on both sides: the tree marks it ✓
-        except OSError:
-            pass
-        return item, local_sha256
+            trash_local(entry["destination"])
+        except OSError as error:
+            results[f"{entry['kind']}_ERROR"] += 1
+            report("[red]✗[/]", f"{relative.as_posix()}: {error}")
+            continue
+        results[f"{entry['kind']}_TRASH_LOCAL"] += 1
+        forgotten.append(relative)
+        emptied.add(relative.parent)
+        report("[bright_magenta]✗[/]", f"{relative.as_posix()} → your trash")
+    return emptied
 
-    def remember(entry, item, local_sha256):
-        if entry.get("state_key"):
-            state["files"].pop(entry["state_key"], None)
-        record(entry, item, local_sha256)
-        if entry.get("changed_meanwhile"):
-            state["files"][state_key(item, entry["relative_path"])].pop("local_mtime_ns", None)
 
+def prune_emptied_dirs(destination_root, emptied, remote_folders, state):
+    """Remove the folders left empty by phase 5, deepest first, then their parents left empty in turn.
+    Stops at the destination root and at folders that still exist on Drive (remote_folders)."""
+    for folder in sorted(emptied, key=lambda path: len(path.parts), reverse=True):
+        while folder != Path() and folder not in remote_folders:
+            directory = destination_root / folder
+            if not directory.is_dir() or any(directory.iterdir()):
+                break
+            directory.rmdir()
+            state.setdefault("folders", {}).pop(folder.as_posix(), None)  # removed by the sync, not by you
+            folder = folder.parent
+
+
+@stop_signals_interrupt()
+def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None):
+    """Apply the confirmed plan, phase by phase. Transfers run in jobs threads, each with its own Drive client.
+    Whatever happens, finished transfers and deletions are saved in the state."""
+    results = Counter()
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[transfer]}[/]"),
+        console=console,
+        transient=True,
+    )
+
+    def report(mark, text):
+        progress.console.print(f"{mark} {escape(text)}")
+
+    forgotten = []  # deleted paths, forgotten in one pass before the state is saved
+    folder_ids = create_folders(service, plan, state, results, report)
+    transfers = settle_untransferred_files(plan, state, results, report)
+    stop = threading.Event()
     executor = ThreadPoolExecutor(max_workers=max(1, jobs))
     futures = {}
     handled = set()
     try:
-        with progress:
-            futures = {executor.submit(transfer, entry): entry for entry in transfers}
-            for future in as_completed(futures):
-                handled.add(future)
-                entry = futures[future]
-                relative = entry["relative_path"].as_posix()
-                status = entry["status"]
-                try:
-                    item, local_sha256 = future.result()
-                except DRIVE_CALL_ERRORS as error:
-                    results["FILE_ERROR"] += 1
-                    report("[red]✗[/]", f"{relative}: {error_text(error)}")
-                else:
-                    results[f"FILE_{status}"] += 1
-                    remember(entry, item, local_sha256)
-                    if status == "UPLOAD_NEW":
-                        reselect_sent(state, entry["relative_path"], item,
-                                      folder_ids.get(entry["relative_path"].parent, entry.get("parent_id")))
-                    if status == "KEEP_BOTH":
-                        report("[bright_yellow]⧉[/]", f"{relative} ↓ · yours kept as {entry['local_copy'].name}")
-                    else:
-                        mark = {"NEW": "[green]↓[/]", "UPDATE": "[cyan]↓[/]", "UPLOAD_NEW": "[bright_green]↑[/]",
-                                "UPLOAD": "[bright_cyan]↑[/]"}[status]
-                        report(mark, relative)
-                progress.advance(task)
-
-        # 4. Deleted here: Drive's copies go to the Drive trash.
-        trashed = []
-        for entry in plan:
-            if entry["status"] != "TRASH_REMOTE":
-                continue
-            if still_deleted_here(service, entry, state):
-                trashed.append(entry)
-                continue
-            results[f"{entry['kind']}_ERROR"] += 1
-            relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
-            changed_here = os.path.lexists(entry["destination"])
-            report("[red]✗[/]", f"{relative}: {CHANGED_SINCE_PREVIEW if changed_here else CHANGED_ON_DRIVE_SINCE_PREVIEW}")
-        if trashed:
-            failed = trash_items(service, [entry["item"]["id"] for entry in trashed])
-            for entry in trashed:
-                relative = entry["relative_path"].as_posix() + ("/" if entry["kind"] == "FOLDER" else "")
-                error = failed.get(entry["item"]["id"])
-                if error:
-                    results[f"{entry['kind']}_ERROR"] += 1
-                    report("[red]✗[/]", f"{relative}: {error}")
-                else:
-                    results[f"{entry['kind']}_TRASH_REMOTE"] += 1
-                    forgotten.append(entry["relative_path"])
-                    report("[magenta]✗[/]", f"{relative} → Drive trash")
-
-        # 5. Deleted on Drive: your copies go to your system trash; folders left empty by it go too.
-        emptied = set()
-        for entry in plan:
-            if entry["status"] != "TRASH_LOCAL":
-                continue
-            relative = entry["relative_path"]
-            if not still_deleted_on_drive_unchanged_here(entry):
-                results[f"{entry['kind']}_ERROR"] += 1
-                report("[red]✗[/]", f"{relative.as_posix()}: {CHANGED_SINCE_PREVIEW}")
-                continue
-            try:
-                trash_local(entry["destination"])
-            except OSError as error:
-                results[f"{entry['kind']}_ERROR"] += 1
-                report("[red]✗[/]", f"{relative.as_posix()}: {error}")
-                continue
-            results[f"{entry['kind']}_TRASH_LOCAL"] += 1
-            forgotten.append(relative)
-            emptied.add(relative.parent)
-            report("[bright_magenta]✗[/]", f"{relative.as_posix()} → your trash")
-        remote_folders = {path for path in folder_ids}
-        for folder in sorted(emptied, key=lambda path: len(path.parts), reverse=True):
-            while folder != Path() and folder not in remote_folders:
-                directory = destination_root / folder
-                if not directory.is_dir() or any(directory.iterdir()):
-                    break
-                directory.rmdir()
-                state.setdefault("folders", {}).pop(folder.as_posix(), None)  # removed by the sync, not by you
-                folder = folder.parent
+        run_transfers(service, make_service, transfers, folder_ids, state, results, report, progress, executor,
+                      futures, handled, stop)
+        trash_remote_entries(service, plan, state, results, report, forgotten)
+        emptied = trash_local_entries(plan, results, report, forgotten)
+        prune_emptied_dirs(destination_root, emptied, set(folder_ids), state)
     except BaseException:
         stop.set()  # running transfers stop at their next chunk; downloads remove their partial file
         raise
@@ -4386,7 +4410,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
         executor.shutdown(wait=True, cancel_futures=True)
         for future, entry in futures.items():  # finished but not read yet when the run stopped (Ctrl+C...)
             if future not in handled and future.done() and not future.cancelled() and future.exception() is None:
-                remember(entry, *future.result())
+                record_synced(state, entry, *future.result())
         forget_all_below(state, forgotten)
         save_state(destination_root, state)
     return results

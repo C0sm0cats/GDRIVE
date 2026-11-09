@@ -2745,6 +2745,41 @@ class DeletionScalingTest(unittest.TestCase):
         self.assertEqual(self.plan_moved_folders(2), self.plan_moved_folders(30))
 
 
+class ApplyPlanPhasesTest(unittest.TestCase):
+    """apply_plan's phases, each tested on its own (maint 1, maint 3)."""
+
+    def test_settle_untransferred_files_counts_kept_files_and_returns_transfers(self):
+        plan = [
+            {"kind": "FILE", "status": "CONFLICT", "relative_path": Path("a.txt")},
+            {"kind": "FILE", "status": "LOCAL_ONLY", "relative_path": Path("b.txt")},
+            {"kind": "FILE", "status": "NEW", "relative_path": Path("c.txt")},
+            {"kind": "FILE", "status": "UPLOAD_NEW", "relative_path": Path("d.txt")},
+            {"kind": "FOLDER", "status": "NEW", "relative_path": Path("e")},
+        ]
+        results = savegdrive.Counter()
+        transfers = savegdrive.settle_untransferred_files(plan, {"files": {}}, results, mock.Mock())
+        self.assertEqual([entry["relative_path"] for entry in transfers], [Path("c.txt"), Path("d.txt")])
+        self.assertEqual(results, {"FILE_CONFLICT": 1, "FILE_LOCAL_ONLY": 1})
+
+    def test_prune_emptied_dirs_is_the_one_pruning_and_stops_at_drive_folders(self):
+        self.assertFalse(hasattr(savegdrive, "prune_empty_dirs"))  # one implementation of the pruning
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "Kept/Gone/Deeper").mkdir(parents=True)
+            (root / "Other/Busy").mkdir(parents=True)
+            (root / "Other/Busy/file.txt").write_text("x")
+            (root / "Top").mkdir()
+            state = {"folders": {"Kept": "k", "Kept/Gone": "g", "Kept/Gone/Deeper": "d", "Top": "t"}}
+            savegdrive.prune_emptied_dirs(
+                root, {Path("Kept/Gone/Deeper"), Path("Other/Busy"), Path("Top")}, {Path("Kept")}, state)
+            self.assertTrue((root / "Kept").is_dir())  # still on Drive: kept, even empty
+            self.assertFalse((root / "Kept/Gone").exists())
+            self.assertTrue((root / "Other/Busy/file.txt").exists())
+            self.assertFalse((root / "Top").exists())
+            self.assertTrue(root.is_dir())  # never the destination root itself
+        self.assertEqual(state["folders"], {"Kept": "k"})
+
+
 class SelectionScalingTest(unittest.TestCase):
     """Big selections: a, --again and d index the selection instead of rescanning it per item (perf 2)."""
 
