@@ -5630,5 +5630,23 @@ class GitignoreTest(unittest.TestCase):
         self.assertEqual(staged, [".gitignore"])
 
 
+SCREENSHOT_COLORS = """
+import asyncio, importlib.util, sys
+spec = importlib.util.spec_from_file_location("make_screenshot", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print("#38bdf8" in module.plain_svg(asyncio.run(module.render())))
+"""
+
+
+class ScreenshotTest(unittest.TestCase):
+    def test_readme_screenshot_keeps_its_colors_when_no_color_is_set(self):
+        # maint 6: the launcher unsets NO_COLOR, so the README screenshot must not turn gray under it either.
+        script = Path(__file__).resolve().parent.parent / "docs" / "make_screenshot.py"
+        result = subprocess.run([sys.executable, "-c", SCREENSHOT_COLORS, str(script)],
+                                env=dict(os.environ, NO_COLOR="1"), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.stdout.strip().splitlines()[-1:], ["True"], result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

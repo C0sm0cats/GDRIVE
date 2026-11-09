@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ.pop("NO_COLOR", None)  # the runner unsets it too: render the colors users see
 import savegdrive  # noqa: E402
 
 COLUMNS, ROWS = 110, 27
