@@ -1017,6 +1017,62 @@ class SyncTest(unittest.TestCase):
         _, results = self.run_sync()
         self.assertEqual(results["FOLDER_LOCAL_ONLY"], 0)
 
+    def sync_views(self, views, picked):
+        """Select every item at the top of the picked views, like a whole tab, then plan and apply."""
+        cache, selections, browsed = {}, [], {}
+        for view in views:
+            if view.root_id in picked:
+                savegdrive.load_view(self.drive, view, cache)
+                for entry in view.children_of.get(None, []):
+                    savegdrive.add_selected_item(selections, entry["item"], entry["relative_parent"])
+                browsed.update(view.browsed)
+        scopes = savegdrive.build_local_scopes(selections, browsed, [view.base for view in views if view.nodes])
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(
+            self.drive, selections, scopes, self.root, state, cache, roots=savegdrive.view_roots(views)
+        )
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.apply_plan(self.drive, plan, self.root, state)
+        return {entry["relative_path"].as_posix(): entry for entry in plan}
+
+    def test_shared_drive_named_like_yours_never_gets_your_files(self):
+        # Someone adds you to their own drive "Finance": what you put in your Finance folder stays in yours.
+        self.drive.items["q"] = file_item("q", "q3.xlsx", "corp", b"q3")
+        self.drive.shared_drives = [{"id": "corp", "name": "Finance"}, {"id": "evil", "name": "Finance"}]
+        views = savegdrive.drive_views(self.drive, "root")
+        corp = next(view for view in views if view.root_id == "corp")
+        evil = next(view for view in views if view.root_id == "evil")
+        self.assertNotEqual(corp.base, evil.base)
+        self.assertNotEqual(corp.name, evil.name)
+        self.assertEqual(savegdrive.view_roots(views)[corp.base], "corp")
+        self.sync_views(views, {"corp"})
+        (self.root / corp.base / "salaries.xlsx").write_bytes(b"SALARIES")
+        plan = self.sync_views(views, {"corp"})
+        self.assertEqual(plan[(corp.base / "salaries.xlsx").as_posix()]["parent_id"], "corp")
+        self.assertEqual(self.drive.items[self.drive.uploads[0]]["parent"], "corp")
+        # A base two saved roots share (--again) sends nothing.
+        self.assertEqual(savegdrive.upload_roots([("corp", Path("x")), ("evil", Path("x"))]), {Path("x"): None})
+
+    def test_shared_folder_named_like_yours_is_a_conflict(self):
+        # A stranger shares a "Finance" folder listed before your colleague's: neither syncs any more.
+        colleague = {"id": "corp", "name": "Finance", "mimeType": FOLDER, "parent": "ann", "shared": True}
+        self.drive.items.update({"corp": colleague, "q": file_item("q", "q3.xlsx", "corp", b"q3")})
+        views = savegdrive.drive_views(self.drive, "root")
+        self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        self.assertEqual((self.root / "Shared with me/Finance/q3.xlsx").read_bytes(), b"q3")
+        stranger = {"id": "evil", "name": "Finance", "mimeType": FOLDER, "parent": "mallory", "shared": True}
+        self.drive.items = {"evil": stranger, **self.drive.items,
+                            "r": file_item("r", "README.txt", "evil", b"hi")}
+        (self.root / "Shared with me/Finance/salaries.xlsx").write_bytes(b"SALARIES")
+        plan = self.sync_views(views, {savegdrive.SHARED_WITH_ME})
+        finance = plan["Shared with me/Finance"]
+        self.assertEqual((finance["status"], finance.get("duplicate")), ("CONFLICT", True))
+        self.assertFalse([path for path in plan if path.startswith("Shared with me/Finance/")])
+        self.assertEqual(self.drive.uploads, [])
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / "Shared with me/Finance/q3.xlsx").read_bytes(), b"q3")
+        self.assertFalse((self.root / "Shared with me/Finance/README.txt").exists())
+
     def test_space_line(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
@@ -1625,6 +1681,19 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([savegdrive.selected_path(entry).as_posix() for entry in result["selections"]], ["Docs"])
         self.assertEqual(result["destination"], self.root)
         self.assertEqual(len(result["plan"]), 5)
+
+    async def test_checking_one_of_two_same_name_rows_takes_both(self):
+        # Two "Finance" folders look the same in the tree: checking either takes both, so the plan
+        # reports a conflict instead of syncing your folder with whichever was checked.
+        drive = demo_drive()
+        drive.items["twin"] = {"id": "twin", "name": "Docs", "mimeType": FOLDER, "parent": "root"}
+        app = self.make_app(drive)
+        async with app.run_test() as pilot:
+            await pilot.press("down", "space")
+            self.assertEqual(sorted(entry["item"]["id"] for entry in app.selections), ["docs", "twin"])
+            await pilot.press("space")
+            self.assertEqual(app.selections, [])
+            await pilot.press("q")
 
     async def test_views_load_on_tab(self):
         drive = demo_drive()

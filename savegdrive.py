@@ -705,14 +705,11 @@ def path_selection_state(path, selections):
 
 
 def selection_index(selections):
-    """The selected paths and the selected folders' paths, for indexed_selection_state."""
-    paths, folders = set(), set()
+    """The selected paths (with their Drive ids) and the selected folders' paths, for indexed_selection_state."""
+    index = ({}, set())
     for entry in selections:
-        path = selected_path(entry)
-        paths.add(path)
-        if is_folder(entry["item"]):
-            folders.add(path)
-    return paths, folders
+        index_selection(index, entry)
+    return index
 
 
 def indexed_selection_state(path, index):
@@ -727,9 +724,16 @@ def indexed_selection_state(path, index):
 
 def index_selection(index, entry):
     path = selected_path(entry)
-    index[0].add(path)
+    index[0].setdefault(path, set()).add(entry["item"].get("id"))
     if is_folder(entry["item"]):
         index[1].add(path)
+
+
+def already_selected(path, item_id, index):
+    """Is this Drive item in the selection, itself or through a folder? Another item with the same
+    local path is not: both are kept, so the plan sees two Drive items on one local path (a conflict)."""
+    state = indexed_selection_state(path, index)
+    return state == "*" or (state == "x" and item_id in index[0][path])
 
 
 def add_selected_items(selections, candidates):
@@ -739,7 +743,7 @@ def add_selected_items(selections, candidates):
     added, new_folders = [], set()
     for candidate in candidates:
         path = selected_path(candidate)
-        if indexed_selection_state(path, index) != " ":
+        if already_selected(path, candidate["item"].get("id"), index):
             continue
         index_selection(index, candidate)
         if is_folder(candidate["item"]):
@@ -1516,20 +1520,45 @@ def drive_views(service, folder_id):
         )
         for drive in response.get("drives", []):
             FOLDER_DRIVES[drive["id"]] = drive["id"]
-            shared_drives.append(
-                DriveView(drive["name"], drive["id"], Path(SHARED_DRIVES_DIR) / safe_name(drive["name"]))
-            )
+            shared_drives.append(drive)
         page_token = response.get("nextPageToken")
         if not page_token:
-            return views + shared_drives + [DriveView(TRASH_DIR, TRASH, Path(TRASH_DIR))]
+            break
+    return views + shared_drive_views(shared_drives) + [DriveView(TRASH_DIR, TRASH, Path(TRASH_DIR))]
+
+
+def shared_drive_views(drives):
+    """One view per shared drive, each with its own local folder. Drives whose names match
+    (letter case aside) all get their id after the name: none keeps the plain name, so a drive
+    someone else names like yours never receives what you put in your drive's folder."""
+    names = Counter(safe_name(drive["name"]).casefold() for drive in drives)
+    taken, views = set(), []
+    for drive in drives:
+        name = safe_name(drive["name"])
+        if names[name.casefold()] > 1:
+            name = safe_name(f"{name} ({drive['id']})")
+        unique, number = name, 2
+        while unique.casefold() in taken:
+            unique, number = f"{name} ({number})", number + 1
+        taken.add(unique.casefold())
+        shown = drive["name"] if unique == safe_name(drive["name"]) else unique  # tells the tabs apart
+        views.append(DriveView(shown, drive["id"], Path(SHARED_DRIVES_DIR) / unique))
+    return views
+
+
+def upload_roots(roots):
+    """Each view's local base and the Drive folder new local files go to, from (root id, base) pairs
+    (None: Shared with me, Trash, or a base two roots share: which one would get the files?)."""
+    parents = {}
+    for root_id, base in roots:
+        parent = None if root_id in {SHARED_WITH_ME, TRASH} else root_id
+        parents[base] = parent if parents.get(base, parent) == parent else None
+    return parents
 
 
 def view_roots(views):
     """Each view's local base and the Drive folder new local files go to (None: Shared with me, Trash)."""
-    return {
-        view.base: (None if view.root_id in {SHARED_WITH_ME, TRASH} else view.root_id)
-        for view in views
-    }
+    return upload_roots((view.root_id, view.base) for view in views)
 
 
 def load_view(service, view, cache, on_progress=lambda folders, items: None):
@@ -2046,16 +2075,11 @@ class DriveSelectorApp(App):
         if entry is None:
             return
         target_path = selected_path(entry)
-        exact_index = next(
-            (
-                index
-                for index, selected in enumerate(self.selections)
-                if selected_path(selected) == target_path
-            ),
-            None,
-        )
-        if exact_index is not None:
-            self.selections.pop(exact_index)
+        if any(selected_path(selected) == target_path for selected in self.selections):
+            # Every Drive item on this local path goes, twins with the same name included.
+            self.selections[:] = [
+                selected for selected in self.selections if selected_path(selected) != target_path
+            ]
         elif path_selection_state(target_path, self.selections) == "*":
             self.notify(
                 "This item is included by a selected parent folder.",
@@ -2080,7 +2104,14 @@ class DriveSelectorApp(App):
         }
 
     def add_entry(self, entry):
-        add_selected_items(self.selections, [self.selection_candidate(entry)])
+        # Items with the same name in the same folder share one local path: take them all, so the
+        # plan shows them as a conflict instead of syncing that path with whichever was checked.
+        target_path = selected_path(entry)
+        twins = [
+            other for other in self.children_of.get(entry["parent"], [])
+            if other is not entry and selected_path(other) == target_path
+        ]
+        add_selected_items(self.selections, [self.selection_candidate(other) for other in [entry, *twins]])
 
     def action_toggle_current(self):
         self.toggle_entry(self.current_entry())
@@ -2474,7 +2505,7 @@ def last_selection(service, state, cache):
     picked = []
     for saved_item in saved["items"]:
         relative_parent = Path(saved_item["relative_parent"])
-        if indexed_selection_state(Path(saved_item["path"]), index) != " ":
+        if already_selected(Path(saved_item["path"]), saved_item["id"], index):
             continue  # already there through a whole view
         try:
             item = (
@@ -2496,7 +2527,7 @@ def last_selection(service, state, cache):
             continue
         note_drives([item])
         candidate = {"item": item, "relative_parent": relative_parent}
-        if indexed_selection_state(selected_path(candidate), index) == " ":
+        if not already_selected(selected_path(candidate), item.get("id"), index):
             index_selection(index, candidate)
             picked.append(candidate)
     add_selected_items(selections, picked)
@@ -2839,15 +2870,31 @@ def collect_plan(
 
 
 def mark_duplicate_targets(plan):
+    """Two Drive items on one local path: rename one on Drive. Neither syncs, and for folders
+    nothing below them either: which one would get your new files, which one's deletions count?"""
+    folder_targets = Counter(
+        entry["relative_path"]
+        for entry in plan
+        if entry["kind"] == "FOLDER" and entry["status"] != "SKIPPED"
+    )
+    duplicate_folders = {path for path, count in folder_targets.items() if count > 1}
+    if duplicate_folders:
+        plan[:] = [
+            entry for entry in plan
+            if duplicate_folders.isdisjoint(entry["relative_path"].parents)
+        ]
     file_targets = Counter(
         entry["destination"]
         for entry in plan
         if entry["kind"] == "FILE" and entry["status"] != "SKIPPED"
     )
     for entry in plan:
-        if entry["kind"] == "FILE" and file_targets[entry["destination"]] > 1:
+        if (
+            entry["kind"] == "FILE" and file_targets[entry["destination"]] > 1
+            or entry["kind"] == "FOLDER" and entry["relative_path"] in duplicate_folders
+        ):
             entry["status"] = "CONFLICT"
-            entry["duplicate"] = True  # two Drive files, one local name: rename one on Drive
+            entry["duplicate"] = True
 
 
 def path_is_in_scope(relative_path, scopes):
@@ -2884,8 +2931,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE"
     }
     trashed_remote = [
-        entry["relative_path"] for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "TRASH_REMOTE"
-    ]
+        entry["relative_path"] for entry in plan
+        if entry["kind"] == "FOLDER" and (entry["status"] == "TRASH_REMOTE" or entry.get("duplicate"))
+    ]  # deleted here, or two Drive folders on this path: nothing below goes anywhere
     tracked = tracked_files_by_path(state)
     synced_folders = {Path(path) for path in state.get("folders", {})}
     tracked_directories = {
@@ -3015,6 +3063,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             remote_folders[entry["relative_path"]] = (
                 effective_id(entry["item"])
                 if can(entry["item"], "canAddChildren") and not entry["item"].get("readonly")
+                and not entry.get("duplicate")
                 else None
             )
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
@@ -3225,7 +3274,7 @@ def plan_notes(plan):
     if any(entry["status"] == "KEEP_BOTH" and not entry.get("copy_goes_up", True) for entry in plan):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
-        notes.append("Two Drive files with the same name in a folder: rename one on Drive (o opens it).")
+        notes.append("Two Drive items with the same name in a folder: rename one on Drive (o opens it).")
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")
     if "TRASH_LOCAL" in statuses:
@@ -4104,9 +4153,7 @@ def main():
             who = f"{escape(account)} " if account else ""
             console.print(f"[bold]Again[/]  {names}{more} [dim]{who}→ {escape(str(destination_root))}[/]")
             roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
-            upload_roots = {
-                base: (None if root_id in {SHARED_WITH_ME, TRASH} else root_id) for root_id, base in roots
-            }
+            again_roots = upload_roots(roots)
             with console.status("[dim]Comparing with local files…[/]") as status:
                 checked = 0
 
@@ -4117,7 +4164,7 @@ def main():
                         status.update(f"[dim]Comparing with local files… {checked}[/]")
 
                 plan = build_plan(
-                    service, selections, local_scopes, destination_root, state, cache, on_item, upload_roots
+                    service, selections, local_scopes, destination_root, state, cache, on_item, again_roots
                 )
             if args.keep_both:
                 set_keep_both(plan, plan, True)
