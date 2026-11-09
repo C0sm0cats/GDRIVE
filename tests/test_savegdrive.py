@@ -513,6 +513,35 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
         self.assertEqual(hashed, ["Docs/b.txt", "Docs/b.txt"])  # the plan, then the state after sending
 
+    def edit_keeping_size(self):
+        """Sync, then edit Docs/a.txt here without changing its size."""
+        self.run_sync()
+        path = self.root / "Docs/a.txt"
+        before = path.stat().st_mtime_ns
+        path.write_bytes(b"alphA")
+        os.utime(path, ns=(before + 2_000_000_000, before + 2_000_000_000))  # a later save, same size
+
+    def test_same_size_edit_is_sent(self):
+        self.edit_keeping_size()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UPLOAD")
+        self.assertEqual(self.drive.items["a"]["content"], b"alphA")
+
+    def test_same_size_edit_changed_on_drive_too_is_a_conflict(self):
+        self.edit_keeping_size()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha from Drive"))
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alphA")
+
+    def test_same_size_edit_deleted_on_drive_is_sent_back(self):
+        self.edit_keeping_size()
+        del self.drive.items["a"]
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UPLOAD_NEW")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alphA")
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_empty_folders_are_synced(self):
         self.run_sync()
         (self.root / "Empty here").mkdir()
