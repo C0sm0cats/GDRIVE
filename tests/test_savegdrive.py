@@ -2484,7 +2484,7 @@ class SyncTest(unittest.TestCase):
                     if synced:  # the tree back after the sync
                         await app.workers.wait_for_complete()
                         await pilot.pause()
-                        labels.append(str(app.query_one("#drive-tree").root.label))
+                        labels.append(str(app.query_one(Tree).root.label))
                         await pilot.press("q")
                         return
                     await pilot.press("down", "space", "d")  # Docs: sends new.txt
@@ -5010,6 +5010,40 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.view, views[0])
             await pilot.press("q")
 
+    async def test_tab_back_to_an_unfolded_view_keeps_its_tree(self):
+        # perf 12: one tree for every view, so Tab back to an unfolded view rebuilt and relabeled it all.
+        drive = demo_drive()
+        drive.items["t"] = file_item("t", "plan.txt", "team", b"plan")
+        drive.shared_drives = [{"id": "team", "name": "Team"}]
+        views = savegdrive.drive_views(drive, "root")
+        app = self.make_app(drive, views)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.press("e", "down", "space")  # unfolds My Drive, selects Docs
+            await pilot.pause()
+            nodes = dict(app.tree_nodes)
+            docs = next(node for node in nodes.values() if node.data["item"]["id"] == "docs")
+            self.assertEqual(docs.label.plain[0], "☑")
+            await pilot.press("tab", "tab")  # Shared with me, then Team
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIs(app.view, views[2])
+            await pilot.press("c")  # unselects all from another view
+            rebuilds = []
+            app.rebuild = lambda: rebuilds.append(app.view)
+            await pilot.press("shift+tab", "shift+tab")
+            await pilot.pause()
+            self.assertIs(app.view, views[0])
+            self.assertEqual(rebuilds, [])
+            self.assertIs(app.query_one(Tree), app.drive_tree)
+            self.assertEqual(app.tree_nodes, nodes)
+            self.assertTrue(all(node is nodes[index] for index, node in app.tree_nodes.items()))
+            self.assertTrue(all(node.is_expanded for node in nodes.values() if node.allow_expand))
+            self.assertEqual(docs.label.plain[0], "☐")  # the selection changed meanwhile
+            tree = app.drive_tree
+            for node in [tree.root, *nodes.values()]:
+                self.assertEqual(tree.get_label_width(node), Tree.get_label_width(tree, node))
+            await pilot.press("q")
+
     async def test_every_view_tab_stays_visible_when_the_row_overflows(self):
         # design 4: the tab row was one line high, so with several shared drives the active Trash tab was cut off.
         drive = demo_drive()
@@ -5095,11 +5129,11 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 
         drive.list = flaky_list
         async with app.run_test() as pilot:
-            tree = app.query_one(Tree)
             await pilot.press("down", "space", "tab")  # Docs, then Shared with me: the listing fails once
             await app.workers.wait_for_complete()
             await pilot.pause()
             self.assertIs(app.view, views[1])
+            tree = app.query_one(Tree)  # each view has its own tree
             self.assertEqual(str(tree.root.label), "Shared with me  timed out  (switch views to try again)")
             await pilot.press("shift+tab", "tab")  # My Drive, then back: listed again
             await app.workers.wait_for_complete()

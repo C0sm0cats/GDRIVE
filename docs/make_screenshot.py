@@ -140,7 +140,7 @@ async def render():
         app.last_sync_text = savegdrive.last_sync_summary(demo_last_sync())  # as checked at start
         app.update_notice()
         await pilot.pause()
-        app.query_one("#drive-tree").move_cursor(app.tree_nodes[by_name["Lease agreement.pdf"]["index"]])
+        app.drive_tree.move_cursor(app.tree_nodes[by_name["Lease agreement.pdf"]["index"]])
         await pilot.pause()
         return app.export_screenshot(title="savegdrive")
 

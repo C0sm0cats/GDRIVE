@@ -29,6 +29,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from oauthlib.oauth2.rfc6749.errors import OAuth2Error
+from rich.cells import cell_len
 from rich.console import Console, Group
 from send2trash import send2trash
 from rich.markup import escape
@@ -1909,6 +1910,25 @@ class DriveTree(Tree):
         Binding("E", "app.expand_all", "Expand below", show=False, key_display="shift+e"),
     ]
 
+    def __init__(self, label, drive_view, **kwargs):
+        super().__init__(label, **kwargs)
+        # Each view keeps its own tree: Tab back to an unfolded view shows it again instead of
+        # rebuilding every node (seconds on a large one).
+        self.drive_view = drive_view
+        self.tree_nodes = {}
+        self.node_paths = {}  # index -> selected_path of its entry, for the tree nodes
+        self.populated = set()
+        self.label_column = None  # the name column of its labels, to redo them when the width changes
+        self.built_nodes = None  # the view's listing, sort and filter the tree shows
+        self.built_key = None
+        self.stale = None  # "selection" or "all": labels to redo when it is shown again
+
+    def get_label_width(self, node):
+        # Tree measures every line again on each focus change or resize, showing or hiding a view
+        # included: render_label would build a styled copy of each label (a second on a large tree).
+        icon = (self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE) if node.allow_expand else ""
+        return cell_len(icon) + node.label.cell_len
+
 
 class DriveView:
     """One root shown in the tree: My Drive, Shared with me, or a shared drive."""
@@ -2075,7 +2095,7 @@ class DriveSelectorApp(App):
         margin: 1 2 0 2;
     }
 
-    #drive-tree {
+    .drive-tree {
         height: 1fr;
         margin: 1 2 0 2;
         padding: 0 1;
@@ -2151,11 +2171,8 @@ class DriveSelectorApp(App):
                 view.marks = local_marks(view.nodes, destination, state)
         self.selections = []
         self.tree_frame = None
-        self.label_column = None  # the name column of the labels shown, to redo them when the width changes
         self.label_index = None  # selection_index of self.selections for node_label; None when stale
-        self.tree_nodes = {}
-        self.node_paths = {}  # index -> selected_path of its entry, for the tree nodes
-        self.populated = set()
+        self.trees = {}  # view -> its DriveTree, made in compose
         self.filter_terms = []
         self.filter_ancestors = set()
         self.filter_visible = None
@@ -2186,13 +2203,37 @@ class DriveSelectorApp(App):
         return self.view.expanded
 
     @property
+    def drive_tree(self):
+        return self.trees[self.view]
+
+    @property
+    def tree_nodes(self):
+        return self.drive_tree.tree_nodes
+
+    @property
+    def node_paths(self):
+        return self.drive_tree.node_paths
+
+    @property
+    def populated(self):
+        return self.drive_tree.populated
+
+    @property
+    def label_column(self):
+        return self.drive_tree.label_column
+
+    @label_column.setter
+    def label_column(self, column):
+        self.drive_tree.label_column = column
+
+    @property
     def name_column(self):
         return self.fit_name_column(self.size.width)
 
     def fit_name_column(self, screen_width):
         """Names get what they need, up to the tree's width less the columns after them."""
         if self.tree_frame is None:  # margins, border, padding and scrollbar around the labels
-            styles = self.query_one("#drive-tree", Tree).styles
+            styles = self.drive_tree.styles
             self.tree_frame = styles.margin.width + styles.gutter.width + styles.scrollbar_size_vertical
         width = screen_width - self.tree_frame
         return min(self.view.name_column, max(width - self.view.tail_width, NAME_COLUMN_MIN))
@@ -2215,7 +2256,11 @@ class DriveSelectorApp(App):
         notice = Static(id="notice")
         notice.display = False
         yield notice
-        yield DriveTree(Text(self.view.name, style="bold bright_blue"), id="drive-tree")
+        self.trees = {view: DriveTree(Text(view.name, style="bold bright_blue"), view, classes="drive-tree")
+                      for view in self.views}
+        for view, tree in self.trees.items():
+            tree.display = view is self.view
+            yield tree
         filter_input = Input(placeholder="filter by name or path", id="filter")
         filter_input.display = False
         yield filter_input
@@ -2225,8 +2270,7 @@ class DriveSelectorApp(App):
 
     def on_mount(self):
         self.update_sub_title()
-        tree = self.query_one("#drive-tree", Tree)
-        tree.focus()
+        self.drive_tree.focus()
         self.show_view(self.view)
         self.check_last_sync()
 
@@ -2336,11 +2380,17 @@ class DriveSelectorApp(App):
         filter_input = self.query_one("#filter", Input)
         if switching and (self.filter_terms or filter_input.display):
             self.clear_filter(rebuild=False)
-        tree = self.query_one("#drive-tree", Tree)
+        tree = self.drive_tree
+        for other in self.trees.values():
+            other.display = other is tree
+        first = self.query(DriveTree).first()
+        if first is not tree:  # first: query_one(Tree) is the tree shown
+            self.screen.move_child(tree, before=first)
         if not filter_input.has_focus:  # still typing the filter: leave the cursor in it
             tree.focus()
         if view.nodes is None:
             tree.clear()
+            tree.built_nodes = tree.built_key = None
             tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  loading…", "dim")))
             if view.error is None:
                 self.run_worker(lambda: self.load_in_background(view), thread=True, group="views")
@@ -2352,8 +2402,13 @@ class DriveSelectorApp(App):
             view.sort(self.sort)
             if self.filter_terms:
                 self.apply_filter(filter_input.value)  # computed on the loaded items
-            else:
+            elif tree.built_nodes is not view.nodes or tree.built_key != self.tree_key():
                 self.rebuild()
+            elif tree.stale == "all" or tree.label_column != self.name_column:
+                self.relabel_nodes()
+            elif tree.stale == "selection":
+                self.relabel_nodes(selection_only=True)
+            tree.stale = None
             if not view.nodes:
                 tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  empty", "dim")))
         self.update_views()
@@ -2418,10 +2473,11 @@ class DriveSelectorApp(App):
     # Tree building: children are added when their folder is first expanded.
 
     def populate(self, tree_node):
+        tree = tree_node.tree
         key = None if tree_node.data is None else tree_node.data["index"]
-        if key in self.populated:
+        if key in tree.populated or tree is not self.drive_tree:
             return
-        self.populated.add(key)
+        tree.populated.add(key)
         for entry in self.children_of.get(key, []):
             if self.filter_visible is not None and entry["index"] not in self.filter_visible:
                 continue
@@ -2431,32 +2487,40 @@ class DriveSelectorApp(App):
                 expand=False,
                 allow_expand=entry["index"] in self.children_of,
             )
-            self.tree_nodes[entry["index"]] = child
-            self.node_paths[entry["index"]] = selected_path(entry)
+            tree.tree_nodes[entry["index"]] = child
+            tree.node_paths[entry["index"]] = selected_path(entry)
 
     def expand(self, tree_node):
         self.populate(tree_node)
         tree_node.expand()
 
-    @on(Tree.NodeExpanded, "#drive-tree")
-    def node_expanded(self, event):
-        self.populate(event.node)
-        if not self.filter_terms and event.node.data is not None:
-            self.expanded.add(selected_path(event.node.data))
+    # A tree's messages can arrive once another view is shown: each one goes to its own view.
 
-    @on(Tree.NodeCollapsed, "#drive-tree")
+    @on(Tree.NodeExpanded, ".drive-tree")
+    def node_expanded(self, event):
+        tree = event.node.tree
+        self.populate(event.node)
+        if not (tree.built_key or (None, ()))[1] and event.node.data is not None:
+            tree.drive_view.expanded.add(selected_path(event.node.data))
+
+    @on(Tree.NodeCollapsed, ".drive-tree")
     def node_collapsed(self, event):
-        if not self.filter_terms and event.node.data is not None:
-            self.expanded.discard(selected_path(event.node.data))
+        tree = event.node.tree
+        if not (tree.built_key or (None, ()))[1] and event.node.data is not None:
+            tree.drive_view.expanded.discard(selected_path(event.node.data))
+
+    def tree_key(self):
+        return self.view.sorted_by, tuple(self.filter_terms)
 
     def rebuild(self):
-        tree = self.query_one("#drive-tree", Tree)
+        tree = self.drive_tree
         current = self.current_entry()
         tree.clear()
         self.label_index = None
-        self.tree_nodes = {}
-        self.node_paths = {}
-        self.populated = set()
+        tree.tree_nodes = {}
+        tree.node_paths = {}
+        tree.populated = set()
+        tree.built_nodes, tree.built_key, tree.stale = self.view.nodes, self.tree_key(), None
         self.populate(tree.root)
         tree.root.expand()
         for entry in self.nodes:  # parents come first, so each one is already in the tree
@@ -2543,7 +2607,16 @@ class DriveSelectorApp(App):
 
     def refresh_node_labels(self, selection_only=False):
         """Relabel the populated nodes. selection_only: only the selection changed, so relabel just
-        the nodes whose checkbox changed (each set_label repaints, seconds on a large unfolded tree)."""
+        the nodes whose checkbox changed (each set_label repaints, seconds on a large unfolded tree).
+        The other views' trees are relabeled when they are shown again."""
+        self.relabel_nodes(selection_only)
+        for tree in self.trees.values():
+            if tree is not self.drive_tree and tree.built_nodes is not None:
+                tree.stale = "all" if not selection_only or tree.stale == "all" else "selection"
+        self.update_selection_summary()
+        self.update_views()
+
+    def relabel_nodes(self, selection_only=False):
         self.label_index = None  # the selection changed
         if not selection_only:
             for tree_node in self.tree_nodes.values():
@@ -2562,8 +2635,6 @@ class DriveSelectorApp(App):
                 state = "x" if path in paths else "*" if covered else " "
                 if tree_node.label.plain[:1] != SELECTION_BOXES.get(state, "☐ ")[0]:
                     tree_node.set_label(self.node_label(tree_node.data))
-        self.update_selection_summary()
-        self.update_views()
 
     def update_selection_summary(self, status=None):
         text = Text()
@@ -2599,7 +2670,7 @@ class DriveSelectorApp(App):
     # Actions.
 
     def current_node(self):
-        return self.query_one("#drive-tree", Tree).cursor_node
+        return self.drive_tree.cursor_node
 
     def current_entry(self):
         node = self.current_node()
@@ -2608,7 +2679,7 @@ class DriveSelectorApp(App):
     def on_view_root(self):
         """The cursor is on the root line of the view (My Drive, Shared with me…), which has no item."""
         node = self.current_node()
-        return node is not None and node is self.query_one("#drive-tree", Tree).root
+        return node is not None and node is self.drive_tree.root
 
     def toggle_entry(self, entry):
         if entry is None:
@@ -2686,7 +2757,7 @@ class DriveSelectorApp(App):
             self.expand(node)
 
     def action_collapse_or_parent(self):
-        tree = self.query_one("#drive-tree", Tree)
+        tree = self.drive_tree
         node = tree.cursor_node
         if node is None:
             return
@@ -2696,7 +2767,7 @@ class DriveSelectorApp(App):
             tree.move_cursor(node.parent)
 
     def action_expand_or_child(self):
-        tree = self.query_one("#drive-tree", Tree)
+        tree = self.drive_tree
         node = tree.cursor_node
         if node is None or not node.allow_expand:
             return
@@ -2783,12 +2854,12 @@ class DriveSelectorApp(App):
             self.apply_filter(event.value)
         if not event.value.strip():
             event.input.display = False
-        self.query_one("#drive-tree", Tree).focus()
+        self.drive_tree.focus()
 
     def clear_filter(self, rebuild=True):
         filter_input = self.query_one("#filter", Input)
         filter_input.display = False
-        self.query_one("#drive-tree", Tree).focus()
+        self.drive_tree.focus()
         self.cancel_pending_filter()
         with filter_input.prevent(Input.Changed):
             filter_input.value = ""
@@ -2839,7 +2910,7 @@ class DriveSelectorApp(App):
 
     def action_unfold_view(self):
         """e unfolds the whole view; when it is all unfolded, folds it back."""
-        tree = self.query_one("#drive-tree", Tree)
+        tree = self.drive_tree
         if self.view.nodes is None:
             return
         folders = [index for index in self.children_of if index is not None]
