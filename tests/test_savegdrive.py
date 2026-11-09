@@ -144,7 +144,8 @@ class FakeDrive:
             folder_id = savegdrive.TRASH
         else:
             folder_id = q.split("'")[1]
-        want_trashed = q.endswith("trashed = true")
+        # Like the API: without a trashed clause, a folder lists its trashed children too.
+        want_trashed = True if q.endswith("trashed = true") else False if q.endswith("trashed = false") else None
 
         def run():
             failures = self.failures.get(folder_id)
@@ -160,7 +161,7 @@ class FakeDrive:
             else:
                 children = [
                     self.public(item) for item in self.items.values()
-                    if item.get("parent") == folder_id and self.is_trashed(item) == want_trashed
+                    if item.get("parent") == folder_id and want_trashed in (None, self.is_trashed(item))
                 ]
             start = int(pageToken or 0)
             page = children[start:start + self.page_size]
@@ -865,6 +866,14 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Photos 2"], "TRASH_REMOTE")
         self.assertTrue(self.drive.is_trashed(self.drive.items["photos2"]))
         self.assertFalse((self.root / "Photos 2").exists())
+
+    def test_file_trashed_on_drive_goes_to_your_trash(self):
+        self.run_sync()
+        self.drive.items["p"]["trashed"] = True  # deleting on Drive trashes it, the item stays
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos/beach.jpg"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "Photos/beach.jpg").exists())
+        self.assertEqual(sorted(path.name.split("-", 1)[1] for path in self.trash.iterdir()), ["beach.jpg"])
 
     def test_folder_deleted_on_drive_goes_to_your_trash(self):
         self.run_sync()
