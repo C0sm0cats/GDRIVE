@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httplib2
-from google.auth.exceptions import GoogleAuthError
+from google.auth.exceptions import GoogleAuthError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -219,6 +219,20 @@ def signed_in_account(service):
     return about.get("user", {}).get("emailAddress")
 
 
+def sign_in_or_exit(reason, needed):
+    """sign_in, or exit when no one is at a terminal to finish it (cron, --again --yes).
+
+    Without a terminal, the browser sign-in would wait forever for a redirect that never comes.
+    """
+    if not sys.stdin.isatty():
+        console.print(
+            f"[red]✗[/] {needed}\n"
+            "  [dim]Run savegdrive once in a terminal to sign in, then this run works again.[/]"
+        )
+        raise SystemExit(1)
+    return sign_in(reason)
+
+
 def authenticate():
     creds = None
     if TOKEN_PATH.exists():
@@ -227,7 +241,10 @@ def authenticate():
         if not creds.has_scopes(SCOPES):
             # A token from the read-only versions: Google must ask again for the wider access.
             debug("Saved token lacks the full Drive scope")
-            creds = sign_in("SaveGDrive now syncs both ways: allow full Drive access in your browser.")
+            creds = sign_in_or_exit(
+                "SaveGDrive now syncs both ways: allow full Drive access in your browser.",
+                "SaveGDrive now syncs both ways and needs full Drive access.",
+            )
             TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
             return creds
 
@@ -236,15 +253,28 @@ def authenticate():
             try:
                 creds.refresh(Request())
                 debug(f"Token refreshed, expires {local_expiry(creds)}")
+            except TransportError as error:
+                # Network down (laptop just out of sleep, DNS): the session itself is still good.
+                debug(f"Could not refresh token: {error}")
+                console.print(
+                    "[red]✗[/] Could not reach Google to refresh the Drive session: "
+                    f"{escape(str(error))}\n  [dim]Check the network connection and try again.[/]"
+                )
+                raise SystemExit(1) from error
             except Exception as error:
                 debug(f"Could not refresh token: {error}")
                 if "invalid_grant" in str(error):
-                    reason = "Google Drive session expired, sign in again in your browser."
+                    creds = sign_in_or_exit(
+                        "Google Drive session expired, sign in again in your browser.",
+                        "Google Drive session expired.",
+                    )
                 else:
-                    reason = "Could not refresh the Google Drive session, sign in again in your browser."
-                creds = sign_in(reason)
+                    creds = sign_in_or_exit(
+                        "Could not refresh the Google Drive session, sign in again in your browser.",
+                        f"Could not refresh the Google Drive session: {escape(str(error))}",
+                    )
         else:
-            creds = sign_in("Sign in to Google Drive in your browser.")
+            creds = sign_in_or_exit("Sign in to Google Drive in your browser.", "Not signed in to Google Drive.")
         TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
 
     return creds

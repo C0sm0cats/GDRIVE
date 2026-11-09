@@ -2116,9 +2116,61 @@ class SignInTest(unittest.TestCase):
             )
             new = mock.Mock(to_json=lambda: "{}")
             with mock.patch.object(savegdrive, "TOKEN_PATH", token), \
+                    mock.patch.object(sys.stdin, "isatty", lambda: True), \
                     mock.patch.object(savegdrive, "sign_in", return_value=new) as sign_in:
                 self.assertIs(savegdrive.authenticate(), new)
             self.assertIn("full Drive access", sign_in.call_args[0][0])
+
+    def authenticate_expired(self, refresh_error, isatty):
+        """authenticate with an expired token whose refresh raises refresh_error."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        token = Path(temp.name) / "token.json"
+        token.write_text(
+            '{"token": "t", "refresh_token": "r", "client_id": "c", "client_secret": "s", '
+            '"scopes": ["https://www.googleapis.com/auth/drive"], "expiry": "2000-01-01T00:00:00Z"}'
+        )
+        output = io.StringIO()
+        new = mock.Mock(to_json=lambda: "{}")
+        with mock.patch.object(savegdrive, "TOKEN_PATH", token), \
+                mock.patch.object(savegdrive.Credentials, "refresh", side_effect=refresh_error), \
+                mock.patch.object(savegdrive, "console", Console(file=output, width=200)), \
+                mock.patch.object(sys.stdin, "isatty", lambda: isatty), \
+                mock.patch.object(savegdrive, "sign_in", return_value=new) as sign_in:
+            try:
+                result = savegdrive.authenticate()
+            except SystemExit as error:
+                result = error
+        return result, sign_in, output.getvalue(), token.read_text()
+
+    def test_unattended_run_exits_instead_of_waiting_for_a_browser_sign_in(self):
+        from google.auth.exceptions import RefreshError
+        result, sign_in, output, token = self.authenticate_expired(
+            RefreshError("invalid_grant: Token has been expired or revoked."), isatty=False
+        )
+        sign_in.assert_not_called()
+        self.assertIsInstance(result, SystemExit)
+        self.assertEqual(result.code, 1)
+        self.assertIn("session expired", output)
+        self.assertIn("in a terminal", output)
+        self.assertIn('"refresh_token": "r"', token)  # the saved token is left as it was
+
+    def test_network_error_on_refresh_is_not_an_expired_session(self):
+        from google.auth.exceptions import TransportError
+        for isatty in (False, True):
+            with self.subTest(isatty=isatty):
+                result, sign_in, output, _ = self.authenticate_expired(TransportError("DNS down"), isatty)
+                sign_in.assert_not_called()
+                self.assertIsInstance(result, SystemExit)
+                self.assertEqual(result.code, 1)
+                self.assertIn("Could not reach Google", output)
+
+    def test_expired_session_in_a_terminal_still_signs_in(self):
+        from google.auth.exceptions import RefreshError
+        result, sign_in, _, token = self.authenticate_expired(RefreshError("invalid_grant"), isatty=True)
+        self.assertIs(result, sign_in.return_value)
+        self.assertIn("session expired", sign_in.call_args[0][0])
+        self.assertEqual(token, "{}")
 
 
 class KeyListTest(unittest.TestCase):
