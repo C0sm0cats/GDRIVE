@@ -1771,7 +1771,8 @@ class SyncTest(unittest.TestCase):
         self.drive.items["n"]["trashed"] = True
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             again, again_scopes = savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
-        self.assertEqual([entry["item"]["name"] for entry in again], ["a.txt"])
+        # Picked inside Docs: --again must sync it at Docs/a.txt, not at the root.
+        self.assertEqual([savegdrive.selected_path(entry).as_posix() for entry in again], ["Docs/a.txt"])
         self.assertEqual(again[0]["item"]["md5Checksum"], self.drive.items["a"]["md5Checksum"])
         # Gone from Drive or in its trash: still scanned locally.
         self.assertEqual(again_scopes, [Path("Photos"), Path("notes.txt")])
