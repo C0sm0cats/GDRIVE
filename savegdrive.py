@@ -1788,8 +1788,11 @@ class DriveSelectorApp(App):
     ]
 
     def __init__(self, views, destination=None, state=None, service=None, make_service=None, cache=None,
-                 skip_preview=False, account=None, keep_both=False, view=None, sort="name", notice=None):
+                 skip_preview=False, account=None, keep_both=False, view=None, sort="name", notice=None,
+                 token=None):
         super().__init__()
+        self.drive_token = token  # Drive changes token of self.cache: replayed before each plan
+        self.cache_lock = threading.Lock()
         self.keep_both = keep_both
         self.notice = notice
         self.last_sync = None  # the plan of the last selection, checked in the background at start
@@ -1880,9 +1883,35 @@ class DriveSelectorApp(App):
         destination, round_ = self.destination, self.last_sync_round
         self.run_worker(lambda: self.last_sync_in_background(destination, round_), thread=True)
 
+    def refresh_cache(self, service):
+        """Replay the Drive changes made since the tree was loaded: a plan never compares to stale listings."""
+        if self.drive_token is None:
+            return
+        with self.cache_lock:
+            # Shared with me and the Trash are searches, and trashed folders list trashed items: no replay.
+            folders = {folder_id: items for folder_id, items in self.cache.items()
+                       if folder_id not in {SHARED_WITH_ME, TRASH} and folder_id not in TRASHED_FOLDERS}
+            replayed = apply_changes(service, {"token": self.drive_token, "folders": folders})
+            if replayed is None:  # token too old: these folders are listed again by the plan
+                self.drive_token = start_page_token(service)
+                for folder_id in folders:
+                    self.cache.pop(folder_id, None)
+                return
+            self.cache.update(replayed[0])
+            self.drive_token = replayed[1]
+
+    def fresh_selections(self, selections):
+        """The selected items with their metadata from the refreshed listings, when they are listed there."""
+        fresh = {}
+        for folder_id, items in list(self.cache.items()):
+            if folder_id not in {SHARED_WITH_ME, TRASH}:
+                fresh.update((item["id"], item) for item in items)
+        return [dict(entry, item=fresh.get(entry["item"]["id"], entry["item"])) for entry in selections]
+
     def last_sync_in_background(self, destination, round_):
         try:
             service = self.make_service()
+            self.refresh_cache(service)
             state = load_state(destination)
             selections, scopes = last_selection(service, state, self.cache)
             roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
@@ -2531,9 +2560,12 @@ class DriveSelectorApp(App):
                 self.call_from_thread(self.update_selection_summary, f"Comparing with local files… {checked}")
 
         try:
+            service = self.make_service()
+            self.refresh_cache(service)
+            selections = self.fresh_selections(selections)
             state = load_state(destination)
             plan = build_plan(
-                self.make_service(), selections, scopes, destination, state, self.cache, on_item, view_roots(self.views)
+                service, selections, scopes, destination, state, self.cache, on_item, view_roots(self.views)
             )
             if self.keep_both:
                 set_keep_both(plan, plan, True)
@@ -4550,10 +4582,10 @@ def main():
             app = DriveSelectorApp(
                 views, destination_root, load_state(destination_root), service, make_service, cache,
                 skip_preview=args.yes, account=account, keep_both=args.keep_both,
-                view=view, sort=sort, notice=notice,
+                view=view, sort=sort, notice=notice, token=token,
             )
             result = app.run()
-            view, sort, destination_root = app.view, app.sort, app.destination
+            view, sort, destination_root, token = app.view, app.sort, app.destination, app.drive_token
             if not result:
                 break
             plan, selections, local_scopes = result["plan"], result["selections"], result["scopes"]

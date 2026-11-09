@@ -1175,6 +1175,49 @@ class SyncTest(unittest.TestCase):
         self.assertIsNone(app.return_value)
         self.assertFalse(self.drive.items["docs"].get("trashed"))
 
+    def tree_left_open_while_drive_changes(self, token):
+        """Tree loaded after a sync; then a colleague edits a.txt, b.txt and notes.txt on Drive while you edit
+        a.txt and notes.txt and delete b.txt here; then Docs and notes.txt are picked and compared (d)."""
+        import asyncio
+        import hashlib
+        self.run_sync()
+        cache = {}
+        views = [savegdrive.DriveView("My Drive", "root")]
+        savegdrive.load_view(self.drive, views[0], cache)
+        for item_id in ("a", "b", "n"):
+            content = b"colleague's edit on Drive"
+            self.drive.items[item_id].update(content=content, size=str(len(content)),
+                                             md5Checksum=hashlib.md5(content).hexdigest(),
+                                             modifiedTime="2026-03-01T00:00:00.000Z")
+            self.drive.change(item_id)
+        (self.root / "Docs/a.txt").write_bytes(b"my local edit")
+        (self.root / "notes.txt").write_bytes(b"my local notes")
+        (self.root / "Docs/b.txt").unlink()
+        app = savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), self.drive, None,
+                                          cache, token=token)
+
+        async def drive_it():
+            async with app.run_test() as pilot:
+                await pilot.press("down", "space", "down", "down", "space", "d")  # Docs, notes.txt
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await pilot.press("y")
+        asyncio.run(drive_it())
+        plan = app.return_value["plan"]
+        return {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+
+    def test_tree_left_open_compares_with_drive_changes_made_since(self):
+        token = savegdrive.start_page_token(self.drive)
+        statuses = self.tree_left_open_while_drive_changes(token)
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")  # not sent over the colleague's edit
+        self.assertEqual(statuses["notes.txt"], "CONFLICT")  # a file picked on its own too
+        self.assertEqual(statuses["Docs/b.txt"], "NEW")  # the change wins over your deletion: not trashed
+
+    def test_tree_left_open_lists_drive_again_when_its_changes_token_expired(self):
+        statuses = self.tree_left_open_while_drive_changes("expired")
+        self.assertEqual(statuses["Docs/a.txt"], "CONFLICT")
+        self.assertEqual(statuses["Docs/b.txt"], "NEW")
+
     def test_again_preview_asks_to_type_delete_for_a_mass_deletion(self):
         self.sync_everything()
         import asyncio
