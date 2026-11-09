@@ -1073,6 +1073,56 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Shared with me/Finance/q3.xlsx").read_bytes(), b"q3")
         self.assertFalse((self.root / "Shared with me/Finance/README.txt").exists())
 
+    def test_names_differing_only_by_case_are_a_conflict(self):
+        # A case-insensitive disk (macOS, exFAT...) stores these as one file: rename one on Drive.
+        self.drive.items.update({
+            "up": file_item("up", "IMG_0001.JPG", "photos", b"camera photo"),
+            "low": file_item("low", "img_0001.jpg", "photos", b"phone photo"),
+            "nfc": file_item("nfc", "Caf\u00e9.txt", "docs", b"nfc"),
+            "nfd": file_item("nfd", "Cafe\u0301.txt", "docs", b"nfd"),
+            "f1": {"id": "f1", "name": "Album", "mimeType": FOLDER, "parent": "root"},
+            "f2": {"id": "f2", "name": "album", "mimeType": FOLDER, "parent": "root"},
+            "x1": file_item("x1", "a.jpg", "f1", b"one"),
+            "x2": file_item("x2", "a.jpg", "f2", b"two"),
+        })
+        statuses, _ = self.run_sync()
+        for path in ("Photos/IMG_0001.JPG", "Photos/img_0001.jpg", "Docs/Caf\u00e9.txt", "Docs/Cafe\u0301.txt",
+                     "Album", "album"):
+            self.assertEqual(statuses[path], "CONFLICT", path)
+        self.assertFalse([path for path in statuses if path.casefold().startswith("album/")])
+        self.assertFalse((self.root / "Photos/IMG_0001.JPG").exists())
+        self.assertFalse((self.root / "Photos/img_0001.jpg").exists())
+        self.run_sync()
+        self.assertEqual(self.drive.uploads, [])
+        self.assertEqual(self.drive.items["up"]["content"], b"camera photo")
+        self.assertEqual(self.drive.items["low"]["content"], b"phone photo")
+
+    def test_case_only_rename_on_drive_is_not_a_deletion(self):
+        # On a case-insensitive disk, "report.txt" and "Report.txt" are one file: a hard link
+        # (and a folder symlink) gives this disk the same two names for one file.
+        self.drive.items.update({
+            "r": file_item("r", "report.txt", "docs", b"report"),
+            "cl": {"id": "cl", "name": "clients", "mimeType": FOLDER, "parent": "root"},
+            "c0": file_item("c0", "contract0.pdf", "cl", b"contract 0"),
+            "c1": file_item("c1", "contract1.pdf", "cl", b"contract 1"),
+        })
+        self.run_sync()
+        self.drive.items["r"]["name"] = "Report.txt"
+        self.drive.items["cl"]["name"] = "Clients"
+        os.link(self.root / "Docs/report.txt", self.root / "Docs/Report.txt")
+        (self.root / "Clients").symlink_to("clients")
+        (self.root / "clients/mine.txt").write_bytes(b"made here")
+        for _ in range(2):
+            statuses, _ = self.run_sync()
+            self.assertEqual(statuses["Docs/Report.txt"], "UNCHANGED")
+            self.assertEqual(statuses["Clients/contract0.pdf"], "UNCHANGED")
+            self.assertFalse([path for path in statuses if path.startswith(("Docs/report", "clients"))])
+        self.assertEqual(statuses["Clients/mine.txt"], "UNCHANGED")  # still seen: sent once
+        self.assertFalse([item for item in self.drive.items.values() if item.get("trashed")])
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / "Docs/report.txt").read_bytes(), b"report")
+        self.assertEqual((self.root / "clients/contract0.pdf").read_bytes(), b"contract 0")
+
     def test_space_line(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)

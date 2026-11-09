@@ -9,6 +9,7 @@ import sys
 import threading
 import textwrap
 import time
+import unicodedata
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2869,29 +2870,37 @@ def collect_plan(
     )
 
 
+def same_name_key(path):
+    """The name a case- or normalization-insensitive disk (macOS, exFAT...) sees: one file for all spellings."""
+    return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
 def mark_duplicate_targets(plan):
     """Two Drive items on one local path: rename one on Drive. Neither syncs, and for folders
-    nothing below them either: which one would get your new files, which one's deletions count?"""
+    nothing below them either: which one would get your new files, which one's deletions count?
+
+    Names that differ only by case or Unicode normalization count as one path: some disks
+    (macOS, exFAT...) store them as one file."""
     folder_targets = Counter(
-        entry["relative_path"]
+        same_name_key(entry["relative_path"])
         for entry in plan
         if entry["kind"] == "FOLDER" and entry["status"] != "SKIPPED"
     )
-    duplicate_folders = {path for path, count in folder_targets.items() if count > 1}
+    duplicate_folders = {key for key, count in folder_targets.items() if count > 1}
     if duplicate_folders:
         plan[:] = [
             entry for entry in plan
-            if duplicate_folders.isdisjoint(entry["relative_path"].parents)
+            if not any(same_name_key(parent) in duplicate_folders for parent in entry["relative_path"].parents)
         ]
     file_targets = Counter(
-        entry["destination"]
+        same_name_key(entry["destination"])
         for entry in plan
         if entry["kind"] == "FILE" and entry["status"] != "SKIPPED"
     )
     for entry in plan:
         if (
-            entry["kind"] == "FILE" and file_targets[entry["destination"]] > 1
-            or entry["kind"] == "FOLDER" and entry["relative_path"] in duplicate_folders
+            entry["kind"] == "FILE" and file_targets[same_name_key(entry["destination"])] > 1
+            or entry["kind"] == "FOLDER" and same_name_key(entry["relative_path"]) in duplicate_folders
         ):
             entry["status"] = "CONFLICT"
             entry["duplicate"] = True
@@ -2945,6 +2954,21 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         if entry.get("item") is None
     }
     new_folders = set()
+    # On a case-insensitive disk (macOS, exFAT...), Drive's "Report.txt" can be the local "report.txt"
+    remote_by_key = {
+        "FILE": {same_name_key(path): path for path in remote_files},
+        "FOLDER": {same_name_key(path): path for path in remote_directories},
+    }
+
+    def drive_spelling(child, relative_path, kind):
+        """The Drive path child is on disk under another spelling, or None."""
+        remote = remote_by_key[kind].get(same_name_key(relative_path))
+        if remote is None or remote == relative_path:
+            return None
+        try:
+            return remote if os.path.samefile(child, destination_root / remote) else None
+        except OSError:
+            return None
 
     def can_send(relative_path):
         parent = relative_path.parent
@@ -2990,13 +3014,15 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         )
         planned_local_paths.add(relative_path)
 
-    def scan_directory(relative_directory):
-        directory = destination_root / relative_directory
+    def scan_directory(relative_directory, directory=None):
+        """directory: where relative_directory is on disk, when the disk spells it differently."""
+        if directory is None:
+            directory = destination_root / relative_directory
         if not directory.is_dir():
             return
 
         for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
-            relative_path = child.relative_to(destination_root)
+            relative_path = relative_directory / child.name
             if relative_path.parts[0] in RESERVED_NAMES:
                 continue
             if (
@@ -3011,17 +3037,24 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 continue  # deleted here; Drive's copy goes to the Drive trash
 
             if child.is_dir():
+                remote = drive_spelling(child, relative_path, "FOLDER")
                 if relative_path in remote_directories:
-                    scan_directory(relative_path)
+                    scan_directory(relative_path, child)
+                elif remote is not None:
+                    scan_directory(remote, child)  # the same folder under Drive's spelling
                 elif relative_path in tracked_directories:
-                    scan_directory(relative_path)
+                    scan_directory(relative_path, child)
                     if relative_path in synced_folders and not any(child.rglob("*")):
                         add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
                 else:
                     add_local_entry(relative_path, "FOLDER")
                     if relative_path in new_folders:
-                        scan_directory(relative_path)  # its files go up too
-            elif child.is_file() and relative_path not in remote_files:
+                        scan_directory(relative_path, child)  # its files go up too
+            elif (
+                child.is_file()
+                and relative_path not in remote_files
+                and drive_spelling(child, relative_path, "FILE") is None  # else Drive's file, under another spelling
+            ):
                 add_local_entry(relative_path, "FILE")
 
     for scope in scopes:
