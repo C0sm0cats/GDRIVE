@@ -1951,7 +1951,8 @@ class SyncTest(unittest.TestCase):
                     return FakeRequest(run)
 
                 self.drive.get = failing_get
-                with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())), \
+                        mock.patch.object(savegdrive.time, "sleep"):  # 500 and 503 are retried first
                     with self.assertRaises(HttpError):  # not "no longer on Drive": its copies would be trashed
                         savegdrive.last_selection(self.drive, savegdrive.load_state(self.root), {})
         self.drive.get = real_get
@@ -2961,6 +2962,60 @@ class TrashedFoldersScalingTest(unittest.TestCase):
 
     def test_local_paths_are_not_compared_with_each_deleted_folder(self):
         self.assertEqual(self.local_entries(2), self.local_entries(40))
+
+
+class DriveCallBatchingTest(unittest.TestCase):
+    """--again and planning fetch saved items and shortcut targets in batches, not one call each (perf 4)."""
+
+    def counting_gets(self, drive):
+        gets = []
+        real = drive.get
+
+        def get(fileId, **kwargs):
+            gets.append(fileId)
+            return real(fileId, **kwargs)
+
+        drive.get = get
+        drive.batches.clear()
+        return gets
+
+    def test_again_gets_the_saved_items_in_batches(self):
+        drive = FakeDrive([{"id": "docs", "name": "Docs", "mimeType": FOLDER, "parent": "root"}]
+                          + [file_item(f"f{index}", f"f{index}.txt", "docs", b"x") for index in range(120)])
+        state = {"last_selection": {"scopes": [], "items": [
+            {"id": f"f{index}", "relative_parent": "Docs", "path": f"Docs/f{index}.txt",
+             "parents": ["docs"], "parent_id": "docs"}
+            for index in range(120)
+        ]}}
+        gets = self.counting_gets(drive)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, _ = savegdrive.last_selection(drive, state, {})
+        self.assertEqual(len(again), 120)
+        self.assertEqual(len(gets), 120)
+        self.assertEqual(drive.batches, [50, 50, 20])  # every get went through a batch
+
+    def test_plan_resolves_file_shortcuts_in_batches(self):
+        drive = FakeDrive([{"id": "links", "name": "Links", "mimeType": FOLDER, "parent": "root"}] + [
+            item for index in range(60) for item in (
+                file_item(f"t{index}", f"target{index}.txt", "elsewhere", f"t{index}".encode()),
+                {"id": f"s{index}", "name": f"Link {index}.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                 "parent": "links", "shortcutDetails": {"targetId": f"t{index}", "targetMimeType": "text/plain"}},
+            )
+        ])
+        cache = {}
+        nodes, _ = savegdrive.collect_drive_tree(drive, "root", cache)
+        links = next(node for node in nodes if node["display_path"] == "Links")
+        selections = []
+        savegdrive.add_selected_item(selections, links["item"], links["relative_parent"])
+        gets = self.counting_gets(drive)
+        with tempfile.TemporaryDirectory() as temp:
+            plan = savegdrive.build_plan(drive, selections, [], Path(temp), {"files": {}, "folders": {}}, cache)
+        files = {entry["relative_path"].as_posix(): entry for entry in plan if entry["kind"] == "FILE"}
+        self.assertEqual(len(files), 60)
+        self.assertEqual(files["Links/Link 7.txt"]["item"]["md5Checksum"], drive.items["t7"]["md5Checksum"])
+        self.assertTrue(files["Links/Link 7.txt"]["item"]["readonly"])
+        self.assertEqual(len(gets), 60)
+        self.assertEqual(drive.batches, [50, 10])  # every get went through a batch
 
 
 class ApplyPlanPhasesTest(unittest.TestCase):

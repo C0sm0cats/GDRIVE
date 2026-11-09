@@ -426,6 +426,41 @@ def list_folders(service, folder_ids, cache):
         cache[folder_id] = sort_items(items)
 
 
+def get_items(service, ids, fields):
+    """The metadata of every id in batched API calls: id -> item, or the HttpError Drive gave for it."""
+    pending = list(dict.fromkeys(ids))
+    found = {}
+    attempts = Counter()
+
+    while pending:
+        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
+        retry = []
+
+        def callback(request_id, response, exception, chunk=chunk):
+            item_id = chunk[int(request_id)]
+            if exception is None:
+                found[item_id] = response
+            elif is_retryable(exception) and attempts[item_id] < API_RETRIES:
+                attempts[item_id] += 1
+                retry.append(item_id)
+            else:
+                found[item_id] = exception
+
+        batch = service.new_batch_http_request(callback=callback)
+        for index, item_id in enumerate(chunk):
+            batch.add(
+                service.files().get(fileId=item_id, fields=fields, supportsAllDrives=True), request_id=str(index)
+            )
+        batch.execute()
+        debug(f"Got {plural(len(chunk), 'item')}")
+        if retry:
+            delay = min(2 ** max(attempts[item_id] for item_id in retry), 30)
+            debug(f"Drive rate limit, retrying {len(retry)} call(s) in {delay}s")
+            time.sleep(delay)
+            pending = retry + pending
+    return found
+
+
 def list_children(service, folder_id, cache):
     list_folders(service, [folder_id], cache)
     return cache[folder_id]
@@ -563,23 +598,30 @@ def apply_changes(service, snapshot):
     return cache, response["newStartPageToken"]
 
 
-def resolve_file_shortcut(service, item):
-    if item["mimeType"] != SHORTCUT_MIME_TYPE:
-        return item
-    if is_folder(item):
+SHORTCUT_TARGET_FIELDS = (
+    "id,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)"
+)
+
+
+def is_file_shortcut(item):
+    return item["mimeType"] == SHORTCUT_MIME_TYPE and not is_folder(item)
+
+
+def resolve_file_shortcut(service, item, targets=None):
+    """The target of a file shortcut, named like it; targets: the ones get_items already fetched."""
+    if not is_file_shortcut(item):
         return item
 
-    target = (
-        service.files()
-        .get(
-            fileId=effective_id(item),
-            fields="id,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)",
-            supportsAllDrives=True,
+    target = (targets or {}).get(effective_id(item))
+    if target is None:
+        target = (
+            service.files()
+            .get(fileId=effective_id(item), fields=SHORTCUT_TARGET_FIELDS, supportsAllDrives=True)
+            .execute(num_retries=API_RETRIES)
         )
-        .execute(num_retries=API_RETRIES)
-    )
-    target["name"] = item["name"]
-    return target
+    elif isinstance(target, Exception):
+        raise target
+    return dict(target, name=item["name"])
 
 
 def folder_name(service, folder_id):
@@ -2729,20 +2771,23 @@ def last_selection(service, state, cache, kept=None):
     add_selected_items(selections, from_roots)
     # Selected so far, kept up to date as items are picked, then added at once.
     index = selection_index(selections)
+    fetched = get_items(
+        service,
+        [
+            saved_item["id"] for saved_item in saved["items"]
+            if not already_selected(Path(saved_item["path"]), saved_item["id"], index)
+        ],
+        ITEM_FIELDS,
+    )
     picked = []
     for saved_item in saved["items"]:
         relative_parent = Path(saved_item["relative_parent"])
         if already_selected(Path(saved_item["path"]), saved_item["id"], index):
             continue  # already there through a whole view
-        try:
-            item = (
-                service.files()
-                .get(fileId=saved_item["id"], fields=ITEM_FIELDS, supportsAllDrives=True)
-                .execute(num_retries=API_RETRIES)
-            )
-        except HttpError as error:
-            if error.status_code != 404:
-                raise
+        item = fetched[saved_item["id"]]
+        if isinstance(item, Exception):
+            if not isinstance(item, HttpError) or item.status_code != 404:
+                raise item
             item = None
         from_trash = Path(saved_item["path"]).parts[:1] == (TRASH_DIR,)
         if item is not None and item.get("trashed") and from_trash:
@@ -3060,8 +3105,12 @@ def collect_plan(
     tracked_folders=None,
     visited=None,
     parent_closed=False,
+    targets=None,
 ):
-    """parent_closed: the Drive parent takes no new items (shared with you read only)."""
+    """parent_closed: the Drive parent takes no new items (shared with you read only).
+
+    targets: the file shortcut targets build_plan fetched in batches, by id.
+    """
     mime_type = effective_mime_type(item)
     relative_path = relative_parent / local_name(item)
     destination = destination_root / relative_path
@@ -3140,12 +3189,13 @@ def collect_plan(
                 tracked_folders,
                 visited,
                 not can(item, "canAddChildren"),
+                targets,
             )
         return
 
     shortcut = item["mimeType"] == SHORTCUT_MIME_TYPE or item.get("readonly")
     try:
-        item = resolve_file_shortcut(service, item)
+        item = resolve_file_shortcut(service, item, targets)
     except HttpError as error:
         if error.status_code not in {403, 404}:
             raise
@@ -3589,10 +3639,14 @@ def moved_scopes(state, selections):
 
 def build_plan(service, selections, scopes, destination_root, state, cache, on_item=lambda: None, roots=None):
     """The sync plan of the selection; roots maps view base paths to their Drive folder id (None: read only)."""
-    prefetch_folders(
-        service,
-        [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
-        cache,
+    folder_ids = [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])]
+    prefetch_folders(service, folder_ids, cache)
+    # Every file shortcut below the selection, resolved in batches, not one call each while planning.
+    shortcuts = [entry["item"] for entry in selections] + [
+        item for folder_id in reachable_folders(cache, folder_ids) for item in cache[folder_id]
+    ]
+    targets = get_items(
+        service, [effective_id(item) for item in shortcuts if is_file_shortcut(item)], SHORTCUT_TARGET_FIELDS
     )
     plan = []
     tracked_folders = tracked_folder_paths(state)
@@ -3609,6 +3663,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             cache,
             tracked_folders=tracked_folders,
             visited=visited,
+            targets=targets,
         )
         for _ in range(len(plan) - before):
             on_item()
