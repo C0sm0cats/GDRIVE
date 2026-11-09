@@ -5289,6 +5289,7 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
     """Apply the confirmed plan, phase by phase. Transfers run in jobs threads, each with its own Drive client.
     Whatever happens, finished transfers and deletions are saved in the state."""
     results = Counter()
+    results.failures = []  # "path: reason" of each error, shown above the tree when it comes back
     progress = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -5300,6 +5301,8 @@ def apply_plan(service, plan, destination_root, state, jobs=1, make_service=None
     )
 
     def report(mark, text):
+        if mark == "[red]✗[/]":
+            results.failures.append(printable(text))
         progress.console.print(f"{mark} {escape(printable(text))}")
 
     forgotten = []  # deleted paths, forgotten in one pass before the state is saved
@@ -5491,12 +5494,23 @@ def last_sync_summary(plan):
     return text
 
 
+NOTICE_FAILURES = 3  # errors listed above the tree; all of them stay in the terminal
+
+
 def result_notice(plan, results):
     """The last sync's result, shown above the tree when it comes back."""
     text = Text()
     if not in_sync(plan):
         text.append("Done  ", style="bold")
         text.append_text(Text.from_markup(results_summary(results)))
+        failures = getattr(results, "failures", [])
+        for failure in failures[:NOTICE_FAILURES]:
+            text.append("\n✗ ", style="red")
+            text.append(failure)
+        if len(failures) > NOTICE_FAILURES:
+            text.append(
+                f"\n… and {len(failures) - NOTICE_FAILURES} more, listed in the terminal after you quit", style="dim"
+            )
     else:
         text.append("✓ ", style="green")
         text.append("Everything was in sync.")

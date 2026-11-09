@@ -2278,6 +2278,30 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(self.drive.items["a"]["trashed"])
         self.assertFalse((self.root / "Docs/a.txt").exists())
 
+    def test_failed_transfers_are_named_above_the_tree(self):
+        # ux 13: the tree's result names each failed file and its reason, not just "1 error".
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"bravo v2"))
+
+        def failing_fetch(service, item, file_handle, stop=None):
+            raise OSError(f"disk full for {item['name']}")
+
+        plan, state = self.preview()
+        with mock.patch.object(savegdrive, "fetch_media", failing_fetch):
+            results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 2)
+        notice = savegdrive.result_notice(plan, results).plain
+        self.assertIn("2 errors", notice)
+        self.assertIn("✗ Docs/a.txt: disk full for a.txt", notice)
+        self.assertIn("✗ Docs/b.txt: disk full for b.txt", notice)
+
+        results.failures = [f"f{index}.txt: down" for index in range(5)]
+        notice = savegdrive.result_notice(plan, results).plain
+        self.assertIn("✗ f2.txt: down", notice)
+        self.assertNotIn("f3.txt", notice)
+        self.assertIn("… and 2 more, listed in the terminal after you quit", notice)
+
     def test_failed_download_is_counted_in_the_result(self):
         # tests 54: the result above the tree and in the terminal counts the failed transfer, not just "Done".
         self.run_sync()
