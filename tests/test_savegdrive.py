@@ -2888,6 +2888,30 @@ class SyncTest(unittest.TestCase):
                 saved = {record["path"]: record for record in savegdrive.load_state(root)["files"].values()}
                 self.assertEqual(saved["Docs/a.txt"]["remote_signature"], shown["a"])  # downloaded before: no conflict
 
+    def test_disk_trash_at_the_destination_root_is_never_sent(self):
+        # security 18: with a disk root as the destination, send2trash puts what it removes in <root>/.Trash-<uid>
+        def disk_trash_local(path):
+            trash = self.root / ".Trash-1000"
+            (trash / "files").mkdir(parents=True, exist_ok=True)
+            (trash / "info").mkdir(exist_ok=True)
+            (trash / "info" / f"{path.name}.trashinfo").write_text(f"[Trash Info]\nPath={path}\n")
+            os.replace(path, trash / "files" / path.name)
+
+        self.run_sync()
+        for name in (".Trash/1000", ".Trashes/501", "$RECYCLE.BIN/S-1-5-21"):
+            (self.root / name).mkdir(parents=True)
+            (self.root / name / "old.txt").write_bytes(b"deleted here")
+        del self.drive.items["a"]
+        with mock.patch.object(savegdrive, "trash_local", disk_trash_local):
+            statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "TRASH_LOCAL")
+        self.assertTrue((self.root / ".Trash-1000/files/a.txt").exists())
+        names_before = {item["name"] for item in self.drive.items.values()}
+        statuses, _ = self.run_sync()
+        trash_names = (".Trash-1000", ".Trash", ".Trashes", "$RECYCLE.BIN")
+        self.assertEqual([path for path in statuses if path.split("/")[0] in trash_names], [])
+        self.assertEqual({item["name"] for item in self.drive.items.values()}, names_before)
+
     def test_part_file_left_by_a_killed_run_is_removed(self):
         self.run_sync()
         left = self.root / "Docs" / f".b.txt{savegdrive.PART_SUFFIX}"

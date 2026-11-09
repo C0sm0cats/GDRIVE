@@ -76,6 +76,12 @@ RESERVED_NAMES = {
     f"{LEGACY_REMOTE_CACHE_NAME}.tmp",
 }
 RESERVED_PATHS = {Path(name) for name in RESERVED_NAMES}
+# The system trash of a disk whose root is the destination (freedesktop, macOS, Windows): never sent to Drive.
+DISK_TRASH_NAMES = {".Trash", ".Trashes", "$RECYCLE.BIN"}
+
+
+def is_disk_trash(name):
+    return name in DISK_TRASH_NAMES or name.startswith(".Trash-")
 SHARED_WITH_ME = "sharedWithMe"  # pseudo folder id: the items others shared with you
 SHARED_WITH_ME_DIR = "Shared with me"
 SHARED_DRIVES_DIR = "Shared drives"
@@ -3664,7 +3670,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
 
         for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
             relative_path = relative_directory / child.name
-            if relative_path.parts[0] in RESERVED_NAMES:
+            if relative_path.parts[0] in RESERVED_NAMES or is_disk_trash(relative_path.parts[0]):
                 continue
             if (
                 relative_directory == Path()
@@ -3728,6 +3734,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             kind = "FOLDER" if child.is_dir() else "FILE"
             if (
                 relative_path.parts[0] in RESERVED_NAMES
+                or is_disk_trash(relative_path.parts[0])
                 or (parent == Path() and child.name in VIEW_DIRS)
                 or child.is_symlink()
                 or child.name.endswith(PART_SUFFIX)
