@@ -2916,6 +2916,14 @@ def tracked_below(state, relative_path):
     return [record for record in state["files"].values() if record.get("path", "").startswith(prefix)]
 
 
+def synced_here_before(state, relative_path, folder_id, tracked_folders):
+    """This Drive folder was synced at this path: gone here, it was deleted here."""
+    known_id = state.get("folders", {}).get(relative_path.as_posix())
+    if known_id is not None:
+        return known_id == folder_id  # another Drive folder by that name is new, not deleted here
+    return relative_path.as_posix() in tracked_folders  # a state without folder ids: its files tell
+
+
 def tracked_folder_paths(state):
     """Folders (posix paths) holding synced files: one pass, so a plan tests them without rereading the state."""
     folders = set()
@@ -3006,10 +3014,7 @@ def collect_plan(
             and not item.get("readonly")
             and not is_readonly_path(relative_path)
             and can(item, "canTrash")
-            and (
-                relative_path.as_posix() in tracked_folders
-                or relative_path.as_posix() in state.get("folders", {})
-            )
+            and synced_here_before(state, relative_path, folder_id, tracked_folders)
             and remote_subtree_unchanged(service, folder_id, relative_path, state, cache)
         ):
             status = "TRASH_REMOTE"  # synced before, the whole folder was deleted here

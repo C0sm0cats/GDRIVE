@@ -924,6 +924,19 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(self.drive.items["club"].get("trashed"))
         self.assertTrue((self.root / "Club/Photos 2026").is_dir())
 
+    def test_folder_made_again_on_drive_under_a_synced_name_comes_down(self):
+        self.run_sync()
+        import shutil
+        for key in ["photos", "p"]:
+            del self.drive.items[key]
+        shutil.rmtree(self.root / "Photos")  # deleted on Drive and here
+        self.drive.items["photos2"] = {"id": "photos2", "name": "Photos", "mimeType": FOLDER, "parent": "root"}
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Photos"], "NEW")
+        self.assertFalse(self.drive.is_trashed(self.drive.items["photos2"]))
+        self.assertEqual(results["FOLDER_TRASH_REMOTE"], 0)
+        self.assertTrue((self.root / "Photos").is_dir())
+
     def test_read_only_items_are_never_sent_or_trashed(self):
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False, "canTrash": True, "canEdit": True}
         for key in ["a", "b"]:
