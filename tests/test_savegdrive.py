@@ -1431,10 +1431,11 @@ class SyncTest(unittest.TestCase):
                 mock.patch.object(savegdrive, "authenticate", lambda: None), \
                 mock.patch.object(savegdrive, "build", lambda *args, **kwargs: self.drive), \
                 mock.patch.object(savegdrive, "signed_in_account", lambda service: None), \
-                mock.patch.object(savegdrive, "console", Console(file=io.StringIO())), \
+                mock.patch.object(savegdrive, "console", Console(file=io.StringIO())) as output, \
                 mock.patch.object(sys.stdin, "isatty", lambda: isatty), \
                 mock.patch.object(sys.stdout, "isatty", lambda: isatty):
             savegdrive.main()
+        return output.file.getvalue()
 
     def test_again_after_an_upload_keeps_the_sent_file(self):
         self.sync_everything()
@@ -1644,6 +1645,34 @@ class SyncTest(unittest.TestCase):
         self.assertIsInstance(screens[0], savegdrive.ConfirmScreen)
         self.assertEqual(screens[0].word, "delete")
         self.assertFalse(self.drive.items["docs"].get("trashed"))
+
+    def test_again_preview_cancelled_changes_nothing(self):
+        # The --again preview in a terminal: esc, n and q cancel it, y applies it.
+        self.sync_everything()
+        import asyncio
+        (self.root / "Docs" / "a.txt").unlink()
+
+        def press(key):
+            def run(app):
+                async def drive_it():
+                    async with app.run_test() as pilot:
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, savegdrive.StandalonePreviewScreen)
+                        await pilot.press(key)
+                        await pilot.pause()
+                asyncio.run(drive_it())
+                return app.return_value
+            return run
+
+        for key in ("q", "escape", "n"):
+            with self.subTest(key=key), mock.patch.object(savegdrive.PreviewApp, "run", press(key)):
+                output = self.run_main("--again", isatty=True)
+                self.assertIn("Cancelled. Nothing was changed.", output)
+                self.assertFalse(self.drive.items["a"].get("trashed"))
+        with mock.patch.object(savegdrive.PreviewApp, "run", press("y")):
+            output = self.run_main("--again", isatty=True)
+        self.assertNotIn("Cancelled", output)
+        self.assertTrue(self.drive.items["a"].get("trashed"))
 
     def test_parallel_downloads(self):
         for i in range(20):
