@@ -1573,8 +1573,14 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             savegdrive.apply_plan(self.drive, plan, self.root, state)
         # A later My Drive-only run does not report the view folders as local only.
-        _, results = self.run_sync()
+        statuses, results = self.run_sync()
         self.assertEqual(results["FOLDER_LOCAL_ONLY"], 0)
+        # Nor does it touch the copies kept for the other views.
+        self.assertEqual(
+            [path for path in statuses if path.split("/")[0] in ("Shared with me", "Shared drives")], []
+        )
+        self.assertEqual((self.root / "Shared with me/from Ann.pdf").read_bytes(), b"pdf")
+        self.assertEqual((self.root / "Shared drives/Team/plan.txt").read_bytes(), b"plan")
 
     def sync_views(self, views, picked):
         """Select every item at the top of the picked views, like a whole tab, then plan and apply."""
