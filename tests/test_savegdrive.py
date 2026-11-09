@@ -829,6 +829,49 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Team/plan.txt").read_bytes(), b"plan")
         self.assertEqual((self.root / "Team/Sub/deep.txt").read_bytes(), b"deep")
 
+    def test_folder_shortcut_to_its_parent_skipped_not_whole_sync(self):
+        # A "back to the project" shortcut Docs/Back -> Docs: skipped, never followed forever.
+        self.drive.items["back"] = {"id": "back", "name": "Back", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                                    "parent": "docs", "shortcutDetails": {"targetId": "docs", "targetMimeType": FOLDER}}
+        real_list_folders, calls = savegdrive.list_folders, []
+
+        def bounded_list_folders(*args):
+            calls.append(args)
+            if len(calls) > 50:
+                raise AssertionError("listing never ends")
+            return real_list_folders(*args)
+
+        with mock.patch.object(savegdrive, "list_folders", bounded_list_folders):
+            # A fresh cache, as on a first plan: build_plan lists every level itself.
+            nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", {})
+            selections = []
+            for node in nodes:
+                if node["parent"] is None:
+                    savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+            plan = savegdrive.build_plan(self.drive, selections, savegdrive.build_local_scopes(selections, browsed),
+                                         self.root, savegdrive.load_state(self.root), {})
+            self.assertEqual({entry["relative_path"].as_posix(): entry["status"] for entry in plan}["Docs/Back"],
+                             "SKIPPED")
+            # The same stop without build_plan's record of planned folders.
+            alone = []
+            savegdrive.collect_plan(self.drive, self.drive.items["docs"], Path(), self.root,
+                                    savegdrive.load_state(self.root), alone, {})
+            self.assertEqual({entry["relative_path"].as_posix(): entry["status"] for entry in alone}["Docs/Back"],
+                             "SKIPPED")
+
+            statuses, results = self.run_sync()
+            self.assertEqual(statuses["Docs/Back"], "SKIPPED")
+            self.assertEqual(results["FILE_NEW"], 5)
+            self.assertFalse((self.root / "Docs/Back").exists())
+
+            # Docs deleted here: the loop is not checked forever, and Docs is not trashed on Drive.
+            shutil.rmtree(self.root / "Docs")
+            statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs"], "NEW")
+        self.assertEqual(statuses["Docs/Back"], "SKIPPED")
+        self.assertFalse(self.drive.items["docs"].get("trashed"))
+        self.assertFalse(self.drive.items["back"].get("trashed"))
+
     def test_folder_reached_twice_syncs_once(self):
         # Crossed shortcuts from an editor of a shared folder: one copy, not 2^levels.
         self.drive.items.update({item["id"]: item for item in crossed_shortcuts(12)})
