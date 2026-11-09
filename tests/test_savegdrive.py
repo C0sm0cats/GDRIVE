@@ -750,6 +750,41 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(self.drive.items[sent[0]["parent"]]["name"], "Docs")
 
+    def sync_picked(self, *paths, again=False):
+        """Sync the picked tree paths (or, with again, the last selection) like run_sync: plan, apply, remember."""
+        state = savegdrive.load_state(self.root)
+        if again:
+            with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                selections, scopes = savegdrive.last_selection(self.drive, state, {})
+        else:
+            nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", {})
+            by_path = {node["display_path"]: node for node in nodes}
+            selections = []
+            for path in paths:
+                savegdrive.add_selected_item(selections, by_path[path]["item"], by_path[path]["relative_parent"])
+            scopes = savegdrive.build_local_scopes(selections, browsed)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, {})
+        savegdrive.remember_selection(state, selections, scopes)
+        self.apply(plan, state)
+        return {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+
+    def test_picked_items_renamed_on_drive_leave_no_old_copy(self):
+        # A file picked alone, renamed on Drive, then --again: the old copy goes to your trash.
+        self.sync_picked("notes.txt")
+        self.drive.items["n"]["name"] = "notes-2026.txt"
+        statuses = self.sync_picked(again=True)
+        self.assertEqual(statuses["notes.txt"], "TRASH_LOCAL")
+        self.assertFalse((self.root / "notes.txt").exists())
+        self.assertEqual((self.root / "notes-2026.txt").read_bytes(), b"notes")
+        # A folder picked in the tree, edited here, renamed on Drive, picked again under its new name.
+        self.sync_picked("Photos")
+        (self.root / "Photos/beach.jpg").write_bytes(b"retouched here")
+        self.drive.items["photos"]["name"] = "Photos 2026"
+        statuses = self.sync_picked("Photos 2026")
+        self.assertEqual(statuses["Photos/beach.jpg"], "UPLOAD_NEW")  # the change is not lost
+        self.assertIn(b"retouched here", [item.get("content") for item in self.drive.items.values()])
+        self.assertEqual((self.root / "Photos 2026/beach.jpg").read_bytes(), b"jpeg")
+
     def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
         self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}
         self.drive.items["club_photos"] = {"id": "club_photos", "name": "Photos 2026", "mimeType": FOLDER,

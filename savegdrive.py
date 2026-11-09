@@ -3156,6 +3156,19 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             add_local_entry(scope, "FILE")
 
 
+def moved_scopes(state, selections):
+    """Where items of the last selection were, when they are picked again at another path (renamed or moved
+    on Drive since): the old copy is scanned like an item deleted on Drive, to your trash or sent back if changed."""
+    now = {}
+    for entry in selections:
+        now.setdefault(entry["item"].get("id"), set()).add(selected_path(entry))
+    return [
+        Path(saved_item["path"])
+        for saved_item in (state.get("last_selection") or {}).get("items", [])
+        if saved_item.get("id") in now and Path(saved_item["path"]) not in now[saved_item["id"]]
+    ]
+
+
 def build_plan(service, selections, scopes, destination_root, state, cache, on_item=lambda: None, roots=None):
     """The sync plan of the selection; roots maps view base paths to their Drive folder id (None: read only)."""
     prefetch_folders(
@@ -3192,6 +3205,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
                 and not entry.get("duplicate") and not entry.get("arrived")
                 else None
             )
+    scopes = compact_scopes([*scopes, *moved_scopes(state, selections)])
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
     for entry in plan:
         parent_id = remote_folders.get(entry["relative_path"].parent)
