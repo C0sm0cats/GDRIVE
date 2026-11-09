@@ -130,7 +130,7 @@ class FakeDrives:
         self.drive = drive
 
     def list(self, **kwargs):
-        return FakeRequest(lambda: {"drives": self.drive.shared_drives})
+        return fields_request(lambda: {"drives": self.drive.shared_drives}, kwargs.get("fields"))
 
 
 class FakeDrive:
@@ -2609,6 +2609,60 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["t"]["content"], b"plan by Ann")
         self.assertEqual(list(self.trash.iterdir()), [])
         self.assertEqual((self.root / "Shared drives/Team/Projects/budget.txt").read_bytes(), b"budget")
+
+    def test_new_item_at_the_top_of_a_read_only_view_stays_local(self):
+        # A shared drive or a --folder-id folder you only read: what you add at its top cannot go up.
+        readonly = {"capabilities": {"canEdit": False, "canAddChildren": False, "canTrash": False}}
+        self.drive.shared_drives = [{"id": "team", "name": "Team", **readonly}]
+        self.drive.items.update({
+            "sub": {"id": "sub", "name": "Sub", "mimeType": FOLDER, "parent": "team", **readonly},
+            "r": file_item("r", "rules.pdf", "team", b"rules", **readonly),
+            "shared": {"id": "shared", "name": "Club", "mimeType": FOLDER, "parent": "nobody", **readonly},
+            "n": file_item("n", "notes.txt", "shared", b"notes", **readonly),
+        })
+        views = savegdrive.drive_views(self.drive, "root")
+        team = next(view for view in views if view.root_id == "team")
+        cache = {}
+        savegdrive.load_view(self.drive, team, cache)
+        selections = []
+        for entry in team.children_of.get(None, []):
+            savegdrive.add_selected_item(selections, entry["item"], entry["relative_parent"])
+        scopes = savegdrive.build_local_scopes(selections, team.browsed, [team.base])
+        state = savegdrive.load_state(self.root)
+        token = savegdrive.start_page_token(self.drive)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache,
+                                     roots=savegdrive.view_roots(views))
+        roots = [(team.root_id, team.base, team.can_add)]  # a whole view, as the selector saves it
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            savegdrive.run_sync(mock.Mock(jobs=1), self.drive, lambda: self.drive, plan, selections, scopes,
+                                roots, self.root, state, cache, token)
+        top = self.root / "Shared drives/Team"
+        (top / "mine.txt").write_bytes(b"mine")
+        (top / "Sub/mine2.txt").write_bytes(b"mine too")
+        (top / "NewDir").mkdir()
+        (top / "NewDir/x.txt").write_bytes(b"x")
+        new = ["Shared drives/Team/mine.txt", "Shared drives/Team/NewDir",  # NewDir/x.txt comes with it
+               "Shared drives/Team/Sub/mine2.txt"]
+
+        state = savegdrive.load_state(self.root)
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, {},
+                                     roots=savegdrive.view_roots(views))
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual({path: statuses[path] for path in new}, dict.fromkeys(new, "LOCAL_ONLY"))
+        # --again and s: the saved root remembers it is read only.
+        self.assertIs(state["last_selection"]["roots"][0]["can_add"], False)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, state, {}, [])
+        plan = savegdrive.build_plan(self.drive, again, again_scopes, self.root, state, {},
+                                     roots=savegdrive.upload_roots(savegdrive.saved_roots(state)))
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual({path: statuses[path] for path in new}, dict.fromkeys(new, "LOCAL_ONLY"))
+        # An older saved root, without can_add, keeps sending there.
+        self.assertEqual(savegdrive.upload_roots([("team", team.base)]), {team.base: "team"})
+
+        [club] = savegdrive.drive_views(self.drive, "shared")  # --folder-id on a folder shared read only
+        self.assertEqual((club.name, club.can_add), ("Club", False))
+        self.assertEqual(savegdrive.view_roots([club]), {Path(): None})
 
     def test_shared_views_get_their_own_folders(self):
         self.drive.items["s"] = file_item("s", "from Ann.pdf", "nobody", b"pdf", shared=True)

@@ -705,15 +705,15 @@ def resolve_file_shortcut(service, item, targets=None):
     return dict(target, name=item["name"])
 
 
-def folder_name(service, folder_id):
+def drive_folder(service, folder_id):
+    """The name of the --folder-id folder, and whether you may add files to it."""
     if folder_id == "root":
-        return "My Drive"
-    folder = (
+        return {"name": "My Drive"}
+    return (
         service.files()
-        .get(fileId=folder_id, fields="name", supportsAllDrives=True)
+        .get(fileId=folder_id, fields="name,capabilities(canAddChildren)", supportsAllDrives=True)
         .execute(num_retries=API_RETRIES)
     )
-    return folder["name"]
 
 
 def collect_drive_tree(service, root_folder_id, cache, on_progress=lambda folders, items: None, base=Path()):
@@ -1823,10 +1823,11 @@ class DriveTree(Tree):
 class DriveView:
     """One root shown in the tree: My Drive, Shared with me, or a shared drive."""
 
-    def __init__(self, name, root_id, base=Path()):
+    def __init__(self, name, root_id, base=Path(), can_add=True):
         self.name = name
         self.root_id = root_id
         self.base = base
+        self.can_add = can_add  # False: a shared drive or folder you only read, new files at its top stay here
         self.nodes = None  # loaded on first display
         self.browsed = {}
         self.children_of = {}
@@ -1861,7 +1862,8 @@ class DriveView:
 def drive_views(service, folder_id):
     """My Drive, Shared with me and every shared drive, or only the folder given with --folder-id."""
     if folder_id != "root":
-        return [DriveView(folder_name(service, folder_id), folder_id)]
+        folder = drive_folder(service, folder_id)
+        return [DriveView(folder["name"], folder_id, can_add=can(folder, "canAddChildren"))]
     root_id = (
         service.files().get(fileId="root", fields="id").execute(num_retries=API_RETRIES)["id"]
     )
@@ -1871,7 +1873,8 @@ def drive_views(service, folder_id):
     while True:
         response = (
             service.drives()
-            .list(pageSize=100, pageToken=page_token, fields="nextPageToken,drives(id,name)")
+            .list(pageSize=100, pageToken=page_token,
+                  fields="nextPageToken,drives(id,name,capabilities(canAddChildren))")
             .execute(num_retries=API_RETRIES)
         )
         for drive in response.get("drives", []):
@@ -1898,23 +1901,25 @@ def shared_drive_views(drives):
             unique, number = f"{name} ({number})", number + 1
         taken.add(unique.casefold())
         shown = drive["name"] if unique == safe_name(drive["name"]) else unique  # tells the tabs apart
-        views.append(DriveView(shown, drive["id"], Path(SHARED_DRIVES_DIR) / unique))
+        views.append(
+            DriveView(shown, drive["id"], Path(SHARED_DRIVES_DIR) / unique, can(drive, "canAddChildren"))
+        )
     return views
 
 
 def upload_roots(roots):
-    """Each view's local base and the Drive folder new local files go to, from (root id, base) pairs
-    (None: Shared with me, Trash, or a base two roots share: which one would get the files?)."""
+    """Each view's local base and the Drive folder new local files go to, from (root id, base[, can add])
+    (None: Shared with me, Trash, read only, or a base two roots share: which one would get the files?)."""
     parents = {}
-    for root_id, base in roots:
-        parent = None if root_id in {SHARED_WITH_ME, TRASH} else root_id
+    for root_id, base, *can_add in roots:
+        parent = None if root_id in {SHARED_WITH_ME, TRASH} or can_add == [False] else root_id
         parents[base] = parent if parents.get(base, parent) == parent else None
     return parents
 
 
 def view_roots(views):
-    """Each view's local base and the Drive folder new local files go to (None: Shared with me, Trash)."""
-    return upload_roots((view.root_id, view.base) for view in views)
+    """Each view's local base and the Drive folder new local files go to (None: Shared with me, Trash, read only)."""
+    return upload_roots((view.root_id, view.base, view.can_add) for view in views)
 
 
 def load_view(service, view, cache, on_progress=lambda folders, items: None):
@@ -2177,10 +2182,8 @@ class DriveSelectorApp(App):
             state = load_state(destination)
             kept = []
             selections, scopes = last_selection(service, state, self.cache, kept)
-            roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
-            upload_roots = {base: (None if root_id in {SHARED_WITH_ME, TRASH} else root_id)
-                            for root_id, base in roots}
-            plan = build_plan(service, selections, scopes, destination, state, self.cache, roots=upload_roots)
+            roots = saved_roots(state)
+            plan = build_plan(service, selections, scopes, destination, state, self.cache, roots=upload_roots(roots))
             if self.keep_both:
                 set_keep_both(plan, plan, True)
             result = {"plan": plan, "selections": selections, "scopes": scopes, "destination": destination,
@@ -2525,7 +2528,8 @@ class DriveSelectorApp(App):
         """The Drive folder the entry sits in, if new files may go there (None: read only, behind a shortcut):
         --again sends it back there when it is deleted on Drive but changed here."""
         if entry["parent"] is None:
-            return None if self.view.root_id in {SHARED_WITH_ME, TRASH} else self.view.root_id
+            readonly = self.view.root_id in {SHARED_WITH_ME, TRASH} or not self.view.can_add
+            return None if readonly else self.view.root_id
         parent = self.nodes[entry["parent"]]
         folder = parent["item"]
         if not can(folder, "canAddChildren") or folder.get("readonly"):
@@ -2949,7 +2953,10 @@ def remember_selection(state, selections, scopes, roots=(), kept=()):
     kept are saved items now in the Drive trash, stored as they were: restored there, they come back.
     """
     state["last_selection"] = {
-        "roots": [{"id": root_id, "base": base.as_posix()} for root_id, base in roots],
+        "roots": [
+            dict({"id": root_id, "base": base.as_posix()}, **({"can_add": False} if can_add == [False] else {}))
+            for root_id, base, *can_add in roots
+        ],
         "items": [
             {
                 "id": entry["item"]["id"],
@@ -2963,6 +2970,14 @@ def remember_selection(state, selections, scopes, roots=(), kept=()):
         ] + [dict(saved_item) for saved_item in kept],
         "scopes": [scope.as_posix() for scope in scopes],
     }
+
+
+def saved_roots(state):
+    """The views --again and s sync entirely, as (root id, base, can add): a root saved before can_add can add."""
+    return [
+        (root["id"], Path(root["base"]), root.get("can_add", True))
+        for root in state["last_selection"].get("roots", [])
+    ]
 
 
 def has_last_selection(state):
@@ -5368,7 +5383,7 @@ def run_sync(args, service, make_service, plan, selections, scopes, roots, desti
     results = apply_plan(service, plan, destination_root, state, args.jobs, make_service)
     save_snapshot(
         destination_root, token, cache,
-        [root_id for root_id, _ in roots]
+        [root[0] for root in roots]
         + [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
     )
     if in_sync(plan):
@@ -5570,7 +5585,7 @@ def main():
             more = f" and {len(selections) - 5} more" if len(selections) > 5 else ""
             who = f"{escape(account)} " if account else ""
             console.print(f"[bold]Again[/]  {names}{more} [dim]{who}→ {escape(str(destination_root))}[/]")
-            roots = [(root["id"], Path(root["base"])) for root in state["last_selection"].get("roots", [])]
+            roots = saved_roots(state)
             again_roots = upload_roots(roots)
             with console.status("[dim]Comparing with local files…[/]") as status:
                 checked = 0
@@ -5629,7 +5644,7 @@ def main():
             roots = result.get("roots")  # from s: the last selection's own
             if roots is None:
                 roots = [
-                    (view_.root_id, view_.base) for view_ in views
+                    (view_.root_id, view_.base, view_.can_add) for view_ in views
                     if view_.nodes and fully_selected(view_.browsed.get(view_.base, []), view_.base, selections)
                 ]
             if args.yes:
