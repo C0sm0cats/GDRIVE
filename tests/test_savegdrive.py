@@ -2372,6 +2372,21 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Everything was in sync", notice)
         self.assertIn("1 conflict kept", notice)
 
+    def test_last_sync_summary_line(self):
+        # tests 43: the start line counts conflicts and Drive deletions, and says in sync only when it is.
+        def summary(*entries):
+            return savegdrive.last_sync_summary([{"kind": kind, "status": status} for kind, status in entries]).plain
+
+        self.assertEqual(summary(("FILE", "UNCHANGED"), ("FOLDER", "UNCHANGED")), "✓ Your last selection is in sync.")
+        conflict = summary(("FILE", "UNCHANGED"), ("FILE", "CONFLICT"))
+        self.assertNotIn("in sync", conflict)
+        self.assertIn("Since the last sync: 1 conflict", conflict)
+        deleted = summary(("FILE", "UNCHANGED"), ("FILE", "TRASH_LOCAL"))
+        self.assertIn("Since the last sync: 1 deleted on Drive", deleted)
+        mixed = summary(("FOLDER", "NEW"), ("FILE", "NEW"), ("FILE", "UPLOAD"), ("FOLDER", "TRASH_REMOTE"),
+                        ("FILE", "CONFLICT"), ("FILE", "CONFLICT"))
+        self.assertIn("1 ↓ to download · 1 ↑ to send · 1 deleted here · 2 conflicts", mixed)
+
     def test_parallel_downloads(self):
         for i in range(20):
             self.drive.items[f"m{i}"] = file_item(f"m{i}", f"m{i}.txt", "photos", f"file {i}".encode())
