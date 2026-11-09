@@ -3177,10 +3177,29 @@ def mark_duplicate_targets(plan):
             entry for entry in plan
             if not any(same_name_key(parent) in duplicate_folders for parent in entry["destination"].parents)
         ]
+    names = {}
+    for entry in plan:
+        if entry["status"] != "SKIPPED" and targets[same_name_key(entry["destination"])] > 1:
+            names.setdefault(same_name_key(entry["destination"]), []).append(entry)
     for entry in plan:
         if targets[same_name_key(entry["destination"])] > 1:
             entry["status"] = "CONFLICT"
             entry["duplicate"] = True
+            entry["same_local_name"] = [
+                source_name(other) for other in names.get(same_name_key(entry["destination"]), []) if other is not entry
+            ]
+
+
+def source_name(entry):
+    """The name the user sees on Drive (or here, for a local only item)."""
+    item = entry.get("item")
+    return item["name"] if item is not None else f"{entry['relative_path'].name} (here)"
+
+
+def duplicate_label(entry):
+    """`(Drive: Report · same local name as Report.docx)`: which Drive items clash, under their Drive names."""
+    others = ", ".join(entry.get("same_local_name") or [])
+    return f"(Drive: {source_name(entry)} · same local name as {others or 'another item'})"
 
 
 def path_is_in_scope(relative_path, scopes):
@@ -3549,6 +3568,8 @@ def print_plan(plan, destination_root):
             path = escape(entry["relative_path"].as_posix())
             if entry["kind"] == "FOLDER":
                 path = f"[cyan]{path}/[/]"
+            if entry.get("duplicate"):
+                path += f"  [dim]{escape(duplicate_label(entry))}[/]"
             item = entry.get("item")
             size = display_size(item) if item is not None and entry["kind"] == "FILE" else ""
             table.add_row(f"[{style}]{label}[/]", path, size if size != "-" else "")
@@ -3636,7 +3657,7 @@ def needs_deletion_check(plan, state):
 def plan_notes(plan):
     statuses = {entry["status"] for entry in plan}
     notes = []
-    if "CONFLICT" in statuses:
+    if any(entry["status"] == "CONFLICT" and not entry.get("duplicate") for entry in plan):
         notes.append(
             "Conflicts are left as they are (b: keep both versions of this one, shift+b: of all). "
             "A file you cannot edit on Drive (a Google Doc export, a file shared read only) and changed here is a "
@@ -3650,7 +3671,10 @@ def plan_notes(plan):
     if any(entry["status"] == "KEEP_BOTH" and not entry.get("copy_goes_up", True) for entry in plan):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("duplicate") for entry in plan):
-        notes.append("Two Drive items with the same name in a folder: rename one on Drive (o opens it).")
+        notes.append(
+            "Several Drive items get one local name (the same name, a Google Doc next to its .docx, "
+            "a / turned into _...): none of them syncs until you rename one on Drive (o opens it)."
+        )
     if any(entry.get("arrived") for entry in plan):
         notes.append(
             "A Drive folder appeared over a local only folder of yours (someone shared one by that name): "
@@ -3825,7 +3849,7 @@ class PreviewScreen(Screen):
             if entry["status"] == "KEEP_BOTH":
                 path += f"  (yours → {entry['local_copy'].name})"
             elif entry.get("duplicate"):
-                path += "  (same name on Drive)"
+                path += f"  {duplicate_label(entry)}"
             table.add_row(
                 Text(label, style=style),
                 Text(path + "/", style="cyan") if entry["kind"] == "FOLDER" else Text(path),
@@ -3857,6 +3881,11 @@ class PreviewScreen(Screen):
         if not self.rows:
             return
         entry = self.rows[table.cursor_row]
+        if entry.get("duplicate"):
+            self.notify(
+                f"{duplicate_label(entry)}: rename one on Drive (o opens it).", severity="warning", markup=False
+            )
+            return
         if not can_keep_both(entry):
             self.notify("Keep both applies to a file changed on both sides.", severity="warning")
             return
@@ -3874,7 +3903,13 @@ class PreviewScreen(Screen):
     def action_keep_both_all(self):
         conflicts = [entry for entry in self.plan if can_keep_both(entry)]
         if not conflicts:
-            self.notify("No file conflicts from Drive.", severity="warning")
+            if any(entry.get("duplicate") for entry in self.plan):
+                self.notify(
+                    "Only Drive items sharing one local name here: rename one on Drive (o opens it).",
+                    severity="warning",
+                )
+            else:
+                self.notify("No file conflicts from Drive.", severity="warning")
             return
         keep = any(entry["status"] == "CONFLICT" for entry in conflicts)
         set_keep_both(self.plan, conflicts, keep)

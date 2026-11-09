@@ -2305,6 +2305,23 @@ class SyncTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "syncs the Drive folder docs, not My Drive"):
                 savegdrive.resolve_destination(str(docs_only))
 
+    def test_google_doc_next_to_its_docx_names_both_drive_items(self):
+        # "Report" (Google Doc) and "Report.docx" (Word) look different on Drive but share one local name.
+        self.drive.items["w"] = file_item("w", "Report.docx", "docs", b"word")
+        plan, _ = self.preview()
+        clashing = [entry for entry in plan if entry["relative_path"].as_posix() == "Docs/Report.docx"]
+        self.assertEqual(sorted(savegdrive.duplicate_label(entry) for entry in clashing), [
+            "(Drive: Report · same local name as Report.docx)",
+            "(Drive: Report.docx · same local name as Report)",
+        ])
+        notes = savegdrive.plan_notes(plan)
+        self.assertTrue(any("a Google Doc next to its .docx" in note for note in notes))
+        self.assertFalse(any("keep both" in note for note in notes))  # b does nothing for these
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200)):
+            savegdrive.print_plan(plan, self.root)
+        self.assertIn("Docs/Report.docx  (Drive: Report · same local name as Report.docx)", output.getvalue())
+
     def test_keep_both(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"edited locally")
