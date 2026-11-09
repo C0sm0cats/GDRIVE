@@ -139,6 +139,7 @@ class FakeDrive:
         self.page_size = page_size
         self.batches = []
         self.failures = {}  # folder id -> errors raised by its next listings
+        self.create_failures = {}  # folder name -> errors raised by its next creations
         self.change_log = []
         self.changes_page_size = 2  # small, so the changes feed comes in several pages
         self.shared_drives = list(shared_drives)
@@ -239,6 +240,20 @@ class FakeDrive:
 
         return fields_request(run, kwargs.get("fields"))
 
+    def create(self, body, **kwargs):
+        """A new folder: files are sent by fake_upload."""
+        def run():
+            failures = self.create_failures.get(body["name"])
+            if failures:
+                raise failures.pop(0)
+            folder_id = f"dir{len(self.items)}"
+            self.items[folder_id] = {"id": folder_id, "name": body["name"], "mimeType": body["mimeType"],
+                                     "parent": body["parents"][0]}
+            self.change(folder_id)
+            return self.public(self.items[folder_id])
+
+        return fields_request(run, kwargs.get("fields"))
+
     def update(self, fileId, body, **kwargs):
         def run():
             if fileId not in self.items:
@@ -296,13 +311,6 @@ def fake_upload(service, path, file_id=None, name=None, parent_id=None, stop=Non
                 modifiedTime=f"2026-02-0{len(service.uploads) % 9 + 1}T00:00:00.000Z")
     service.change(file_id)  # in Drive's changes feed, like any other change
     return service.public(item)
-
-
-def fake_create_folder(service, name, parent_id):
-    folder_id = f"dir{len(service.items)}"
-    service.items[folder_id] = {"id": folder_id, "name": name, "mimeType": FOLDER, "parent": parent_id}
-    service.change(folder_id)
-    return {"id": folder_id, "name": name, "mimeType": FOLDER}
 
 
 def file_item(item_id, name, parent, content, **extra):
@@ -503,8 +511,7 @@ class SyncTest(unittest.TestCase):
         def fake_trash_local(path):
             os.replace(path, self.trash / f"{len(list(self.trash.iterdir()))}-{path.name}")
 
-        for name, fake in [("fetch_media", fake_fetch), ("upload_file", fake_upload),
-                           ("create_remote_folder", fake_create_folder), ("trash_local", fake_trash_local)]:
+        for name, fake in [("fetch_media", fake_fetch), ("upload_file", fake_upload), ("trash_local", fake_trash_local)]:
             patcher = mock.patch.object(savegdrive, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -633,6 +640,28 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(marks.get(b_node["index"]), "synced")
         statuses, _ = self.run_sync()
         self.assertEqual({status for path, status in statuses.items() if path != "Docs/Survey"}, {"UNCHANGED"})
+
+    def test_new_local_folders_are_created_on_drive_one_batch_per_level(self):
+        # perf 10: 20 years x 12 months were 261 sequential files.create before the first upload.
+        self.run_sync()
+        for year in range(3):
+            for month in range(1, 61):
+                (self.root / f"Docs/Archive/{2000 + year}/{month:02d}").mkdir(parents=True)
+        (self.root / "Docs/Archive/2000/01/a.txt").write_bytes(b"a")
+        self.drive.create_failures["2001"] = [http_error(429), http_error(403)]  # rate limited, then refused
+        plan, state = self.preview()
+        self.drive.batches.clear()
+        with mock.patch.object(savegdrive.time, "sleep"):
+            results = self.apply(plan, state, jobs=4)
+        # Archive, then 3 years (2001 rate limited, retried, refused), then 120 months in batches of API_BATCH_SIZE.
+        self.assertEqual(self.drive.batches, [1, 3, 1, 50, 50, 20])
+        self.assertEqual(results["FOLDER_UPLOAD_NEW"], 1 + 2 + 120)
+        self.assertEqual(results["FOLDER_ERROR"], 1 + 60)
+        folders = {(item["name"], item["parent"]): item["id"] for item in self.drive.items.values()}
+        archive = folders[("Archive", "docs")]
+        self.assertNotIn(("2001", archive), folders)
+        january = folders[("01", folders[("2000", archive)])]
+        self.assertIn(("a.txt", january), folders)
 
     def test_conflicts(self):
         self.run_sync()
@@ -3213,9 +3242,7 @@ class UploadTest(unittest.TestCase):
         # Without parents, Drive puts the folder at the top of My Drive; without mimeType, it makes a file.
         service = mock.Mock()
         files = service.files.return_value
-        files.create.return_value.execute.return_value = {"id": "ideas", "name": "Ideas"}
-        item = savegdrive.create_remote_folder(service, "Ideas", "docs")
-        self.assertEqual(item["id"], "ideas")
+        savegdrive.remote_folder_request(service, "Ideas", "docs")
         kwargs = files.create.call_args.kwargs
         self.assertEqual(kwargs["body"], {"name": "Ideas", "parents": ["docs"], "mimeType": savegdrive.FOLDER_MIME_TYPE})
         self.assertTrue(kwargs["supportsAllDrives"])

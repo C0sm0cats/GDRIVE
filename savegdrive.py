@@ -4486,16 +4486,50 @@ def upload_file(service, path, file_id=None, name=None, parent_id=None, stop=Non
     return response
 
 
-def create_remote_folder(service, name, parent_id):
-    return (
-        service.files()
-        .create(
-            body={"name": name, "parents": [parent_id], "mimeType": FOLDER_MIME_TYPE},
-            fields="id,name,mimeType,webViewLink",
-            supportsAllDrives=True,
-        )
-        .execute(num_retries=API_RETRIES)
+def remote_folder_request(service, name, parent_id):
+    return service.files().create(
+        body={"name": name, "parents": [parent_id], "mimeType": FOLDER_MIME_TYPE},
+        fields="id,name,mimeType,webViewLink",
+        supportsAllDrives=True,
     )
+
+
+def create_remote_folders(service, folders):
+    """Create every (name, parent id) of folders on Drive in batched calls; returns, for each, the folder or its error."""
+    made = [None] * len(folders)
+    pending = list(range(len(folders)))
+    attempts = Counter()
+
+    while pending:
+        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
+        retry = []
+
+        def callback(request_id, response, exception, chunk=chunk):
+            index = chunk[int(request_id)]
+            if exception is None:
+                made[index] = response
+            elif is_retryable(exception) and attempts[index] < API_RETRIES:
+                attempts[index] += 1
+                retry.append(index)
+            else:
+                made[index] = exception
+
+        batch = service.new_batch_http_request(callback=callback)
+        for position, index in enumerate(chunk):
+            batch.add(remote_folder_request(service, *folders[index]), request_id=str(position))
+        try:
+            batch.execute()
+        except DRIVE_CALL_ERRORS as error:
+            for index in chunk:
+                if made[index] is None and index not in retry:
+                    made[index] = error
+        debug(f"Created {plural(len(chunk), 'folder')} on Drive")
+        if retry:
+            delay = min(2 ** max(attempts[index] for index in retry), 30)
+            debug(f"Drive rate limit, retrying {len(retry)} folder creation(s) in {delay}s")
+            time.sleep(delay)
+            pending = retry + pending
+    return made
 
 
 def trash_local(path):
@@ -4577,24 +4611,35 @@ def create_folders(service, plan, state, results, report):
             results[f"FOLDER_{status}"] += 1
             if status == "UNCHANGED" and entry.get("item") is not None:
                 state.setdefault("folders", {})[relative] = effective_id(entry["item"])
-    for entry in sorted(
-        (entry for entry in plan if entry["kind"] == "FOLDER" and entry["status"] == "UPLOAD_NEW"),
-        key=lambda entry: len(entry["relative_path"].parts),
-    ):
-        relative = entry["relative_path"]
-        parent_id = folder_ids.get(relative.parent, entry.get("parent_id"))
-        try:
+    levels = {}
+    for entry in plan:
+        if entry["kind"] == "FOLDER" and entry["status"] == "UPLOAD_NEW":
+            levels.setdefault(len(entry["relative_path"].parts), []).append(entry)
+    for depth in sorted(levels):
+        # Parents first: every folder of this level has its parent on Drive by now, so one batch makes them all.
+        outcomes = {}
+        sent = []
+        for entry in levels[depth]:
+            parent_id = folder_ids.get(entry["relative_path"].parent, entry.get("parent_id"))
             if parent_id is None:
-                raise OSError("its parent folder could not be created on Drive")
-            folder = create_remote_folder(service, relative.name, parent_id)
+                outcomes[id(entry)] = OSError("its parent folder could not be created on Drive")
+            else:
+                sent.append((entry, parent_id))
+        made = create_remote_folders(service, [(entry["relative_path"].name, parent_id) for entry, parent_id in sent])
+        outcomes.update((id(entry), folder) for (entry, _), folder in zip(sent, made))
+        parents = {id(entry): parent_id for entry, parent_id in sent}
+        for entry in levels[depth]:
+            relative = entry["relative_path"]
+            folder = outcomes[id(entry)]
+            if isinstance(folder, BaseException):
+                results["FOLDER_ERROR"] += 1
+                report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(folder)}")
+                continue
             folder_ids[relative] = folder["id"]
             state.setdefault("folders", {})[relative.as_posix()] = folder["id"]
-            reselect_sent(state, relative, folder, parent_id)
+            reselect_sent(state, relative, folder, parents[id(entry)])
             results["FOLDER_UPLOAD_NEW"] += 1
             report("[bold]↑[/]", f"{relative.as_posix()}/")
-        except DRIVE_CALL_ERRORS as error:
-            results["FOLDER_ERROR"] += 1
-            report("[red]✗[/]", f"{relative.as_posix()}/: {error_text(error)}")
     return folder_ids
 
 
