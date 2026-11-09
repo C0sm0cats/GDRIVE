@@ -2121,7 +2121,7 @@ class DriveSelectorApp(App):
     def check_last_sync(self):
         self.last_sync = None
         state = self.state or {}
-        if self.service is None or self.destination is None or not state.get("last_selection"):
+        if self.service is None or self.destination is None or not has_last_selection(state):
             self.last_sync_text = None
             self.update_notice()
             return
@@ -2948,14 +2948,20 @@ def remember_selection(state, selections, scopes, roots=(), kept=()):
     }
 
 
+def has_last_selection(state):
+    """Whether --again has something to sync: once every saved item left Drive, the selection is empty."""
+    saved = state.get("last_selection")
+    return bool(saved and (saved.get("items") or saved.get("roots")))
+
+
 def last_selection(service, state, cache, kept=None):
     """The previous run's selection with fresh Drive metadata; items gone from Drive stay as local scopes.
 
     Saved items now in the Drive trash are added to kept, when given, to stay in the saved selection.
     """
-    saved = state.get("last_selection")
-    if not saved or not (saved.get("items") or saved.get("roots")):
+    if not has_last_selection(state):
         return None
+    saved = state["last_selection"]
     selections = []
     scopes = [Path(scope) for scope in saved.get("scopes", [])]
     from_roots = []
@@ -5389,7 +5395,7 @@ def main():
 
         if args.again:
             state = load_state(destination_root)
-            if not state.get("last_selection"):
+            if not has_last_selection(state):
                 console.print(
                     f"[red]✗[/] No previous selection in {escape(str(destination_root))}: "
                     "run once without --again."

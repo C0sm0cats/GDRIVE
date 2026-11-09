@@ -1288,6 +1288,24 @@ class SyncTest(unittest.TestCase):
         picked = savegdrive.load_state(self.root)["last_selection"]["items"]
         self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs", "Photos"])
 
+    def test_again_after_the_whole_selection_left_drive_says_so(self):
+        # Only Photos picked, then deleted on Drive: the first --again trashes the copy, the next one has nothing.
+        self.sync_picked("Photos")
+        del self.drive.items["photos"]
+        self.drive.change("photos")
+        self.run_main("--again", "--yes")
+        self.assertFalse((self.root / "Photos").exists())
+        with self.assertRaises(SystemExit) as raised:  # "No previous selection", not a TypeError
+            self.run_main("--again", "--yes")
+        self.assertEqual(raised.exception.code, 1)
+        # The tree does not offer to check it either.
+        app = savegdrive.DriveSelectorApp([savegdrive.DriveView("My Drive", "root")], self.root,
+                                          savegdrive.load_state(self.root), self.drive, None, {})
+        with mock.patch.object(app, "run_worker") as worker, mock.patch.object(app, "update_notice"):
+            app.check_last_sync()
+        worker.assert_not_called()
+        self.assertIsNone(app.last_sync_text)
+
     def test_folder_removed_here_by_the_sync_is_not_trashed_on_drive(self):
         self.drive.items["club"] = {"id": "club", "name": "Club", "mimeType": FOLDER, "parent": "root"}
         self.drive.items["club_photos"] = {"id": "club_photos", "name": "Photos 2026", "mimeType": FOLDER,
