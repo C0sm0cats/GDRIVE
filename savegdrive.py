@@ -97,7 +97,7 @@ SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 LIST_FIELDS = (
     "nextPageToken,"
     "files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,"
-    "explicitlyTrashed,capabilities(canEdit,canAddChildren,canTrash))"
+    "explicitlyTrashed,capabilities(canEdit,canAddChildren,canTrash,canDownload))"
 )
 API_BATCH_SIZE = 50  # Drive accepts 100 calls per batch, but throttles large ones
 API_RETRIES = 5
@@ -388,9 +388,14 @@ def is_folder(item):
     return effective_mime_type(item) == FOLDER_MIME_TYPE
 
 
+def is_download_forbidden(item):
+    """A file its owner does not let you download (sharing: viewers cannot download): Drive refuses it (403)."""
+    return not is_folder(item) and item.get("capabilities", {}).get("canDownload") is False
+
+
 def is_unsupported(item):
     mime_type = effective_mime_type(item)
-    return (
+    return is_download_forbidden(item) or (
         mime_type.startswith("application/vnd.google-apps.")
         and mime_type != FOLDER_MIME_TYPE
         and mime_type not in EXPORT_FORMATS
@@ -574,7 +579,7 @@ def reachable_folders(cache, folder_ids):
 CHANGE_FIELDS = (
     "nextPageToken,newStartPageToken,changes(fileId,removed,"
     "file(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,driveId,parents,trashed,"
-    "capabilities(canEdit,canAddChildren,canTrash)))"
+    "capabilities(canEdit,canAddChildren,canTrash,canDownload)))"
 )
 
 
@@ -690,7 +695,7 @@ def refresh_listings(service, cache, token):
 
 
 SHORTCUT_TARGET_FIELDS = (
-    "id,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)"
+    "id,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash,canDownload)"
 )
 
 
@@ -2966,7 +2971,7 @@ class DriveSelectorApp(App):
 
 ITEM_FIELDS = (
     "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails,webViewLink,trashed,driveId,parents,"
-    "capabilities(canEdit,canAddChildren,canTrash)"
+    "capabilities(canEdit,canAddChildren,canTrash,canDownload)"
 )
 
 
@@ -4373,6 +4378,12 @@ def plan_notes(plan, terminal=False):
         notes.append("Some kept versions are in folders read only on Drive: they stay on your disk only.")
     if any(entry.get("unreadable") for entry in plan):
         notes.append(UNREADABLE_NOTE)
+    if any(entry["status"] == "SKIPPED" and is_download_forbidden(entry.get("item") or {"mimeType": ""})
+           for entry in plan):
+        notes.append(
+            f"Some files are skipped: their owner does not let you download them {opens}. "
+            "Ask the owner to allow downloads, or to give you edit access."
+        )
     if any(entry.get("duplicate") for entry in plan):
         notes.append(
             "Several Drive items get one local name (the same name, a Google Doc next to its .docx, "
@@ -4906,7 +4917,7 @@ def state_record(entry, local_sha256):
     }
 
 
-UPLOAD_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash)"
+UPLOAD_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink,capabilities(canEdit,canAddChildren,canTrash,canDownload)"
 
 
 def upload_file(service, path, file_id=None, name=None, parent_id=None, stop=None, on_bytes=lambda count: None):

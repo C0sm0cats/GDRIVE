@@ -1055,6 +1055,35 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Photos/Customer survey"], "SKIPPED")
         self.assertFalse(self.drive.is_trashed(self.drive.items["pf"]))
 
+    def test_file_its_owner_forbids_downloading_is_skipped_every_sync(self):
+        # ux 20: the owner unchecked "viewers can download": Drive refuses alt=media (403) at every sync
+        self.drive.items["p"]["capabilities"] = {"canEdit": False, "canTrash": False, "canDownload": False}
+        get_media = savegdrive.fetch_media
+        refused = []
+
+        def refuse(service, item, file_handle, stop=None):
+            if savegdrive.effective_id(item) == "p":
+                refused.append(item["id"])
+                raise http_error(403, "insufficientFilePermissions")
+            return get_media(service, item, file_handle, stop)
+
+        with mock.patch.object(savegdrive, "fetch_media", refuse):
+            for _ in range(2):
+                plan, state = self.preview()
+                statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+                results = self.apply(plan, state, 1)
+                self.assertEqual(statuses["Photos/beach.jpg"], "SKIPPED")
+                self.assertEqual(results["FILE_ERROR"], 0)
+                self.assertTrue(any("does not let you download" in note for note in savegdrive.plan_notes(plan)))
+        self.assertEqual(refused, [])
+        self.assertFalse((self.root / "Photos/beach.jpg").exists())
+        self.assertTrue(savegdrive.is_unsupported(self.drive.items["p"]))
+        self.assertFalse(savegdrive.is_unsupported({"mimeType": FOLDER, "capabilities": {"canDownload": False}}))
+        self.assertIn("canDownload", savegdrive.LIST_FIELDS)
+        for fields in (savegdrive.ITEM_FIELDS, savegdrive.CHANGE_FIELDS, savegdrive.SHORTCUT_TARGET_FIELDS,
+                       savegdrive.UPLOAD_FIELDS):
+            self.assertIn("canDownload", fields)
+
     def test_export_deleted_here_comes_back(self):
         self.drive.items["minutes"] = {"id": "minutes", "name": "Minutes", "mimeType": FOLDER, "parent": "root"}
         self.drive.items["board"] = {"id": "board", "name": "Board", "mimeType": DOC, "parent": "minutes",
