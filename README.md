@@ -536,6 +536,9 @@ any time.
 .venv/bin/python -m unittest discover -s tests
 ```
 
+After an upgrade of the system Python (for example 3.13 to 3.14), run
+`./run-savegdrive.sh --help` once first: it rebuilds `.venv` for the new version.
+
 The README screenshot is generated from the real selector with demo files:
 
 ```bash

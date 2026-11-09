@@ -3,6 +3,15 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+# .venv/bin/python links to the system Python. After a minor upgrade of it
+# (3.13 -> 3.14) that interpreter looks for a lib/python3.14 the venv lacks, so
+# nothing imports and pip is gone: rebuild the venv instead of failing forever.
+if [ -e "$script_dir/.venv" ] && ! "$script_dir/.venv/bin/python" -c \
+    'import os, sys, sysconfig; sys.exit(not os.path.isdir(sysconfig.get_path("purelib")))' >/dev/null 2>&1; then
+    echo "SaveGDrive: .venv does not match the installed Python any more; rebuilding it." >&2
+    rm -rf "$script_dir/.venv"
+fi
+
 if [ ! -x "$script_dir/.venv/bin/python" ]; then
     if command -v python3 >/dev/null 2>&1; then
         python=python3

@@ -5477,10 +5477,11 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
 FAKE_PYTHON = """#!/bin/sh
 case "$1" in
     -V) echo "Python $FAKE_PY_VERSION"; exit 0 ;;
-    -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;; esac
+    -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;;
+            *purelib*) [ -d "$(dirname "$0")/../lib/site-packages" ]; exit $? ;; esac
         [ "$FAKE_IMPORTS_OK" = 1 ]; exit $? ;;
     -m) case "$2" in
-            venv) {mkdir} -p "$3/bin" && {cp} "$0" "$3/bin/python"; exit $? ;;
+            venv) {mkdir} -p "$3/bin" "$3/lib/site-packages" && {cp} "$0" "$3/bin/python"; exit $? ;;
             pip) echo "$*" >> "$FAKE_PIP_LOG"; exit "$FAKE_PIP_RC" ;;
         esac; exit 1 ;;
 esac
@@ -5495,13 +5496,13 @@ class LauncherTest(unittest.TestCase):
     PACKAGES = "google-api-python-client google-auth google-auth-oauthlib send2trash textual"
 
     def run_launcher(self, names, version_ok=True, venv=False, stamp=None, stamp_age_days=0,
-                     imports_ok=True, pip_rc=0):
+                     imports_ok=True, pip_rc=0, venv_site=True):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         shutil.copy(Path(__file__).resolve().parent.parent / "run-savegdrive.sh", root)
         (root / "savegdrive.py").write_text("")
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        for tool in ("dirname", "find"):
+        for tool in ("dirname", "find", "rm"):
             os.symlink(shutil.which(tool), bin_dir / tool)
         fake = FAKE_PYTHON.format(mkdir=shutil.which("mkdir"), cp=shutil.which("cp"))
         for name in names:
@@ -5511,6 +5512,8 @@ class LauncherTest(unittest.TestCase):
             (root / ".venv" / "bin").mkdir(parents=True)
             (root / ".venv" / "bin" / "python").write_text(fake)
             (root / ".venv" / "bin" / "python").chmod(0o755)
+            if venv_site:
+                (root / ".venv" / "lib" / "site-packages").mkdir(parents=True)
         if stamp is not None:
             stamp_path = root / ".venv" / ".savegdrive-deps"
             stamp_path.write_text(stamp + "\n")
@@ -5580,6 +5583,24 @@ class LauncherTest(unittest.TestCase):
         self.assertIn("could not update", result.stderr)
         self.assertIn("savegdrive.py --help", result.stdout)
         self.assertFalse((root / ".venv" / ".savegdrive-deps").exists())
+
+    def test_launcher_rebuilds_venv_made_by_an_older_python(self):
+        # The system Python went 3.13 -> 3.14: .venv/bin/python now runs 3.14,
+        # which has no lib/python3.14/site-packages in this venv, and no pip.
+        result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES,
+                                         imports_ok=False, venv_site=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rebuilding it", result.stderr)
+        self.assertTrue((root / ".venv" / "lib" / "site-packages").is_dir())
+        self.assertEqual(len(self.pip_calls(root)), 1)
+        self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
+        self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_keeps_a_matching_venv(self):
+        result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("rebuilding", result.stderr)
+        self.assertTrue((root / ".venv" / ".savegdrive-deps").exists())
 
     def test_launcher_fails_when_install_fails_and_imports_are_missing(self):
         result, root = self.run_launcher(["python3"], imports_ok=False, pip_rc=1)
