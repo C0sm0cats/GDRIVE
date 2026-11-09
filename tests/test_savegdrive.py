@@ -962,6 +962,34 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(names["a.txt"]["content"], b"alpha")
         self.assertEqual(names["new.jpg"]["parent"], names["Photos"]["id"])
 
+    def test_restored_from_a_trash_after_a_sync_stays(self):
+        self.run_sync()
+        (self.root / "Docs/a.txt").unlink()  # deleted here: goes to the Drive trash
+        del self.drive.items["b"]  # deleted on Drive: goes to your system trash
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "TRASH_REMOTE")
+        self.assertEqual(statuses["Docs/b.txt"], "TRASH_LOCAL")
+        self.assertEqual(statuses["Photos"], "TRASH_REMOTE")
+        savegdrive.restore_items(self.drive, ["a"])  # r in the Trash view
+        [kept] = list(self.trash.iterdir())
+        os.replace(kept, self.root / "Docs/b.txt")  # put back from the system trash
+        (self.root / "Photos").mkdir()
+        (self.root / "Photos/new.jpg").write_bytes(b"made here")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "NEW")
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["Photos/new.jpg"], "UPLOAD_NEW")
+        self.assertEqual(results["FILE_ERROR"] + results["FOLDER_ERROR"], 0)
+        self.assertFalse(self.drive.items["a"].get("trashed"))
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha")
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"bravo")
+        self.assertEqual(list(self.trash.iterdir()), [])
+        names = {item["name"]: item for item in self.drive.items.values() if not item.get("trashed")}
+        self.assertEqual(names["b.txt"]["parent"], "docs")
+        self.assertEqual(names["new.jpg"]["parent"], names["Photos"]["id"])
+
     def test_picked_folder_renamed_on_drive_sends_the_changes_back(self):
         cache = {}
         nodes, browsed = savegdrive.collect_drive_tree(self.drive, "root", cache)
