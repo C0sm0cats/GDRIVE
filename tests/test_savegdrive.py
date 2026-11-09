@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 import tempfile
@@ -1145,6 +1146,21 @@ class SyncTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             savegdrive.initialize_managed_destination(other)
         self.assertEqual(savegdrive.initialize_managed_destination(self.root), self.root)
+
+    def test_gdrive_pull_folder_is_adopted(self):
+        legacy = Path(self.temp.name) / "Legacy"
+        legacy.mkdir()
+        (legacy / "a.txt").write_text("a")
+        state = {"version": savegdrive.STATE_VERSION, "files": {"id::a.txt": {"sha256": "x"}}}
+        (legacy / savegdrive.LEGACY_STATE_FILE_NAME).write_text(json.dumps(state))
+        (legacy / savegdrive.LEGACY_REMOTE_CACHE_NAME).write_text("{}")
+        self.assertEqual(savegdrive.initialize_managed_destination(legacy), legacy)
+        self.assertEqual(
+            sorted(path.name for path in legacy.iterdir()),
+            [savegdrive.STATE_FILE_NAME, "a.txt"],
+        )
+        self.assertEqual(savegdrive.load_state(legacy)["files"], state["files"])
+        self.assertIn(savegdrive.LEGACY_REMOTE_CACHE_NAME, savegdrive.RESERVED_NAMES)
 
 
 class UploadTest(unittest.TestCase):

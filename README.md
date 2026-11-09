@@ -127,6 +127,11 @@ folder is created if it does not exist. It must be:
 A non-empty folder without that state file is refused to prevent accidental
 adoption or overwriting of unrelated data.
 
+Coming from GDrive Pull (before 2.0)? Keep your folder: on the first run,
+SaveGDrive renames its `.gdrivepull-managed-state.json` to
+`.savegdrive-state.json` and deletes `.gdrivepull-remote-cache.json`, which is
+rebuilt.
+
 SaveGDrive then signs in to Google Drive with full Drive access (it sends files
 and manages the Drive trash). Your browser opens the Google sign-in page; if it
 does not, the terminal shows a clickable link. The session is kept in

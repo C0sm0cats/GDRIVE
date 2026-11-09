@@ -55,11 +55,18 @@ CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 STATE_FILE_NAME = ".savegdrive-state.json"
 REMOTE_CACHE_NAME = ".savegdrive-cache.json"
 PART_SUFFIX = ".savegdrive.part"
+# GDrive Pull (before 2.0) kept the same state format under these names.
+LEGACY_STATE_FILE_NAME = ".gdrivepull-managed-state.json"
+LEGACY_REMOTE_CACHE_NAME = ".gdrivepull-remote-cache.json"
 RESERVED_NAMES = {
     STATE_FILE_NAME,
     f"{STATE_FILE_NAME}.tmp",
     REMOTE_CACHE_NAME,
     f"{REMOTE_CACHE_NAME}.tmp",
+    LEGACY_STATE_FILE_NAME,
+    f"{LEGACY_STATE_FILE_NAME}.tmp",
+    LEGACY_REMOTE_CACHE_NAME,
+    f"{LEGACY_REMOTE_CACHE_NAME}.tmp",
 }
 RESERVED_PATHS = {Path(name) for name in RESERVED_NAMES}
 SHARED_WITH_ME = "sharedWithMe"  # pseudo folder id: the items others shared with you
@@ -232,8 +239,8 @@ def authenticate():
 
 # --- Settings and managed destination --------------------------------------
 
-def has_valid_state(destination):
-    state_path = destination / STATE_FILE_NAME
+def has_valid_state(destination, name=STATE_FILE_NAME):
+    state_path = destination / name
     if not state_path.is_file():
         return False
     try:
@@ -767,10 +774,27 @@ def matches_filter(entry, terms):
     return all(term in haystack for term in terms)
 
 
+def migrate_legacy_state(destination):
+    """Adopt a GDrive Pull folder: rename its state, drop its cache (rebuilt on the next listing)."""
+    if has_valid_state(destination) or not has_valid_state(destination, LEGACY_STATE_FILE_NAME):
+        return
+    os.replace(destination / LEGACY_STATE_FILE_NAME, destination / STATE_FILE_NAME)
+    for name in (
+        f"{LEGACY_STATE_FILE_NAME}.tmp",
+        LEGACY_REMOTE_CACHE_NAME,
+        f"{LEGACY_REMOTE_CACHE_NAME}.tmp",
+    ):
+        try:
+            (destination / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
 def initialize_managed_destination(destination):
     if destination.exists():
         if not destination.is_dir():
             raise ValueError("The final destination is not a directory.")
+        migrate_legacy_state(destination)
         if has_valid_state(destination):
             return destination
         if any(destination.iterdir()):
