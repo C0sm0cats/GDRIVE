@@ -1030,6 +1030,23 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertEqual(self.drive.uploads, [])
 
+    def test_local_symlinks_are_never_followed(self):
+        # Links to places outside the synced folder (~/Documents, ~, a secret) never send anything to Drive.
+        outside = Path(self.temp.name) / "outside"
+        (outside / ".ssh").mkdir(parents=True)
+        (outside / ".ssh/id_rsa").write_bytes(b"secret key")
+        self.run_sync()
+        (self.root / "link").symlink_to(outside, target_is_directory=True)
+        (self.root / "Docs/key").symlink_to(outside / ".ssh/id_rsa")
+        names_before = {item["name"] for item in self.drive.items.values()}
+        statuses, results = self.run_sync()
+        self.assertEqual([path for path in statuses if path == "link" or path.startswith("link/")], [])
+        self.assertNotIn("Docs/key", statuses)
+        self.assertEqual(self.drive.uploads, [])
+        self.assertEqual({item["name"] for item in self.drive.items.values()}, names_before)
+        self.assertEqual(results["FILE_ERROR"], 0)
+        self.assertTrue((outside / ".ssh/id_rsa").exists())
+
     def test_file_shortcut_and_trash_view_only_come_down(self):
         # Photos holds a shortcut to Docs/a.txt: deleting or editing it here must not touch a.txt on Drive.
         self.drive.items["link"] = {"id": "link", "name": "Link.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
