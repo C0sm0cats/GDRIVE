@@ -118,6 +118,9 @@ console = Console(highlight=False)
 # httplib2 without network (ServerNotFoundError...), or a sign-in that cannot be renewed (RefreshError...).
 DRIVE_CALL_ERRORS = (HttpError, OSError, httplib2.HttpLib2Error, GoogleAuthError)
 VERBOSE = False
+# The --folder-id of this run (None with --again, which replays the folder's own roots). A managed folder
+# mirrors one Drive root: synced again from another one, all its files would look deleted on Drive.
+DRIVE_ROOT = None
 
 
 def debug(message):
@@ -848,12 +851,41 @@ def migrate_legacy_state(destination):
             pass
 
 
+def drive_root_name(drive_root):
+    return "My Drive" if drive_root == "root" else f"the Drive folder {drive_root}"
+
+
+def claim_drive_root(destination, drive_root):
+    """Record the Drive root a managed folder mirrors, and refuse any other one."""
+    if drive_root is None:
+        return
+    state = json.loads((destination / STATE_FILE_NAME).read_text(encoding="utf-8"))
+    recorded = state.get("drive_root")
+    if recorded is None:
+        if state["files"] or state.get("folders"):
+            # Synced before the root was recorded: My Drive (the default), unless this folder was synced whole.
+            roots = (state.get("last_selection") or {}).get("roots", [])
+            whole = any(root.get("id") == drive_root and root.get("base") == "." for root in roots)
+            recorded = drive_root if whole else "root"
+        else:
+            recorded = drive_root
+        if recorded == drive_root:
+            state["drive_root"] = drive_root
+            save_state(destination, state)
+    if recorded != drive_root:
+        raise ValueError(
+            f"This folder syncs {drive_root_name(recorded)}, not {drive_root_name(drive_root)}: "
+            "each one needs its own folder."
+        )
+
+
 def initialize_managed_destination(destination):
     if destination.exists():
         if not destination.is_dir():
             raise ValueError("The final destination is not a directory.")
         migrate_legacy_state(destination)
         if has_valid_state(destination):
+            claim_drive_root(destination, DRIVE_ROOT)
             return destination
         if any(destination.iterdir()):
             raise ValueError(
@@ -864,10 +896,10 @@ def initialize_managed_destination(destination):
     else:
         destination.mkdir(parents=False)
 
-    save_state(
-        destination,
-        {"version": STATE_VERSION, "files": {}},
-    )
+    state = {"version": STATE_VERSION, "files": {}}
+    if DRIVE_ROOT is not None:
+        state["drive_root"] = DRIVE_ROOT
+    save_state(destination, state)
     return destination
 
 
@@ -4347,8 +4379,9 @@ def main():
         help="Show sign-in, token and API details, and list unchanged items in the preview.",
     )
     args = parser.parse_args()
-    global VERBOSE
+    global VERBOSE, DRIVE_ROOT
     VERBOSE = args.verbose
+    DRIVE_ROOT = None if args.again else args.folder_id
 
     try:
         try:

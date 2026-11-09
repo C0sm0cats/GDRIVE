@@ -1489,6 +1489,27 @@ class SyncTest(unittest.TestCase):
         with self.assertRaises(OSError):
             savegdrive.resolve_destination(str(Path(self.temp.name) / "missing" / "x"))
 
+    def test_folder_synced_with_my_drive_refuses_another_folder_id(self):
+        self.run_sync()  # My Drive, in a folder made before the Drive root was recorded
+        for folder_id in ("root", "docs", None):  # None: --again, which replays the folder's own roots
+            with mock.patch.object(savegdrive, "DRIVE_ROOT", folder_id):
+                if folder_id == "docs":
+                    with self.assertRaisesRegex(ValueError, "syncs My Drive, not the Drive folder docs"):
+                        savegdrive.resolve_destination(str(self.root))
+                else:
+                    self.assertEqual(savegdrive.resolve_destination(str(self.root)), self.root)
+        self.assertEqual(savegdrive.load_state(self.root)["drive_root"], "root")
+        self.assertEqual(sorted(path.name for path in self.root.iterdir() if not path.name.startswith(".")),
+                         ["Docs", "Photos", "notes.txt"])
+
+        docs_only = Path(self.temp.name) / "Docs only"
+        with mock.patch.object(savegdrive, "DRIVE_ROOT", "docs"):
+            savegdrive.resolve_destination(str(docs_only))
+            self.assertEqual(savegdrive.resolve_destination(str(docs_only)), docs_only)
+        with mock.patch.object(savegdrive, "DRIVE_ROOT", "root"):
+            with self.assertRaisesRegex(ValueError, "syncs the Drive folder docs, not My Drive"):
+                savegdrive.resolve_destination(str(docs_only))
+
     def test_keep_both(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"edited locally")
