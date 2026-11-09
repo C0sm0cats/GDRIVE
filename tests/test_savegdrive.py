@@ -29,6 +29,44 @@ def http_error(status):
     return HttpError(response, b"{}")
 
 
+def parse_fields(fields):
+    """Parse a Drive partial-response selector ("a,b(c,d)") into {name: sub-selection or None}."""
+    selection, stack, name = {}, [], ""
+    current = selection
+    for char in fields + ",":
+        if char in ",()":
+            if name.strip():
+                current[name.strip()] = None
+            if char == "(":
+                current[name.strip()] = {}
+                stack.append(current)
+                current = current[name.strip()]
+            elif char == ")":
+                current = stack.pop()
+            name = ""
+        else:
+            name += char
+    return selection
+
+
+def select_fields(value, selection):
+    """Keep only the selected fields of a response, as Drive does: unasked fields never come back."""
+    if selection is None:
+        return value
+    if isinstance(value, list):
+        return [select_fields(element, selection) for element in value]
+    if isinstance(value, dict):
+        return {key: select_fields(value[key], sub) for key, sub in selection.items() if key in value}
+    return value
+
+
+def fields_request(run, fields):
+    """A FakeRequest whose response is cut down to `fields`, when the caller gave some."""
+    if fields is None:
+        return FakeRequest(run)
+    return FakeRequest(lambda: select_fields(run(), parse_fields(fields)))
+
+
 class FakeRequest:
     def __init__(self, run):
         self.run = run
@@ -76,7 +114,7 @@ class FakeChanges:
                 response["newStartPageToken"] = str(len(self.drive.change_log))
             return response
 
-        return FakeRequest(run)
+        return fields_request(run, kwargs.get("fields"))
 
 
 class FakeDrives:
@@ -170,7 +208,7 @@ class FakeDrive:
                 response["nextPageToken"] = str(start + self.page_size)
             return response
 
-        return FakeRequest(run)
+        return fields_request(run, kwargs.get("fields"))
 
     def get(self, fileId, **kwargs):
         def run():
@@ -181,7 +219,7 @@ class FakeDrive:
             item = self.items[fileId]
             return dict(self.public(item), trashed=self.is_trashed(item))  # asked for by ITEM_FIELDS
 
-        return FakeRequest(run)
+        return fields_request(run, kwargs.get("fields"))
 
     def update(self, fileId, body, **kwargs):
         def run():
