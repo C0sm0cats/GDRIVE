@@ -2486,7 +2486,8 @@ class DriveSelectorApp(App):
             allowed = [item for item in items if can(item, "canTrash")]
             if not allowed:
                 self.notify(
-                    f"You cannot move {self.describe(items)} to the Drive trash: shared with you read only.",
+                    f"You cannot move {self.describe(items)} to the Drive trash: Drive does not let you "
+                    "(read only, owned by someone else, or a shared drive role that cannot delete).",
                     severity="warning",
                     markup=False,
                 )
@@ -2501,7 +2502,7 @@ class DriveSelectorApp(App):
                 lambda service: delete_items(service, ids), f"Deleted {what} forever.",
             )
         else:
-            note = f" ({plural(skipped, 'item')} shared with you read only stay.)" if skipped else ""
+            note = f" ({plural(skipped, 'item')} you cannot trash on Drive stay.)" if skipped else ""
             self.drive_change(
                 f"Move {what} to the Google Drive trash? You can restore it from the Trash view.{note}", None,
                 lambda service: trash_items(service, ids), f"Moved {what} to the Drive trash.",
@@ -3052,6 +3053,12 @@ def collect_plan(
             # syncing would send your files into it. Rename one of the two.
             status = "CONFLICT"
             arrived = True
+        # Deleted here, but Drive will not let you trash it: it comes down again.
+        comes_back = (
+            status == "NEW"
+            and not can(item, "canTrash")
+            and synced_here_before(state, relative_path, folder_id, tracked_folders)
+        )
         plan.append(
             {
                 "status": status,
@@ -3062,6 +3069,7 @@ def collect_plan(
                 "repeat": repeat,
                 "arrived": arrived,
                 "too_deep": too_deep,
+                "comes_back": comes_back,
             }
         )
         if visited is not None and status in {"NEW", "UNCHANGED", "TRASH_REMOTE"}:
@@ -3133,6 +3141,10 @@ def collect_plan(
             "state_key": replaced_key,  # the replaced file's record, dropped once this one is synced
             "local_sha256": current_sha256,
             "local_stat": planned_stat,
+            # Deleted here, but Drive will not let you trash it: it comes down again.
+            "comes_back": status == "NEW"
+            and not can(item, "canTrash")
+            and tracked_record(state, item, relative_path) is not None,
         }
     )
 
@@ -3653,6 +3665,11 @@ def plan_notes(plan):
         notes.append(
             f"Folders too deep (past {MAX_FOLDER_DEPTH} levels, through a chain of shortcuts) are skipped: "
             "what is on your disk there is left as it is."
+        )
+    if any(entry.get("comes_back") for entry in plan):
+        notes.append(
+            "Deleted here, but Drive does not let you delete them (read only, not yours, or your shared drive "
+            "role): downloaded again. Ask their owner or a manager to delete them."
         )
     if "TRASH_REMOTE" in statuses:
         notes.append("Deleted here since the last sync: Drive's copies go to the Drive trash (kept 30 days).")

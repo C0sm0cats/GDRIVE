@@ -1186,6 +1186,25 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertEqual(self.drive.uploads, [])
 
+    def test_deleted_here_but_not_trashable_on_drive_says_it_comes_back(self):
+        # A shared drive contributor: may edit, may not trash. Deleting here cannot delete on Drive.
+        for key in ["photos", "a"]:
+            self.drive.items[key]["capabilities"] = {"canEdit": True, "canAddChildren": True, "canTrash": False}
+        self.run_sync()
+        plan, _ = self.preview()
+        self.assertFalse(any(entry.get("comes_back") for entry in plan))  # nothing deleted: no note
+        (self.root / "Docs/a.txt").unlink()
+        import shutil
+        shutil.rmtree(self.root / "Photos")
+        plan, _ = self.preview()
+        entries = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertEqual(entries["Docs/a.txt"]["status"], "NEW")
+        self.assertTrue(entries["Docs/a.txt"]["comes_back"])
+        self.assertEqual(entries["Photos"]["status"], "NEW")
+        self.assertTrue(entries["Photos"]["comes_back"])
+        self.assertFalse(entries["Docs/b.txt"].get("comes_back"))
+        self.assertTrue(any("Drive does not let you delete them" in note for note in savegdrive.plan_notes(plan)))
+
     def test_edited_here_deleted_on_drive_in_read_only_folder_is_kept(self):
         # The only copy of the edit is here: it cannot go up, so it must not go to the system trash either.
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False, "canTrash": True, "canEdit": True}
@@ -3572,11 +3591,15 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         drive.items["photos"]["capabilities"] = {"canTrash": False}
         app = self.make_app(drive)
         async with app.run_test() as pilot:
-            await pilot.press("end", "x")  # notes.txt, read only: no question
+            with mock.patch.object(app, "notify") as notify:
+                await pilot.press("end", "x")  # notes.txt, read only: no question
             self.assertNotIsInstance(app.screen, savegdrive.ConfirmScreen)
+            refusal = notify.call_args.args[0]
+            self.assertNotIn("shared with you read only", refusal)  # a contributor may edit it
+            self.assertIn("Drive does not let you", refusal)
             await pilot.press("home", "down", "space", "down", "space", "down", "space", "x")
             self.assertIsInstance(app.screen, savegdrive.ConfirmScreen)
-            self.assertIn("2 items shared with you read only stay", str(app.screen.message))
+            self.assertIn("2 items you cannot trash on Drive stay", str(app.screen.message))
             await pilot.press("y")
             await self.wait(app, pilot)
         self.assertTrue(drive.items["docs"]["trashed"])

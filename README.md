@@ -186,8 +186,9 @@ Some rules keep it safe:
   `--allow-deletions`. That is what an unplugged disk or an emptied folder
   looks like.
 - **Your rights on Drive count**: a file shared with you read only is never
-  sent back (a local change is a conflict) nor trashed (deleted here, it comes
-  back); a new file in a folder you cannot add to stays local only, like new
+  sent back (a local change is a conflict); one Drive does not let you trash
+  (read only, owned by someone else, or a shared drive role that cannot delete)
+  comes back when deleted here, and the preview says so; a new file in a folder you cannot add to stays local only, like new
   files at the top of Shared with me or in the Trash view.
 - **Empty folders are synced too**: created, deleted or emptied on one side,
   the other side follows.
