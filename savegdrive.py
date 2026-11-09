@@ -4068,6 +4068,11 @@ def has_actions(plan):
     return any(entry["status"] in ACTIONS for entry in plan)
 
 
+def in_sync(plan):
+    """Nothing to do and no conflict left: both sides are the same."""
+    return not has_actions(plan) and not any(entry["status"] == "CONFLICT" for entry in plan)
+
+
 def print_plan(plan, destination_root):
     shown = [entry for entry in plan if VERBOSE or entry["status"] != "UNCHANGED"]
     hidden = len(plan) - len(shown)
@@ -4313,6 +4318,7 @@ class PreviewScreen(Screen):
     """
 
     KEY_CONTEXT = "preview"
+    QUITS = False  # in the tree, y syncs and the tree comes back; --again quits
 
     BINDINGS = [
         Binding("y", "confirm", "Sync"),
@@ -4356,7 +4362,11 @@ class PreviewScreen(Screen):
         for note in plan_notes(self.plan):
             notes.append(note + "\n")
         if not has_actions(self.plan):
-            notes.append("Everything is up to date: y saves the state and quits.", style="bold green")
+            then = " and quits." if self.QUITS else "."
+            if in_sync(self.plan):
+                notes.append(f"Everything is up to date: y saves the state{then}", style="bold green")
+            else:
+                notes.append(f"Nothing to transfer but conflicts: y saves the state{then}", style="bold yellow")
         notes.rstrip()
         self.query_one("#preview-notes", Static).update(notes)
 
@@ -4508,6 +4518,7 @@ class PreviewScreen(Screen):
 
 class StandalonePreviewScreen(PreviewScreen):
     KEY_CONTEXT = "preview-again"
+    QUITS = True
     BINDINGS = [Binding("escape,n,q", "back", "Cancel")]
 
 
@@ -5189,7 +5200,7 @@ def run_sync(args, service, make_service, plan, selections, scopes, roots, desti
         [root_id for root_id, _ in roots]
         + [effective_id(entry["item"]) for entry in selections if is_folder(entry["item"])],
     )
-    if not has_actions(plan):
+    if in_sync(plan):
         console.print("[green]✓[/] Everything is in sync.")
     else:
         print_results(results)
@@ -5232,7 +5243,7 @@ def last_sync_summary(plan):
         if entry["kind"] == "FILE" or entry["status"] in DELETIONS | {"CONFLICT"}
     )
     text = Text()
-    if not has_actions(plan) and not counts["CONFLICT"]:
+    if in_sync(plan):
         text.append("✓ ", style="green")
         text.append("Your last selection is in sync.", style="dim")
         return text
@@ -5254,7 +5265,7 @@ def last_sync_summary(plan):
 def result_notice(plan, results):
     """The last sync's result, shown above the tree when it comes back."""
     text = Text()
-    if has_actions(plan):
+    if not in_sync(plan):
         text.append("Done  ", style="bold")
         text.append_text(Text.from_markup(results_summary(results)))
     else:

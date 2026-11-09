@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -1980,6 +1981,23 @@ class SyncTest(unittest.TestCase):
             output = self.run_main("--again", isatty=True)
         self.assertNotIn("Cancelled", output)
         self.assertTrue(self.drive.items["a"].get("trashed"))
+
+    def test_a_pending_conflict_is_not_reported_in_sync(self):
+        # bugs 21: a file changed on both sides and nothing else to do: the result still counts the conflict.
+        self.sync_everything()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha from Drive"))
+        self.drive.change("a")
+        (self.root / "Docs/a.txt").write_bytes(b"alpha from here")
+        plan, _ = self.preview()
+        self.assertFalse(savegdrive.has_actions(plan))
+        self.assertFalse(savegdrive.in_sync(plan))
+        output = self.run_main("--again", "--yes")
+        self.assertNotIn("Everything is in sync", output)
+        self.assertIn("1 conflict kept", output)
+        results = Counter(FILE_CONFLICT=1)
+        notice = savegdrive.result_notice(plan, results).plain
+        self.assertNotIn("Everything was in sync", notice)
+        self.assertIn("1 conflict kept", notice)
 
     def test_parallel_downloads(self):
         for i in range(20):
@@ -4076,6 +4094,37 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("m")
             self.assertEqual(top(), ["Docs", "Photos", "a undated", "big.bin", "new.txt", "notes.txt"])
             await pilot.press("q")
+
+    async def test_preview_note_when_nothing_to_transfer(self):
+        # bugs 21 and 40: "up to date" only without a conflict; "and quits" only where y quits (--again).
+        def entry(status, name):
+            return {"status": status, "relative_path": Path(name), "kind": "FILE",
+                    "item": {"name": name, "size": "10"}, "destination": self.root / name}
+
+        class SelectorPreview(savegdrive.App):
+            def __init__(self, plan, root):
+                super().__init__()
+                self.plan, self.root = plan, root
+
+            def on_mount(self):
+                self.push_screen(savegdrive.PreviewScreen(self.plan, self.root))
+
+        synced = [entry("UNCHANGED", "a.txt")]
+        conflict = synced + [entry("CONFLICT", "b.txt")]
+        notes = {}
+        for name, app in (
+            ("again", savegdrive.PreviewApp(synced, self.root)),
+            ("selector", SelectorPreview(synced, self.root)),
+            ("conflict", savegdrive.PreviewApp(conflict, self.root)),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                notes[name] = str(app.screen.query_one("#preview-notes").render())
+        self.assertIn("Everything is up to date: y saves the state and quits.", notes["again"])
+        self.assertIn("Everything is up to date: y saves the state.", notes["selector"])
+        self.assertNotIn("quits", notes["selector"])
+        self.assertNotIn("up to date", notes["conflict"])
+        self.assertIn("y saves the state and quits", notes["conflict"])
 
     async def test_tree_comes_back_after_a_download(self):
         drive = demo_drive()
