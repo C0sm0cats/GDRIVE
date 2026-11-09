@@ -1963,8 +1963,69 @@ class SyncTest(unittest.TestCase):
         nodes[by_path["Photos/beach.jpg"]]["item"]["md5Checksum"] = "new"  # changed on Drive
         self.assertEqual(marks()["Photos/beach.jpg"], "changed")
         self.assertEqual(marks()["Photos"], "changed")
-        (self.root / "notes.txt").unlink()
-        self.assertIsNone(marks()["notes.txt"])
+        (self.root / "notes.txt").unlink()  # deleted here: goes to the Drive trash
+        self.assertEqual(marks()["notes.txt"], "deleted")
+
+    def test_marks_for_changes_made_here(self):
+        # Each mark tells what the next sync does: up, to the Drive trash, or a conflict that never goes up.
+        self.run_sync()
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        by_path = {node["display_path"]: node["index"] for node in nodes}
+
+        def marks():
+            found = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+            return {path: found.get(index) for path, index in by_path.items()}
+
+        def statuses():
+            plan, _ = self.preview()
+            return {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+
+        # A new file here: the folder is no longer the same on both sides, and the file goes up.
+        (self.root / "Docs/new.txt").write_text("new")
+        self.assertEqual(marks()["Docs"], "edited")
+        self.assertEqual(statuses()["Docs/new.txt"], "UPLOAD_NEW")
+        (self.root / "Docs/new.txt").unlink()
+        self.assertEqual(marks()["Docs"], "synced")
+        # Only local files the sync would send count: not a part file, not a link.
+        (self.root / "Docs/x.txt.savegdrive.part").write_text("partial")
+        (self.root / "Docs/link").symlink_to(self.root / "notes.txt")
+        self.assertEqual(marks()["Docs"], "synced")
+        (self.root / "Docs/x.txt.savegdrive.part").unlink()
+        (self.root / "Docs/link").unlink()
+
+        # Deleted here: goes to the Drive trash, not a change on Drive.
+        (self.root / "Docs/b.txt").unlink()
+        self.assertEqual(marks()["Docs/b.txt"], "deleted")
+        self.assertEqual(marks()["Docs"], "edited")
+        self.assertEqual(statuses()["Docs/b.txt"], "TRASH_REMOTE")
+        # An export deleted here comes back down: no mark, like a file not downloaded yet.
+        (self.root / "Docs/Report.docx").unlink()
+        self.assertIsNone(marks()["Docs/Report"])
+        self.assertEqual(statuses()["Docs/Report.docx"], "NEW")
+
+        # An export edited here never goes back to Drive: a conflict, for the file and its folder.
+        (self.root / "Docs/Report.docx").write_bytes(b"edited docx")
+        self.run_sync()  # b.txt to the Drive trash, the export down again
+        nodes[:] = savegdrive.collect_drive_tree(self.drive, "root", {})[0]
+        by_path = {node["display_path"]: node["index"] for node in nodes}
+        os.utime(self.root / "Docs/Report.docx", (0, 0))
+        self.assertEqual(marks()["Docs/Report"], "conflict")
+        self.assertEqual(marks()["Docs"], "conflict")
+        self.assertEqual(statuses()["Docs/Report.docx"], "CONFLICT")
+
+    def test_marks_for_a_read_only_file_edited_here(self):
+        self.run_sync()
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        a_node = next(node for node in nodes if node["display_path"] == "Docs/a.txt")
+        a_node["item"]["capabilities"] = {"canEdit": False}  # shared with you read only
+        os.utime(self.root / "Docs/a.txt", (0, 0))
+        marks = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        self.assertEqual(marks.get(a_node["index"]), "conflict")
+        # Deleted here, but you may not trash it: it comes down again.
+        a_node["item"]["capabilities"] = {"canTrash": False}
+        (self.root / "Docs/a.txt").unlink()
+        marks = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        self.assertIsNone(marks.get(a_node["index"]))
 
     def test_google_doc_edited_on_drive_comes_down(self):
         # A Google Doc has no md5: only its modifiedTime says it changed on Drive.

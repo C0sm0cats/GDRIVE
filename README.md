@@ -16,7 +16,7 @@ deleted for good: what you delete on one side goes to the trash of the other.
   file count and size; files with their size, modification date and export
   format
 - Marks since the last sync: ✓ same on both sides, ↻ changed on Drive, ✎
-  changed here
+  changed here, ✗ deleted here, ! a conflict that is never sent
 - My Drive, Shared with me, every shared drive and the Drive trash as views,
   switched with `Tab`
 - Multi-selection of files and folders at any depth, across views; a
@@ -254,7 +254,9 @@ from the state without hashing any file:
 | --- | --- |
 | `✓` | Synced and the same on both sides (for a folder: every file in it) |
 | `↻` | Changed on Drive since the last sync, or a folder with new files |
-| `✎` | Changed here since the last sync: sent to Drive at the next one |
+| `✎` | Changed or new here since the last sync: sent to Drive at the next one (for a folder: something in it) |
+| `✗` | Deleted here since the last sync: goes to the Drive trash at the next one |
+| `!` | Changed here, but it cannot go back to Drive (an export such as `.docx`, a file shared with you read only) or changed on both sides: a conflict, never sent |
 
 ### Views
 

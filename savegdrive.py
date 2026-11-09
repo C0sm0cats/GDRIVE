@@ -1432,7 +1432,10 @@ KEY_HELP_NOTE = (
 MARKS = {
     "synced": ("✓", "green", "synced and the same on both sides"),
     "changed": ("↻", "bright_cyan", "changed on Drive since the last sync, or new files in the folder"),
-    "edited": ("✎", "yellow", "changed here since the last sync: sent to Drive at the next one"),
+    "edited": ("✎", "yellow", "changed or new here since the last sync: sent to Drive at the next one"),
+    "deleted": ("✗", "magenta", "deleted here since the last sync: goes to the Drive trash at the next one"),
+    "conflict": ("!", "red", "changed here, but it cannot go back to Drive (export, read only) or changed on both "
+                 "sides: a conflict, never sent"),
 }
 
 
@@ -1566,18 +1569,44 @@ def label_tail(entry, totals):
 
 
 def local_marks(nodes, destination, state):
-    """Mark files already downloaded (from the managed state, without hashing) and sum them up per folder."""
+    """Mark files already downloaded (from the managed state, without hashing) and sum them up per folder.
+
+    A mark tells what the next sync does: down (changed), up (edited, deleted), or nothing but a conflict.
+    """
     if destination is None or state is None:
         return {}
     tracked = tracked_files_by_path(state)
+    synced_folders = {Path(path) for path in state.get("folders", {})}
+    tracked_directories = {parent for tracked_path in tracked for parent in tracked_path.parents} | synced_folders
+    download_only = set()  # below a folder shortcut: its content only comes down
+    drive_names = {}  # folder index -> local names of its Drive children
+    for node in nodes:
+        item = node["item"]
+        parent = node["parent"]
+        if parent in download_only or (is_folder(item) and item["mimeType"] == SHORTCUT_MIME_TYPE):
+            download_only.add(node["index"])
+        if parent is not None:
+            drive_names.setdefault(parent, set()).add(local_name(item))
     marks = {}
     counts = {}  # folder index -> Counter of its files' marks ("" = not downloaded yet)
     for node in reversed(nodes):
         item = node["item"]
         index = node["index"]
+        relative_path = selected_path(node)
         if is_folder(item):
             folder = counts.get(index, Counter())
-            if folder["edited"]:
+            if relative_path in tracked_directories:
+                folder.update(local_only_marks(
+                    destination / relative_path, relative_path, drive_names.get(index, set()), tracked,
+                    tracked_directories,
+                    can_receive=index not in download_only and not item.get("readonly")
+                    and can(item, "canAddChildren"),
+                ))
+            if folder["conflict"]:
+                marks[index] = "conflict"
+            elif folder["deleted"] and not folder["synced"] and not (destination / relative_path).is_dir():
+                marks[index] = "deleted"
+            elif folder["edited"] or folder["deleted"]:
                 marks[index] = "edited"
             elif folder["changed"] or (folder["synced"] and folder[""]):
                 marks[index] = "changed"
@@ -1590,18 +1619,36 @@ def local_marks(nodes, destination, state):
                 pass  # no local copy, or no metadata to compare before the preview resolves it
             else:
                 mark = ""
-                relative_path = selected_path(node)
                 record = tracked.get(relative_path, (None, {}))[1]
                 if record.get("remote_id") == effective_id(item):
                     try:
                         path_stat = (destination / relative_path).stat()
                     except OSError:
                         path_stat = None
-                    if path_stat is not None:
-                        if remote_signature(item) != record.get("remote_signature"):
-                            mark = "changed"
-                        elif not mtime_matches(path_stat, record.get("modified_time")):
-                            mark = "edited"
+                    readonly = index in download_only or item.get("readonly") or is_readonly_path(relative_path)
+                    remote_changed = remote_signature(item) != record.get("remote_signature")
+                    if path_stat is None:
+                        if (
+                            not remote_changed
+                            and not readonly
+                            and can(item, "canTrash")
+                            and effective_mime_type(item) not in EXPORT_FORMATS
+                        ):
+                            mark = "deleted"  # synced, then deleted here: goes to the Drive trash
+                        # else it comes down again: no mark, like a file not downloaded yet
+                    else:
+                        local_changed = not mtime_matches(path_stat, record.get("modified_time"))
+                        # The top of Shared with me has no folder for new files, but a file you may edit goes back up
+                        goes_up = (
+                            index not in download_only
+                            and not item.get("readonly")
+                            and relative_path.parts[:1] != (TRASH_DIR,)
+                            and sends_back(item)
+                        )
+                        if remote_changed:
+                            mark = "conflict" if local_changed else "changed"
+                        elif local_changed:
+                            mark = "edited" if goes_up else "conflict"
                         else:
                             mark = "synced"
                 if mark:
@@ -1610,6 +1657,35 @@ def local_marks(nodes, destination, state):
         if node["parent"] is not None:
             counts.setdefault(node["parent"], Counter()).update(own)
     return marks
+
+
+def local_only_marks(directory, relative_directory, drive_names, tracked, tracked_directories, can_receive):
+    """Marks of what is in a synced local folder but not in its Drive folder: new here (goes up if the folder
+    takes new items), or synced before and deleted on Drive (goes to your trash). One listing, no hashing."""
+    found = Counter()
+    try:
+        children = list(os.scandir(directory))
+    except OSError:
+        return found
+    folded = {unicodedata.normalize("NFC", name).casefold() for name in drive_names}
+    for child in children:
+        name = child.name
+        if name in drive_names or name.endswith(PART_SUFFIX) or child.is_symlink():
+            continue
+        relative_path = relative_directory / name
+        if relative_path in tracked or relative_path in tracked_directories:
+            found["changed"] += 1  # deleted on Drive: goes to your trash, or a conflict if changed here
+            continue
+        if unicodedata.normalize("NFC", name).casefold() in folded:
+            continue  # the Drive item under another spelling (case-insensitive disk), or a name clash
+        try:
+            if child.is_dir() and holds_state(Path(child.path)):
+                continue  # another SaveGDrive folder, synced on its own
+        except OSError:
+            continue
+        if can_receive and not is_readonly_path(relative_path):
+            found["edited"] += 1  # new here: goes up at the next sync
+    return found
 
 
 def drive_url(item):
