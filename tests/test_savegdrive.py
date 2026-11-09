@@ -1007,6 +1007,32 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(results["FILE_ERROR"], 0)
         self.assertEqual(self.drive.uploads, [])
 
+    def test_file_shortcut_and_trash_view_only_come_down(self):
+        # Photos holds a shortcut to Docs/a.txt: deleting or editing it here must not touch a.txt on Drive.
+        self.drive.items["link"] = {"id": "link", "name": "Link.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                                    "parent": "photos",
+                                    "shortcutDetails": {"targetId": "a", "targetMimeType": "text/plain"}}
+        self.run_sync()
+        self.assertEqual((self.root / "Photos/Link.txt").read_bytes(), b"alpha")
+
+        (self.root / "Photos/Link.txt").unlink()
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos/Link.txt"], "NEW")  # comes back
+        self.assertFalse(self.drive.is_trashed(self.drive.items["a"]))
+        self.assertFalse(self.drive.items["link"].get("trashed"))
+        self.assertEqual((self.root / "Photos/Link.txt").read_bytes(), b"alpha")
+
+        (self.root / "Photos/Link.txt").write_bytes(b"edited through the shortcut")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Photos/Link.txt"], "CONFLICT")
+        self.assertEqual(self.drive.items["a"]["content"], b"alpha")
+        self.assertEqual(self.drive.uploads, [])
+
+        self.assertTrue(savegdrive.is_readonly_path(Path(savegdrive.TRASH_DIR) / "x.txt"))
+        self.assertTrue(savegdrive.is_readonly_path(Path(savegdrive.SHARED_WITH_ME_DIR) / "x.txt"))
+        self.assertFalse(savegdrive.is_readonly_path(Path(savegdrive.SHARED_WITH_ME_DIR) / "Team/x.txt"))
+        self.assertFalse(savegdrive.is_readonly_path(Path("Docs/x.txt")))
+
     def test_unchanged_files_are_not_hashed_again(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
