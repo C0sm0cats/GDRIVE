@@ -53,6 +53,7 @@ deleted for good: what you delete on one side goes to the trash of the other.
 
 ```text
 GDRIVE/
+├── .gitignore
 ├── LICENSE
 ├── README.md
 ├── savegdrive.py
@@ -118,7 +119,7 @@ git pull
 ```
 
 The runner upgrades the dependencies, including the packages they depend on,
-on the first run of a new version and then every 30 days. To upgrade them now:
+when the list of packages changes and then every 30 days. To upgrade them now:
 
 ```bash
 .venv/bin/python -m pip install -U --upgrade-strategy eager \
@@ -530,6 +531,9 @@ any time.
   the folder. Move the folder aside (for example `mv ~/GDrive ~/GDrive.old`),
   run SaveGDrive again to sync into a new empty folder, then compare the two
   and copy back what you changed locally before deleting the old one.
+- **"The tree needs a terminal"**: the tree cannot run from cron, a script
+  or with its output sent to a file. Run it once in a terminal, then use
+  `--again --yes` from cron or the script.
 - **More details**: run with `--verbose`.
 
 ## Tests
