@@ -49,8 +49,17 @@ imports_ok=1
 
 if [ "$imports_ok" = 0 ] || [ "$stamp_packages" != "$packages" ] \
     || [ -n "$(find "$stamp" -mtime +30 2>/dev/null)" ]; then
+    # When the packages already import, the upgrade is optional: without
+    # retries and with a short timeout, an offline run starts within seconds.
+    # "pip install -U" exits 0 when the index cannot be reached, so check
+    # first that it answers: an offline run must not write the stamp, or the
+    # next upgrade would wait 30 more days.
+    pip_net=
+    [ "$imports_ok" = 1 ] && pip_net="--retries 0 --timeout 10"
     # shellcheck disable=SC2086
-    if "$script_dir/.venv/bin/python" -m pip install -U --upgrade-strategy eager $packages; then
+    if { [ "$imports_ok" = 0 ] \
+            || "$script_dir/.venv/bin/python" -m pip index versions textual $pip_net >/dev/null 2>&1; } \
+        && "$script_dir/.venv/bin/python" -m pip install $pip_net -U --upgrade-strategy eager $packages; then
         printf '%s\n' "$packages" > "$stamp"
     elif [ "$imports_ok" = 1 ]; then
         echo "SaveGDrive could not update its Python packages; it will try again next run." >&2

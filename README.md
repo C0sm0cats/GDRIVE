@@ -119,7 +119,9 @@ git pull
 ```
 
 The runner upgrades the dependencies, including the packages they depend on,
-when the list of packages changes and then every 30 days. To upgrade them now:
+when the list of packages changes and then every 30 days. A run that cannot
+reach the package index (offline, PyPI blocked) starts with the installed
+packages and tries again the next run. To upgrade them now:
 
 ```bash
 .venv/bin/python -m pip install -U --upgrade-strategy eager \

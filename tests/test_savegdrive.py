@@ -7287,7 +7287,8 @@ case "$1" in
                 [ "$FAKE_VENV_OK" = 1 ] || {{ echo "ensurepip is not available" >&2; exit 1; }}
                 {mkdir} -p "$3/lib/site-packages/pip"; exit $? ;;
             pip) [ -d "$(dirname "$0")/../lib/site-packages/pip" ] || {{ echo "No module named pip" >&2; exit 1; }}
-                echo "$*" >> "$FAKE_PIP_LOG"; exit "$FAKE_PIP_RC" ;;
+                echo "$*" >> "$FAKE_PIP_LOG"
+                [ "$3" = index ] && exit "$FAKE_INDEX_RC"; exit "$FAKE_PIP_RC" ;;
         esac; exit 1 ;;
 esac
 echo "ran $*"
@@ -7301,7 +7302,8 @@ class LauncherTest(unittest.TestCase):
     PACKAGES = "google-api-python-client google-auth google-auth-oauthlib send2trash textual"
 
     def run_launcher(self, names, version_ok=True, venv=False, stamp=None, stamp_age_days=0,
-                     imports_ok=True, pip_rc=0, venv_site=True, venv_pip=True, venv_ok=True):
+                     imports_ok=True, pip_rc=0, venv_site=True, venv_pip=True, venv_ok=True,
+                     index_rc=0):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         shutil.copy(Path(__file__).resolve().parent.parent / "run-savegdrive.sh", root)
         (root / "savegdrive.py").write_text("")
@@ -7333,8 +7335,10 @@ class LauncherTest(unittest.TestCase):
             "FAKE_IMPORTS_OK": "1" if imports_ok else "0",
             "FAKE_PIP_LOG": str(root / "pip.log"),
             "FAKE_PIP_RC": str(pip_rc),
+            "FAKE_INDEX_RC": str(index_rc),
             "FAKE_VENV_OK": "1" if venv_ok else "0",
         }
+        self.last_env = env
         result = subprocess.run(
             [shutil.which("sh"), str(root / "run-savegdrive.sh"), "--help"],
             env=env, capture_output=True, text=True, timeout=30,
@@ -7359,20 +7363,40 @@ class LauncherTest(unittest.TestCase):
         self.assertIn("3.10.22", result.stderr)
         self.assertFalse((root / ".venv").exists())
 
-    def pip_calls(self, root):
+    def pip_calls(self, root, command="install"):
         log = root / "pip.log"
-        return log.read_text().splitlines() if log.exists() else []
+        calls = log.read_text().splitlines() if log.exists() else []
+        return [call for call in calls if call.split()[2] == command]
+
+    UPGRADE = "-m pip install --retries 0 --timeout 10 -U --upgrade-strategy eager " + PACKAGES
 
     def test_launcher_upgrades_an_existing_venv_without_stamp(self):
         # A .venv from before the stamp (e.g. 1.1.0) whose imports all work.
         result, root = self.run_launcher(["python3"], venv=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.pip_calls(root),
-            ["-m pip install -U --upgrade-strategy eager " + self.PACKAGES],
-        )
+        self.assertEqual(self.pip_calls(root), [self.UPGRADE])
         self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
         self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_offline_upgrade_starts_fast_and_keeps_the_old_stamp(self):
+        # pip install -U exits 0 when the index cannot be reached: the stamp
+        # must stay old so the next run tries again, and pip must not retry.
+        result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES,
+                                         stamp_age_days=31, index_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pip_calls(root, "index"),
+                         ["-m pip index versions textual --retries 0 --timeout 10"])
+        self.assertEqual(self.pip_calls(root), [])
+        self.assertIn("try again next run", result.stderr)
+        self.assertIn("savegdrive.py --help", result.stdout)
+        stamp = root / ".venv" / ".savegdrive-deps"
+        self.assertGreater(time.time() - stamp.stat().st_mtime, 30 * 86400)
+        # Back online, the upgrade runs and the stamp is renewed.
+        subprocess.run([shutil.which("sh"), str(root / "run-savegdrive.sh"), "--help"],
+                       env={**self.last_env, "FAKE_INDEX_RC": "0"},
+                       capture_output=True, text=True, timeout=30, check=True)
+        self.assertEqual(self.pip_calls(root), [self.UPGRADE])
+        self.assertLess(time.time() - stamp.stat().st_mtime, 86400)
 
     def test_launcher_upgrades_on_old_or_different_stamp_only(self):
         result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES, stamp_age_days=1)
