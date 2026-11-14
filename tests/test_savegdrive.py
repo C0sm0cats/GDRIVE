@@ -3722,6 +3722,35 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Errno", output.getvalue())
         self.assertFalse(target.parent.exists())
 
+    def test_busy_folder_or_missing_parent_does_not_advise_another_folder(self):
+        # Waiting, or creating the parent, is the fix: another folder would download everything again.
+        busy = Path(self.temp.name) / "Busy"
+        busy.mkdir()
+        fd = os.open(busy, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another run syncing it
+        not_empty = Path(self.temp.name) / "NotEmpty"
+        not_empty.mkdir()
+        (not_empty / "a.txt").write_text("a")
+        cases = [
+            (busy, "Another SaveGDrive run is using this folder: wait for it to finish.", False),
+            (Path(self.temp.name) / "Backups" / "GDrive", "does not exist: create it first.", False),
+            (not_empty, "already contains files", True),
+        ]
+        for target, message, advised in cases:
+            output = io.StringIO()
+            with self.subTest(target=target.name), \
+                    mock.patch.object(sys, "argv", ["savegdrive", "--download-path", str(target)]), \
+                    mock.patch.object(savegdrive, "console", Console(file=output, width=400, highlight=False)), \
+                    mock.patch.object(savegdrive, "authenticate", side_effect=AssertionError("signed in")), \
+                    mock.patch.object(sys.stdin, "isatty", lambda: True), \
+                    mock.patch.object(sys.stdout, "isatty", lambda: True):
+                with self.assertRaises(SystemExit) as raised:
+                    savegdrive.main()
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn(message, output.getvalue())
+                self.assertEqual("Choose another folder" in output.getvalue(), advised)
+
     def test_wrong_credentials_file_says_what_to_download_instead_of_a_traceback(self):
         # A service account key and a truncated file: both common first-install mistakes.
         credentials = Path(self.temp.name) / "credentials.json"

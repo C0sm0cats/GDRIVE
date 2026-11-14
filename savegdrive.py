@@ -1152,6 +1152,14 @@ def claim_drive_root(destination, drive_root, service=None):
 FOLDER_LOCK = {}  # the managed folder this run syncs, locked until it exits: {"path": Path, "fd": int}
 
 
+class FolderBusy(ValueError):
+    """Another run holds the folder: waiting is the fix, not another folder."""
+
+
+class MissingParent(ValueError):
+    """The folder's parent does not exist (maybe an unmounted disk): creating it is the fix, not another folder."""
+
+
 def lock_folder(destination):
     """Lock the managed folder (flock on the folder itself), so two runs never sync it at once.
 
@@ -1163,7 +1171,7 @@ def lock_folder(destination):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        raise ValueError("Another SaveGDrive run is using this folder: wait for it to finish.") from None
+        raise FolderBusy("Another SaveGDrive run is using this folder: wait for it to finish.") from None
     except BaseException:
         os.close(fd)
         raise
@@ -1221,7 +1229,7 @@ def initialize_managed_destination(destination, service=None):
     else:
         # Only the folder itself is created: a missing parent may be an unmounted disk.
         if not destination.parent.is_dir():
-            raise ValueError(
+            raise MissingParent(
                 f"The parent folder {destination.parent} does not exist: create it first."
             )
         destination.mkdir(parents=False)
@@ -6195,10 +6203,11 @@ def main():
             ):
                 no_previous_selection(candidate)
         def refuse_folder(error):
-            console.print(
-                f"[red]✗[/] {escape(args.download_path)}: {escape(str(error))}\n"
-                "  [dim]Choose another folder with --download-path PATH.[/]"
+            # Not for a busy folder or a missing parent: another folder would download everything again.
+            advice = "" if isinstance(error, (FolderBusy, MissingParent)) else (
+                "\n  [dim]Choose another folder with --download-path PATH.[/]"
             )
+            console.print(f"[red]✗[/] {escape(args.download_path)}: {escape(str(error))}{advice}")
             raise SystemExit(1)
 
         try:
