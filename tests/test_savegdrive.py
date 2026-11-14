@@ -4063,6 +4063,29 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"kept last time")
         self.assertEqual((self.root / "Docs/b (local 2).txt").read_bytes(), b"edited locally again")
 
+    def test_keep_both_of_a_name_near_255_bytes_shortens_the_copy(self):
+        # bugs 60: "name (local).ext" must fit the 255-byte limit, or keep both fails (OSError under 3.11-3.13).
+        names = ["x" * 247 + ".txt", "é" * 125 + ".txt", "y." + "z" * 252]
+        for index, name in enumerate(names):
+            self.drive.items[f"long{index}"] = file_item(f"long{index}", name, "docs", b"v1")
+        self.conflict_after_docs_sync()
+        for index, name in enumerate(names):
+            (self.root / "Docs" / name).write_bytes(b"mine")
+            self.drive.items[f"long{index}"].update(file_item(f"long{index}", name, "docs", b"theirs"))
+            self.drive.change(f"long{index}")
+        output = self.run_main("--again", "--yes", "--keep-both")
+        self.assertNotIn("error", output)
+        copies = sorted(path.name for path in (self.root / "Docs").iterdir() if "(local)" in path.name)
+        self.assertEqual(len(copies), 4, copies)  # b.txt and the three long names
+        for name in names:
+            self.assertEqual((self.root / "Docs" / name).read_bytes(), b"theirs")
+        for copy in copies:
+            self.assertLessEqual(len(copy.encode()), 255, copy)
+            self.assertEqual((self.root / "Docs" / copy).read_bytes(), b"edited locally" if copy.startswith("b ")
+                             else b"mine")
+        self.assertIn("x" * 243 + " (local).txt", copies)
+        self.assertIn("é" * 121 + " (local).txt", copies)  # never half a character
+
     def keep_both_b_planned(self):
         """b.txt edited here and on Drive, keep both chosen in the preview: (plan, state)."""
         self.run_sync()

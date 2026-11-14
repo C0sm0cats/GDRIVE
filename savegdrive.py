@@ -65,6 +65,7 @@ CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 STATE_FILE_NAME = ".savegdrive-state.json"
 REMOTE_CACHE_NAME = ".savegdrive-cache.json"
 PART_SUFFIX = ".savegdrive.part"
+NAME_MAX_BYTES = 255  # longest file name on ext4, APFS, btrfs... (Errno 36 above)
 FILTER_DELAY = 0.25  # seconds without typing before the filter rebuilds the tree
 # GDrive Pull (before 2.0) kept the same state format under these names.
 LEGACY_STATE_FILE_NAME = ".gdrivepull-managed-state.json"
@@ -4507,8 +4508,17 @@ def local_copy_path(destination, taken):
     counter = 1
     while True:
         label = "local" if counter == 1 else f"local {counter}"
-        candidate = destination.with_name(f"{stem} ({label}){suffix}")
-        if candidate not in taken and not candidate.exists():
+        tail = f" ({label}){suffix}"
+        if len(os.fsencode(tail)) > NAME_MAX_BYTES - 1:  # an extension too long to keep: cut the whole name
+            tail, short = f" ({label})", destination.name
+        else:
+            short = stem
+        # Names are limited to 255 bytes (Errno 36): shorten the name, never by half a character.
+        while short and len(os.fsencode(short + tail)) > NAME_MAX_BYTES:
+            short = short[:-1]
+        candidate = destination.with_name(short + tail)
+        # os.path.lexists, not Path.exists: that one raises on a name too long under Python 3.11 to 3.13.
+        if candidate not in taken and not os.path.lexists(candidate):
             return candidate
         counter += 1
 
