@@ -6246,6 +6246,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(table.cursor_row, 0)
             self.assertEqual(table.scroll_x, 0)
 
+    async def test_shift_b_again_undoes_keep_both(self):
+        plan = []
+        for n in (1, 2):
+            (self.root / f"notes {n}.txt").write_text("edited here")
+            plan.append({
+                "status": "CONFLICT", "relative_path": Path(f"notes {n}.txt"), "kind": "FILE",
+                "item": {"id": f"c{n}", "name": f"notes {n}.txt", "size": "10"},
+                "destination": self.root / f"notes {n}.txt",
+            })
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("B")
+            await pilot.pause()
+            self.assertEqual([entry["status"] for entry in plan], ["KEEP_BOTH", "KEEP_BOTH"])
+            await pilot.press("B")  # again: undo
+            await pilot.pause()
+            self.assertEqual([entry["status"] for entry in plan], ["CONFLICT", "CONFLICT"])
+            self.assertFalse(any("local_copy" in entry for entry in plan))
+
     async def test_preview_tab_and_keep_both_do_not_fill_the_table_again(self):
         # perf 7: each tab and each b cleared the table and added all its rows again (1 to 4 s at 10 000 rows).
         plan = [{
