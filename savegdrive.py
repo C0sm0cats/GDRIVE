@@ -1066,10 +1066,11 @@ def compact_scopes(scopes):
     return compacted
 
 
-def fully_selected(root_items, base, selections):
+def fully_selected(root_items, base, selections, index=None):
     if not root_items:
         return False
-    index = selection_index(selections)  # once: path_selection_state per item rescanned the selection
+    if index is None:  # once: path_selection_state per item rescanned the selection
+        index = selection_index(selections)
     return all(
         indexed_selection_state(base / local_name(item), index) in {"x", "*"}
         for item in root_items
@@ -1082,10 +1083,20 @@ def build_local_scopes(selections, browsed_directories, bases=(Path(),)):
         for entry in selections
         if covers_selection(entry, selected_path(entry))
     ]
+    index = selection_index(selections)  # once for every view, not once per view
     for base in bases:
-        if fully_selected(browsed_directories.get(base, []), base, selections):
+        if fully_selected(browsed_directories.get(base, []), base, selections, index):
             scopes.append(base)
     return compact_scopes(scopes)
+
+
+def fully_selected_roots(views, selections):
+    """(root_id, base, can_add) of each loaded view whose top items are all selected."""
+    index = selection_index(selections)  # once for every view, not once per view
+    return [
+        (view.root_id, view.base, view.can_add) for view in views
+        if view.nodes and fully_selected(view.browsed.get(view.base, []), view.base, selections, index)
+    ]
 
 
 def matches_filter(entry, terms):
@@ -6393,10 +6404,7 @@ def main():
             destination_root, state = result["destination"], result["state"]
             roots = result.get("roots")  # from s: the last selection's own
             if roots is None:
-                roots = [
-                    (view_.root_id, view_.base, view_.can_add) for view_ in views
-                    if view_.nodes and fully_selected(view_.browsed.get(view_.base, []), view_.base, selections)
-                ]
+                roots = fully_selected_roots(views, selections)
             if args.yes:
                 print_plan(plan, destination_root)
                 if not confirm_in_terminal(args, plan, state):

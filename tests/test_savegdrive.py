@@ -15,6 +15,7 @@ import unittest
 import webbrowser
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -5296,6 +5297,28 @@ class SelectionScalingTest(unittest.TestCase):
     def test_fully_selected_view_is_linear(self):
         # perf 14: every top item of the view selected (a, then d or y) rescanned the selection per item.
         self.assertLess(self.fully_selected_view(400), self.fully_selected_view(20) * 30)
+
+    def fully_selected_views(self, count):
+        bases = [Path("Shared drives") / f"T{index}" for index in range(count)]
+        browsed, selections, views = {}, [], []
+        for base in bases:
+            items = [{"id": f"{base}/{index}", "name": f"D{index}", "mimeType": FOLDER} for index in range(5)]
+            browsed[base] = items
+            savegdrive.add_selected_items(selections, [{"item": item, "relative_parent": base} for item in items])
+            views.append(SimpleNamespace(root_id=str(base), base=base, can_add=False, nodes=[1], browsed={base: items}))
+        calls, scopes = self.count_paths(lambda: savegdrive.build_local_scopes(selections, browsed, bases))
+        self.assertEqual(scopes, sorted(bases, key=lambda path: path.as_posix()))
+        roots_calls, roots = self.count_paths(lambda: savegdrive.fully_selected_roots(views, selections))
+        self.assertEqual(roots, [(str(base), base, False) for base in bases])
+        partial = savegdrive.fully_selected_roots(views, selections[1:])
+        self.assertEqual(len(partial), count - 1)
+        return calls, roots_calls
+
+    def test_fully_selected_views_are_linear(self):
+        # perf 19: d and main's roots rebuilt the selection index once per view (views x selection).
+        small, big = self.fully_selected_views(10), self.fully_selected_views(100)
+        self.assertLess(big[0], small[0] * 30)  # 10x the views and the selection; per view, it was 100x
+        self.assertLess(big[1], small[1] * 30)
 
     def test_compact_scopes_is_linear(self):
         calls = [0]
