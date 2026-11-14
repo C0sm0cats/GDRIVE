@@ -4497,6 +4497,33 @@ class DriveCallBatchingTest(unittest.TestCase):
             self.assertTrue(check(), run.__name__)
             self.assertEqual(drive.batches, [50, 10], run.__name__)
 
+    def test_trash_restore_and_delete_retry_rate_limits(self):
+        # bugs 54, maint 8: a passing 429 or 403 rate limit is retried, as for listings; other errors are not.
+        for run, method in ((savegdrive.trash_items, "update"), (savegdrive.restore_items, "update"),
+                            (savegdrive.delete_items, "delete")):
+            with self.subTest(run=run.__name__):
+                drive = FakeDrive([file_item(item_id, f"{item_id}.txt", "root", b"x") for item_id in "abc"])
+                failures = {"a": [http_error(429)], "b": [http_error(403, "userRateLimitExceeded")],
+                            "c": [http_error(403, "insufficientFilePermissions")]}
+                real = getattr(drive, method)
+
+                def call(fileId, *args, real=real, failures=failures, **kwargs):
+                    if failures.get(fileId):
+                        error = failures[fileId].pop(0)
+
+                        def fail():
+                            raise error
+
+                        return FakeRequest(fail)
+                    return real(fileId, *args, **kwargs)
+
+                setattr(drive, method, call)
+                with mock.patch.object(savegdrive.time, "sleep") as sleep:
+                    failed = run(drive, ["a", "b", "c"])
+                self.assertEqual(list(failed), ["c"])
+                self.assertEqual(drive.batches, [3, 2])  # a and b retried once, c refused for good
+                sleep.assert_called_once_with(2)
+
 
 class ApplyPlanPhasesTest(unittest.TestCase):
     """apply_plan's phases, each tested on its own (maint 1, maint 3)."""

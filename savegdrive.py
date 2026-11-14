@@ -431,6 +431,48 @@ def is_retryable(error):
     return error.status_code == 403 and "ratelimit" in str(error).casefold()
 
 
+def run_batched(service, keys, make_request, on_result, what, batch_errors=False):
+    """Run one Drive call per key in batches of API_BATCH_SIZE, retrying rate limits and server errors.
+
+    on_result(key, response, exception) gets the final outcome of each call, once per key; it may return
+    more keys to run (a next page). With batch_errors, an error of a whole batch becomes the exception of
+    each of its unanswered calls instead of being raised."""
+    pending = list(keys)
+    attempts = Counter()
+
+    while pending:
+        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
+        retry, answered = [], set()
+
+        def callback(request_id, response, exception, chunk=chunk):
+            position = int(request_id)
+            key = chunk[position]
+            answered.add(position)
+            if exception is not None and is_retryable(exception) and attempts[key] < API_RETRIES:
+                attempts[key] += 1
+                retry.append(key)
+            else:
+                pending.extend(on_result(key, response, exception) or ())
+
+        batch = service.new_batch_http_request(callback=callback)
+        for position, key in enumerate(chunk):
+            batch.add(make_request(key), request_id=str(position))
+        try:
+            batch.execute()
+        except DRIVE_CALL_ERRORS as error:
+            if not batch_errors:
+                raise
+            for position, key in enumerate(chunk):
+                if position not in answered:
+                    pending.extend(on_result(key, None, error) or ())
+        debug(f"Drive batch: {plural(len(chunk), what)}")
+        if retry:
+            delay = min(2 ** max(attempts[key] for key in retry), 30)
+            debug(f"Drive rate limit, retrying {plural(len(retry), what)} in {delay}s")
+            time.sleep(delay)
+            pending = retry + pending
+
+
 FOLDER_DRIVES = {}  # folder id -> shared drive id: shared drive folders are listed within their drive
 
 
@@ -471,37 +513,17 @@ def list_folders(service, folder_ids, cache):
     """Store the sorted children of every folder in cache, listing them in batched API calls."""
     pending = [(folder_id, None) for folder_id in dict.fromkeys(folder_ids) if folder_id not in cache]
     found = {folder_id: [] for folder_id, _ in pending}
-    attempts = Counter()
 
-    while pending:
-        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
-        retry, errors = [], []
+    def on_result(key, response, exception):
+        folder_id, _ = key
+        if exception is not None:
+            raise exception
+        found[folder_id].extend(response.get("files", []))
+        if response.get("nextPageToken"):
+            return [(folder_id, response["nextPageToken"])]
+        return []
 
-        def callback(request_id, response, exception, chunk=chunk):
-            folder_id, page_token = chunk[int(request_id)]
-            if exception is not None:
-                if is_retryable(exception) and attempts[folder_id] < API_RETRIES:
-                    attempts[folder_id] += 1
-                    retry.append((folder_id, page_token))
-                else:
-                    errors.append(exception)
-                return
-            found[folder_id].extend(response.get("files", []))
-            if response.get("nextPageToken"):
-                pending.append((folder_id, response["nextPageToken"]))
-
-        batch = service.new_batch_http_request(callback=callback)
-        for index, (folder_id, page_token) in enumerate(chunk):
-            batch.add(list_request(service, folder_id, page_token), request_id=str(index))
-        batch.execute()
-        debug(f"Listed {len(chunk)} folder page(s)")
-        if errors:
-            raise errors[0]
-        if retry:
-            delay = min(2 ** max(attempts[folder_id] for folder_id, _ in retry), 30)
-            debug(f"Drive rate limit, retrying {len(retry)} listing(s) in {delay}s")
-            time.sleep(delay)
-            pending = retry + pending
+    run_batched(service, pending, lambda key: list_request(service, *key), on_result, "folder page")
 
     for folder_id, items in found.items():
         note_drives(items)
@@ -520,36 +542,16 @@ def list_folders(service, folder_ids, cache):
 
 def get_items(service, ids, fields):
     """The metadata of every id in batched API calls: id -> item, or the HttpError Drive gave for it."""
-    pending = list(dict.fromkeys(ids))
     found = {}
-    attempts = Counter()
 
-    while pending:
-        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
-        retry = []
+    def on_result(item_id, response, exception):
+        found[item_id] = response if exception is None else exception
 
-        def callback(request_id, response, exception, chunk=chunk):
-            item_id = chunk[int(request_id)]
-            if exception is None:
-                found[item_id] = response
-            elif is_retryable(exception) and attempts[item_id] < API_RETRIES:
-                attempts[item_id] += 1
-                retry.append(item_id)
-            else:
-                found[item_id] = exception
-
-        batch = service.new_batch_http_request(callback=callback)
-        for index, item_id in enumerate(chunk):
-            batch.add(
-                service.files().get(fileId=item_id, fields=fields, supportsAllDrives=True), request_id=str(index)
-            )
-        batch.execute()
-        debug(f"Got {plural(len(chunk), 'item')}")
-        if retry:
-            delay = min(2 ** max(attempts[item_id] for item_id in retry), 30)
-            debug(f"Drive rate limit, retrying {len(retry)} call(s) in {delay}s")
-            time.sleep(delay)
-            pending = retry + pending
+    run_batched(
+        service, list(dict.fromkeys(ids)),
+        lambda item_id: service.files().get(fileId=item_id, fields=fields, supportsAllDrives=True),
+        on_result, "item",
+    )
     return found
 
 
@@ -2042,17 +2044,12 @@ def load_view(service, view, cache, on_progress=lambda folders, items: None):
 def run_on_items(service, ids, make_request):
     """Run one Drive call per id in batches; returns the ids that failed, with their error."""
     failed = {}
-    for start in range(0, len(ids), API_BATCH_SIZE):
-        chunk = ids[start:start + API_BATCH_SIZE]
 
-        def callback(request_id, response, exception, chunk=chunk):
-            if exception is not None:
-                failed[chunk[int(request_id)]] = error_text(exception)
+    def on_result(item_id, response, exception):
+        if exception is not None:
+            failed[item_id] = error_text(exception)
 
-        batch = service.new_batch_http_request(callback=callback)
-        for index, item_id in enumerate(chunk):
-            batch.add(make_request(item_id), request_id=str(index))
-        batch.execute()
+    run_batched(service, ids, make_request, on_result, "call")
     return failed
 
 
@@ -5341,38 +5338,14 @@ def remote_folder_request(service, name, parent_id):
 def create_remote_folders(service, folders):
     """Create every (name, parent id) of folders on Drive in batched calls; returns, for each, the folder or its error."""
     made = [None] * len(folders)
-    pending = list(range(len(folders)))
-    attempts = Counter()
 
-    while pending:
-        chunk, pending = pending[:API_BATCH_SIZE], pending[API_BATCH_SIZE:]
-        retry = []
+    def on_result(index, response, exception):
+        made[index] = response if exception is None else exception
 
-        def callback(request_id, response, exception, chunk=chunk):
-            index = chunk[int(request_id)]
-            if exception is None:
-                made[index] = response
-            elif is_retryable(exception) and attempts[index] < API_RETRIES:
-                attempts[index] += 1
-                retry.append(index)
-            else:
-                made[index] = exception
-
-        batch = service.new_batch_http_request(callback=callback)
-        for position, index in enumerate(chunk):
-            batch.add(remote_folder_request(service, *folders[index]), request_id=str(position))
-        try:
-            batch.execute()
-        except DRIVE_CALL_ERRORS as error:
-            for index in chunk:
-                if made[index] is None and index not in retry:
-                    made[index] = error
-        debug(f"Created {plural(len(chunk), 'folder')} on Drive")
-        if retry:
-            delay = min(2 ** max(attempts[index] for index in retry), 30)
-            debug(f"Drive rate limit, retrying {len(retry)} folder creation(s) in {delay}s")
-            time.sleep(delay)
-            pending = retry + pending
+    run_batched(
+        service, range(len(folders)), lambda index: remote_folder_request(service, *folders[index]),
+        on_result, "folder creation", batch_errors=True,
+    )
     return made
 
 
