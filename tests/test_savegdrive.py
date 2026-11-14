@@ -3319,6 +3319,63 @@ class SyncTest(unittest.TestCase):
         # A base two saved roots share (--again) sends nothing.
         self.assertEqual(savegdrive.upload_roots([("corp", Path("x")), ("evil", Path("x"))]), {Path("x"): None})
 
+    def test_my_drive_folder_named_shared_drives_is_a_conflict_and_leaves_the_shared_drive_alone(self):
+        # bugs 57: a My Drive folder "Shared drives" shared the shared drives' local folder: picked with
+        # My Drive, it replaced the shared drive in the selection, and each view sent the other's copies
+        # to the system trash.
+        self.drive.items.update({
+            "sd": {"id": "sd", "name": savegdrive.SHARED_DRIVES_DIR, "mimeType": FOLDER, "parent": "root"},
+            "myfin": {"id": "myfin", "name": "Finance", "mimeType": FOLDER, "parent": "sd"},
+            "m": file_item("m", "mine.txt", "myfin", b"mine"),
+            "q": file_item("q", "q3.xlsx", "corp", b"q3"),
+        })
+        self.drive.shared_drives = [{"id": "corp", "name": "Finance"}]
+        views = savegdrive.drive_views(self.drive, "root")
+        corp = next(view for view in views if view.root_id == "corp")
+        both = {views[0].root_id, "corp"}
+        q3, mine = (corp.base / "q3.xlsx").as_posix(), (corp.base / "mine.txt").as_posix()
+
+        plan = self.sync_views(views, both)
+        self.assertEqual(plan[savegdrive.SHARED_DRIVES_DIR]["status"], "CONFLICT")
+        self.assertTrue(plan[savegdrive.SHARED_DRIVES_DIR].get("view_name"))
+        self.assertEqual(plan[q3]["status"], "NEW")
+        self.assertNotIn(mine, plan)
+        self.assertTrue(any("'Shared drives'" in note for note in savegdrive.plan_notes(list(plan.values()))))
+        for picked in ({"corp"}, both, {views[0].root_id}, both):
+            plan = self.sync_views(views, picked)
+            self.assertNotIn("TRASH_LOCAL", {entry["status"] for entry in plan.values()})
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.assertEqual((self.root / q3).read_bytes(), b"q3")
+        self.assertFalse((self.root / mine).exists())
+
+        (self.root / corp.base / "salaries.xlsx").write_bytes(b"SALARIES")
+        plan = self.sync_views(views, both)
+        self.assertEqual(plan[(corp.base / "salaries.xlsx").as_posix()]["parent_id"], "corp")
+        self.assertEqual([self.drive.items[upload]["parent"] for upload in self.drive.uploads], ["corp"])
+
+        # --again, from a selection an older version saved with a "Shared drives" scope.
+        (self.root / corp.base / "budget.xlsx").write_bytes(b"BUDGET")
+        state = savegdrive.load_state(self.root)
+        roots = [(view.root_id, view.base, view.can_add) for view in views if view.root_id in both]
+        savegdrive.remember_selection(state, [], [Path(), Path(savegdrive.SHARED_DRIVES_DIR)], roots)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            again, again_scopes = savegdrive.last_selection(self.drive, state, {}, [])
+        plan = savegdrive.build_plan(self.drive, again, again_scopes, self.root, state, {},
+                                     roots=savegdrive.upload_roots(savegdrive.saved_roots(state)))
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses[savegdrive.SHARED_DRIVES_DIR], "CONFLICT")
+        self.assertEqual(statuses[(corp.base / "budget.xlsx").as_posix()], "UPLOAD_NEW")
+        self.assertEqual(statuses[q3], "UNCHANGED")
+
+        selections = []
+        for view in views:
+            if view.root_id in both:
+                for entry in view.children_of.get(None, []):
+                    savegdrive.add_selected_item(selections, entry["item"], entry["relative_parent"])
+        self.assertEqual(savegdrive.path_selection_state(Path(q3), selections), "x")
+        index = savegdrive.selection_index(selections)
+        self.assertEqual(savegdrive.indexed_selection_state(Path(q3), index), "x")
+
     def test_shared_folder_named_like_yours_is_a_conflict(self):
         # A stranger shares a "Finance" folder listed before your colleague's: neither syncs any more.
         colleague = {"id": "corp", "name": "Finance", "mimeType": FOLDER, "parent": "ann", "shared": True}

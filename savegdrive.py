@@ -92,9 +92,10 @@ SHARED_DRIVES_DIR = "Shared drives"
 TRASH = "trash"  # pseudo folder id: the items you moved to the Drive trash
 TRASH_DIR = "Trash"
 VIEW_DIRS = {SHARED_WITH_ME_DIR, SHARED_DRIVES_DIR, TRASH_DIR}
-# A Drive item at the top named like a read only view would share its local folder: what you change
-# there would only come down. It is a conflict until renamed on Drive.
-VIEW_NAME_PATHS = {Path(SHARED_WITH_ME_DIR), Path(TRASH_DIR)}
+# A Drive item at the top named like a view would share its local folder: what you change there
+# would only come down, or the view's items would go to your trash. It is a conflict until renamed on
+# Drive, and as a folder in the selection it covers nothing: the view's own items stay selected.
+VIEW_NAME_PATHS = {Path(SHARED_WITH_ME_DIR), Path(TRASH_DIR), Path(SHARED_DRIVES_DIR)}
 STATE_VERSION = 1
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
@@ -946,9 +947,14 @@ def path_selection_state(path, selections):
         entry_path = selected_path(entry)
         if entry_path == path:
             return "x"
-        if is_folder(entry["item"]) and entry_path in path.parents:
+        if covers_selection(entry, entry_path) and entry_path in path.parents:
             return "*"
     return " "
+
+
+def covers_selection(entry, path):
+    """Does this selected entry select what is under its path? A folder named like a view does not."""
+    return is_folder(entry["item"]) and path not in VIEW_NAME_PATHS
 
 
 def selection_index(selections):
@@ -972,7 +978,7 @@ def indexed_selection_state(path, index):
 def index_selection(index, entry):
     path = selected_path(entry)
     index[0].setdefault(path, set()).add(entry["item"].get("id"))
-    if is_folder(entry["item"]):
+    if covers_selection(entry, path):
         index[1].add(path)
 
 
@@ -993,7 +999,7 @@ def add_selected_items(selections, candidates):
         if already_selected(path, candidate["item"].get("id"), index):
             continue
         index_selection(index, candidate)
-        if is_folder(candidate["item"]):
+        if covers_selection(candidate, path):
             new_folders.add(path)
         added.append(candidate)
     if not added:
@@ -1053,7 +1059,7 @@ def build_local_scopes(selections, browsed_directories, bases=(Path(),)):
     scopes = [
         selected_path(entry)
         for entry in selections
-        if is_folder(entry["item"])
+        if covers_selection(entry, selected_path(entry))
     ]
     for base in bases:
         if fully_selected(browsed_directories.get(base, []), base, selections):
@@ -3301,7 +3307,14 @@ def last_selection(service, state, cache, kept=None):
         return None
     saved = state["last_selection"]
     selections = []
-    scopes = [Path(scope) for scope in saved.get("scopes", [])]
+    scopes = [Path(scope) for scope in saved.get("scopes", []) if scope != SHARED_DRIVES_DIR]
+    if len(scopes) < len(saved.get("scopes", [])):
+        # "Shared drives" is no view's folder: an older version saved it for a My Drive folder by that name,
+        # and it covered the folders of the shared drives picked with it. Those are scanned on their own.
+        scopes.extend(
+            Path(root["base"]) for root in saved.get("roots", [])
+            if Path(SHARED_DRIVES_DIR) in Path(root["base"]).parents
+        )
     from_roots = []
     for root in saved.get("roots", []):
         if root["id"] in {SHARED_WITH_ME, TRASH}:
@@ -4033,10 +4046,16 @@ class LocalScan:
             if entry["kind"] == "FOLDER"
             and (
                 entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat")
-                or entry.get("too_deep") or entry.get("symlink") or entry.get("view_name")
+                or entry.get("too_deep") or entry.get("symlink")
             )
         }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link
         # here: nothing below goes anywhere
+        self.view_named = {
+            entry["relative_path"] for entry in plan if entry["kind"] == "FOLDER" and entry.get("view_name")
+        }  # a Drive folder named like a view: nothing below goes anywhere, except in the views' own folders
+        self.view_scopes = [
+            scope for scope in scopes if not self.view_named.isdisjoint(scope.parents)
+        ]  # e.g. a shared drive's folder under "Shared drives"
         forget_gone_from_both_sides(
             state, destination_root, self.scope_set, self.remote_files, self.remote_directories,
             self.at_or_below_trashed,
@@ -4062,7 +4081,12 @@ class LocalScan:
     def at_or_below_trashed(self, path):
         # One set lookup per parent: a scan of every trashed folder for each local path was quadratic
         trashed = self.trashed_remote
-        return bool(trashed) and (path in trashed or not trashed.isdisjoint(path.parents))
+        if trashed and (path in trashed or not trashed.isdisjoint(path.parents)):
+            return True
+        named = self.view_named
+        return bool(named) and (path in named or not named.isdisjoint(path.parents)) and not any(
+            scope == path or scope in path.parents for scope in self.view_scopes
+        )
 
     def drive_spelling(self, child, relative_path, kind):
         """The Drive path child is on disk under another spelling, or None."""
