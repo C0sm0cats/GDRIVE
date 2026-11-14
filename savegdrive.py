@@ -14,6 +14,7 @@ import threading
 import textwrap
 import time
 import unicodedata
+import urllib.parse
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6074,8 +6075,13 @@ def result_notice(plan, results):
 
 
 def folder_id_arg(text):
-    """The --folder-id value reduced to the ID: Drive's "Copy link" ends in ?usp=sharing, a full link also works."""
-    return re.split(r"[?#]", text.strip())[0].rstrip("/").rsplit("/", 1)[-1] or "root"
+    """The --folder-id value reduced to the ID: Drive's "Copy link" ends in ?usp=sharing, a full link also works,
+    including the older open?id=ID form."""
+    text = text.strip()
+    query_id = urllib.parse.parse_qs(urllib.parse.urlsplit(text).query).get("id")
+    if query_id and query_id[0].strip():
+        return query_id[0].strip()
+    return re.split(r"[?#]", text)[0].rstrip("/").rsplit("/", 1)[-1] or "root"
 
 
 def destination_path(path_text):

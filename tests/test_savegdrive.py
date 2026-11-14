@@ -2321,6 +2321,7 @@ class SyncTest(unittest.TestCase):
 
     def test_folder_id_copied_from_a_drive_link_opens_that_folder(self):
         # ux 36: Drive's "Copy link" ends in ?usp=sharing or ?usp=drive_link; a full link works too.
+        # ux 41: older shares link to open?id=ID, where the last path segment is "open".
         opened = []
 
         def drive_views(service, folder_id):
@@ -2329,7 +2330,8 @@ class SyncTest(unittest.TestCase):
 
         self.addCleanup(setattr, savegdrive, "DRIVE_ROOT", savegdrive.DRIVE_ROOT)
         values = ["docs?usp=sharing", "docs?usp=drive_link", " docs/ ",
-                  "https://drive.google.com/drive/folders/docs?usp=sharing", "docs"]
+                  "https://drive.google.com/drive/folders/docs?usp=sharing", "docs",
+                  "https://drive.google.com/open?id=docs", "https://drive.google.com/open?id=docs&usp=drive_fs"]
         with mock.patch.object(savegdrive, "drive_views", drive_views):
             for value in values:
                 with self.assertRaises(SystemExit):
