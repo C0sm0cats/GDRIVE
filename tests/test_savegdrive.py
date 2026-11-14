@@ -4641,6 +4641,27 @@ class TrashedFoldersScalingTest(unittest.TestCase):
         self.assertEqual(self.local_entries(2), self.local_entries(40))
 
 
+class LastSyncNewFoldersScalingTest(unittest.TestCase):
+    """New folders are checked against the files to transfer by lookup, not one scan each (perf 17)."""
+
+    def comparisons(self, files):
+        plan = [{"kind": "FOLDER", "status": status, "relative_path": CountingPath(path)}
+                for status, path in (("NEW", "Photos/Day"), ("NEW", "Photos/Empty"),
+                                     ("UPLOAD_NEW", "Scans/Batch"), ("UPLOAD_NEW", "Scans/Empty"))]
+        plan += [{"kind": "FILE", "status": "NEW", "relative_path": Path(f"Photos/Day/p{index}.jpg")}
+                 for index in range(files)]
+        plan += [{"kind": "FILE", "status": "UPLOAD_NEW", "relative_path": Path(f"Scans/Batch/s{index}.pdf")}
+                 for index in range(files)]
+        CountingPath.comparisons = 0
+        text = savegdrive.last_sync_summary(plan).plain
+        self.assertIn(f"Since the last sync: {files} ↓ to download · {files} ↑ to send · "
+                      "1 folder to create here · 1 folder to create on Drive   s", text)
+        return CountingPath.comparisons
+
+    def test_new_folders_are_not_compared_with_each_file(self):
+        self.assertEqual(self.comparisons(2), self.comparisons(40))
+
+
 class DriveCallBatchingTest(unittest.TestCase):
     """--again and planning fetch saved items and shortcut targets in batches, not one call each (perf 4)."""
 

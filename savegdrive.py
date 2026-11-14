@@ -5978,13 +5978,15 @@ def last_sync_summary(plan):
         return text
     # A new folder no file comes with (empty, or holding only what is already in sync) is work of its own.
     new_folders = [entry for entry in plan if entry["kind"] == "FOLDER" and entry["status"] in {"NEW", "UPLOAD_NEW"}]
-    file_paths = {
-        direction: [entry["relative_path"] for entry in plan if entry["kind"] == "FILE" and entry["status"] in statuses]
+    # Gathered once per direction, so each new folder is a lookup, not a scan of every file (perf 17).
+    folders_with_files = {
+        direction: {parent for entry in plan if entry["kind"] == "FILE" and entry["status"] in statuses
+                    for parent in entry["relative_path"].parents}
         for direction, statuses in (("NEW", {"NEW", "UPDATE"}), ("UPLOAD_NEW", UPLOADS))
     } if new_folders else {}
     folders_only = Counter(
         entry["status"] for entry in new_folders
-        if not any(entry["relative_path"] in path.parents for path in file_paths[entry["status"]])
+        if entry["relative_path"] not in folders_with_files[entry["status"]]
     )
     parts = [
         (counts["NEW"] + counts["UPDATE"], "↓ to download", "green"),
