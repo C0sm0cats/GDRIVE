@@ -1084,18 +1084,48 @@ def drive_root_name(drive_root):
     return "My Drive" if drive_root == "root" else f"the Drive folder {drive_root}"
 
 
-def claim_drive_root(destination, drive_root):
-    """Record the Drive root a managed folder mirrors, and refuse any other one."""
+def legacy_drive_root(service, state, drive_root):
+    """The Drive root of a folder synced before the root was recorded, from where its top-level picks sit
+    on Drive: drive_root, or "root" for My Drive; None when Drive cannot tell (offline, picks gone)."""
+    saved = (state.get("last_selection") or {}).get("items", [])
+    ids = [item["id"] for item in saved if item.get("relative_parent") == "." and item.get("id")][:API_BATCH_SIZE]
+    if not ids:
+        return None
+    try:
+        my_drive = service.files().get(fileId="root", fields="id").execute(num_retries=API_RETRIES)["id"]
+        found = get_items(service, ids, "id,parents")
+    except DRIVE_CALL_ERRORS as error:
+        debug(f"Could not read where this folder's picks sit on Drive: {error_text(error)}")
+        return None
+    for item in found.values():
+        parents = [] if isinstance(item, Exception) else item.get("parents") or []
+        if drive_root in parents:
+            return drive_root
+        if my_drive in parents:
+            return "root"
+    return None
+
+
+def claim_drive_root(destination, drive_root, service=None):
+    """Record the Drive root a managed folder mirrors, and refuse any other one.
+
+    A folder synced before the root was recorded, and not as a whole root, is decided with Drive: without
+    a service (before signing in) it is left undecided, and main calls this again once signed in."""
     if drive_root is None:
         return
     state = json.loads((destination / STATE_FILE_NAME).read_text(encoding="utf-8"))
     recorded = state.get("drive_root")
     if recorded is None:
         if state["files"] or state.get("folders"):
-            # Synced before the root was recorded: My Drive (the default), unless this folder was synced whole.
             roots = (state.get("last_selection") or {}).get("roots", [])
             whole = any(root.get("id") == drive_root and root.get("base") == "." for root in roots)
-            recorded = drive_root if whole else "root"
+            if whole:
+                recorded = drive_root
+            elif service is None:
+                return
+            else:
+                # Where its top-level picks sit; My Drive (the default) when Drive cannot tell.
+                recorded = legacy_drive_root(service, state, drive_root) or "root"
         else:
             recorded = drive_root
         if recorded == drive_root:
@@ -1167,7 +1197,7 @@ def local_child_rule(relative_directory, child, on_drive=lambda child, relative_
     return None
 
 
-def initialize_managed_destination(destination):
+def initialize_managed_destination(destination, service=None):
     outer = next((parent for parent in destination.parents if holds_state(parent)), None)
     if outer is not None:
         raise ValueError(
@@ -1188,7 +1218,7 @@ def initialize_managed_destination(destination):
     try:
         migrate_legacy_state(destination)
         if has_valid_state(destination):
-            claim_drive_root(destination, DRIVE_ROOT)
+            claim_drive_root(destination, DRIVE_ROOT, service)
         elif any(destination.iterdir()):
             raise ValueError(
                 "This destination already contains files but has no "
@@ -1301,9 +1331,10 @@ class DestinationSetupScreen(Screen):
         Binding("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, initial_destination):
+    def __init__(self, initial_destination, service=None):
         super().__init__()
         self.initial_destination = initial_destination
+        self.service = service  # decides the Drive root of a folder synced before it was recorded
 
     def compose(self) -> ComposeResult:
         initial_parent = self.initial_destination.parent
@@ -1411,7 +1442,7 @@ class DestinationSetupScreen(Screen):
         status = self.query_one("#setup-status", Static)
         try:
             destination = self.destination_from_inputs()
-            destination = initialize_managed_destination(destination)
+            destination = initialize_managed_destination(destination, self.service)
         except (OSError, ValueError) as error:
             status.update(
                 Text.assemble((str(error), "bold bright_red"))
@@ -2940,7 +2971,7 @@ class DriveSelectorApp(App):
             self.check_last_sync()
             self.notify(f"Syncing with {destination} for this session.", markup=False)
 
-        self.push_screen(DestinationSetupScreen(initial), changed)
+        self.push_screen(DestinationSetupScreen(initial, self.service), changed)
 
     def action_unfold_view(self):
         """e unfolds the whole view; when it is all unfolded, folds it back."""
@@ -6068,14 +6099,17 @@ def main():
                 has_valid_state(candidate) and not has_last_selection(load_state(candidate))
             ):
                 no_previous_selection(candidate)
-        try:
-            destination_root = resolve_destination(args.download_path)
-        except (OSError, ValueError) as error:
+        def refuse_folder(error):
             console.print(
                 f"[red]✗[/] {escape(args.download_path)}: {escape(str(error))}\n"
                 "  [dim]Choose another folder with --download-path PATH.[/]"
             )
             raise SystemExit(1)
+
+        try:
+            destination_root = resolve_destination(args.download_path)
+        except (OSError, ValueError) as error:
+            refuse_folder(error)
 
         creds = authenticate()
 
@@ -6083,6 +6117,11 @@ def main():
             return build("drive", "v3", credentials=creds, cache_discovery=False)
 
         service = make_service()
+        try:
+            # A folder synced before its Drive root was recorded is decided with Drive, now signed in.
+            claim_drive_root(destination_root, DRIVE_ROOT, service)
+        except (OSError, ValueError) as error:
+            refuse_folder(error)
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
         account = signed_in_account(service)
 

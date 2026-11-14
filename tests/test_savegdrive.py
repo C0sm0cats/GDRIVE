@@ -3590,11 +3590,12 @@ class SyncTest(unittest.TestCase):
         self.run_sync()  # My Drive, in a folder made before the Drive root was recorded
         for folder_id in ("root", "docs", None):  # None: --again, which replays the folder's own roots
             with mock.patch.object(savegdrive, "DRIVE_ROOT", folder_id):
+                # Signed in (the service): a folder synced before the root was recorded is decided then.
                 if folder_id == "docs":
                     with self.assertRaisesRegex(ValueError, "syncs My Drive, not the Drive folder docs"):
-                        savegdrive.resolve_destination(str(self.root))
+                        savegdrive.initialize_managed_destination(self.root, self.drive)
                 else:
-                    self.assertEqual(savegdrive.resolve_destination(str(self.root)), self.root)
+                    self.assertEqual(savegdrive.initialize_managed_destination(self.root, self.drive), self.root)
         self.assertEqual(savegdrive.load_state(self.root)["drive_root"], "root")
         self.assertEqual(sorted(path.name for path in self.root.iterdir() if not path.name.startswith(".")),
                          ["Docs", "Photos", "notes.txt"])
@@ -3606,6 +3607,65 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(savegdrive, "DRIVE_ROOT", "root"):
             with self.assertRaisesRegex(ValueError, "syncs the Drive folder docs, not My Drive"):
                 savegdrive.resolve_destination(str(docs_only))
+
+    def test_folder_synced_before_the_root_was_recorded_asks_drive_which_root_it_mirrors(self):
+        # ux 42: a v2 state has no drive_root and no parents of its picks; a part of --folder-id docs was
+        # picked (a.txt, at the top of the folder). Drive says where that pick sits: docs, not My Drive.
+        def old_state(folder, picks):
+            savegdrive.initialize_managed_destination(folder)
+            state = savegdrive.load_state(folder)
+            state.pop("drive_root", None)
+            for item_id, name in picks:
+                (folder / name).write_bytes(self.drive.items[item_id]["content"])
+                state["files"][name] = {"remote_id": item_id, "path": name, "name": name}
+            state["last_selection"] = {
+                "roots": [],
+                "items": [{"id": item_id, "name": name, "relative_parent": ".", "path": name}
+                          for item_id, name in picks],
+                "scopes": [name for _, name in picks],
+            }
+            savegdrive.save_state(folder, state)
+
+        opened = []
+
+        def drive_views(service, folder_id):
+            opened.append(folder_id)
+            raise SystemExit(0)
+
+        self.addCleanup(setattr, savegdrive, "DRIVE_ROOT", savegdrive.DRIVE_ROOT)
+        old_state(self.root, [("a", "a.txt")])
+        with mock.patch.object(savegdrive, "drive_views", drive_views):
+            with self.assertRaises(SystemExit) as raised:
+                self.run_main("--folder-id", "docs", isatty=True)
+            self.assertEqual(raised.exception.code, 0)
+            self.assertEqual(opened, ["docs"])
+            self.assertEqual(savegdrive.load_state(self.root)["drive_root"], "docs")
+            with self.assertRaises(SystemExit) as raised:  # now recorded: My Drive is the other folder
+                output = self.run_main(isatty=True)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(opened, ["docs"])
+
+        # Its top-level pick sits in My Drive: still refused for docs, as before (bugs 7).
+        my_drive = Path(self.temp.name) / "My Drive folder"
+        old_state(my_drive, [("n", "notes.txt")])
+        with mock.patch.object(savegdrive, "DRIVE_ROOT", "docs"):
+            savegdrive.resolve_destination(str(my_drive))  # decided once signed in, with Drive
+            with self.assertRaisesRegex(ValueError, "syncs My Drive, not the Drive folder docs"):
+                savegdrive.claim_drive_root(my_drive, "docs", self.drive)
+        self.assertNotIn("drive_root", savegdrive.load_state(my_drive))
+
+        # The f screen asks Drive too; Drive not answering keeps the old guess, My Drive.
+        picked_in_docs = Path(self.temp.name) / "Docs part"
+        old_state(picked_in_docs, [("b", "b.txt")])
+        with mock.patch.object(savegdrive, "DRIVE_ROOT", "docs"):
+            self.assertEqual(savegdrive.initialize_managed_destination(picked_in_docs, self.drive), picked_in_docs)
+        self.assertEqual(savegdrive.load_state(picked_in_docs)["drive_root"], "docs")
+        offline = Path(self.temp.name) / "Offline"
+        old_state(offline, [("a", "a.txt")])
+        with mock.patch.object(self.drive, "get", side_effect=OSError("network is unreachable")), \
+                mock.patch.object(savegdrive, "DRIVE_ROOT", "docs"):
+            with self.assertRaisesRegex(ValueError, "syncs My Drive, not the Drive folder docs"):
+                savegdrive.initialize_managed_destination(offline, self.drive)
 
     def test_google_doc_next_to_its_docx_names_both_drive_items(self):
         # "Report" (Google Doc) and "Report.docx" (Word) look different on Drive but share one local name.
