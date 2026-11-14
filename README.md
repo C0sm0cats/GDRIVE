@@ -53,6 +53,9 @@ deleted for good: what you delete on one side goes to the trash of the other.
 
 ```text
 GDRIVE/
+├── .github/
+│   └── workflows/
+│       └── tests.yml
 ├── .gitignore
 ├── LICENSE
 ├── README.md
@@ -431,8 +434,9 @@ Nothing changes, here or on Drive, before you confirm: y in the preview, or the 
 
 `d` compares the selection with the local folder and opens the preview: the
 plan, a summary by kind of change, the amount to download (next to the free
-disk space) and to send, and notes about conflicts and deletions. Nothing has
-changed yet.
+disk space) and to send, warnings found while comparing (a selected folder
+moved on Drive, a broken shortcut), and notes about conflicts and deletions.
+Nothing has changed yet.
 
 The tabs above the list show each kind of change with its count; `Tab` /
 `Shift+Tab` switch between them. `y` syncs, `b` keeps both versions of a
@@ -493,7 +497,7 @@ ID can be used as the remote root:
 ```
 
 The folder ID is the part of the folder URL after `folders/`, without `?usp=…`
-(a full folder link also works).
+(a full folder link also works, including an older `open?id=` link).
 
 ## Local files
 
