@@ -5398,6 +5398,33 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(len(line) <= row.size.width for line in lines), lines)
             await pilot.press("q")
 
+    async def test_active_tabs_stay_readable_on_a_16_color_xterm(self):
+        # design 21: the active view and filter tabs were bold #07111f, which a 16-color terminal maps to ANSI
+        # black; xterm draws bold black as grey: 1.0:1 on the red filter tab, 3.2:1 on the cyan view tab.
+        from rich.color import ColorSystem
+
+        def bold_black_on_color(row):
+            return [segment.text for y in range(row.size.height) for segment in row.render_line(y)
+                    if segment.style and segment.style.bgcolor and segment.style.color and segment.style.bold
+                    and segment.style.color.downgrade(ColorSystem.STANDARD).number == 0]
+
+        drive = demo_drive()
+        app = self.make_app(drive, savegdrive.drive_views(drive, "root"))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            self.assertIn(f" {app.view.name} ", str(app.query_one("#views").render()))
+            self.assertEqual(bold_black_on_color(app.query_one("#views")), [])
+        plan = [{
+            "status": status, "relative_path": Path(f"{status.lower()}.txt"), "kind": "FILE",
+            "item": {"name": f"{status.lower()}.txt", "size": "4"}, "destination": self.root / f"{status.lower()}.txt",
+        } for status in ("NEW", "UPDATE", "CONFLICT")]
+        app = savegdrive.PreviewApp(plan, self.root)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            row = app.screen.query_one("#preview-filters")
+            self.assertIn(" Changes (", str(row.render()))
+            self.assertEqual(bold_black_on_color(row), [])
+
     async def test_selection_state_and_unchanged_status_stay_readable_on_the_dark_tui(self):
         # design 5: the unchecked ☐, "Nothing selected" and "unchanged"/"skipped" were bright_black,
         # rendered #625e4c: 2.8:1 on the dark background, under the 4.5:1 of readable text.

@@ -2506,7 +2506,8 @@ class DriveSelectorApp(App):
                 if entry.get("view") is view
             )
             label = f" {view.name}" + (f" ({selected})" if selected else "") + " "
-            tabs.append(Text(label, style="bold #07111f on #38bdf8" if view is self.view else "#93c5fd"))
+            # Not bold: on 16 colors this dark text becomes ANSI black, which xterm draws bold as grey.
+            tabs.append(Text(label, style="#07111f on #38bdf8" if view is self.view else "#93c5fd"))
         width = (screen_width or self.size.width) - widget.styles.margin.width
         widget.update(tab_row(tabs, width))
 
@@ -4978,7 +4979,8 @@ class PreviewScreen(Screen):
         tabs = []
         for index, (tab_name, tab_keep) in enumerate(self.filters):
             label = f" {tab_name} ({sum(1 for entry in self.plan if tab_keep(entry))}) "
-            tabs.append(Text(label, style="bold #07111f on #f59e0b" if index == self.filter_index else "#93c5fd"))
+            # Not bold: on 16 colors this dark text becomes ANSI black, which xterm draws bold as grey.
+            tabs.append(Text(label, style="#07111f on #f59e0b" if index == self.filter_index else "#93c5fd"))
         # The key bar lists tab and shift+tab too: the hint goes only where it fits.
         hint = Text.assemble("  ", ("tab", "bold #f59e0b"), (" next · ", "dim"),
                              ("shift+tab", "bold #f59e0b"), (" previous", "dim")) if len(self.filters) > 1 else None
