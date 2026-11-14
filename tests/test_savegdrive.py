@@ -1333,6 +1333,28 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")  # readable again: its change goes up
         self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited again")
 
+    def test_unreadable_folder_with_synced_files_is_a_conflict_and_the_rest_syncs(self):
+        # bugs 52: up to Python 3.13, pathlib's exists/is_file/is_dir/is_symlink raise PermissionError below a
+        # folder without search permission, so the whole plan failed there (3.14 returns False).
+        self.run_sync()
+        locked = self.root / "Docs/lockeddir"
+        locked.mkdir()
+        (locked / "mine.txt").write_bytes(b"mine")
+        self.run_sync()
+        self.run_sync()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses["Docs/lockeddir"], "CONFLICT")
+        self.assertEqual(statuses["Docs/lockeddir/mine.txt"], "CONFLICT")
+        self.assertEqual(statuses["Docs/b.txt"], "UPLOAD")
+        self.apply(plan, state)
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+        self.assertFalse(any(item.get("trashed") for item in self.drive.items.values()))
+
     def test_deleted_on_both_sides_then_made_again_here_is_sent(self):
         self.run_sync()
         del self.drive.items["a"]
