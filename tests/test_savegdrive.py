@@ -4160,6 +4160,29 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(left.exists())
         self.assertNotIn(f"Docs/{left.name}", statuses)
 
+    def test_drive_file_named_like_a_part_file_is_kept_on_both_sides(self):
+        # security 20: a Drive file ending in .savegdrive.part was deleted here by the preview, then trashed on Drive
+        self.run_sync()
+        self.drive.items["a"]["name"] = f"a.txt{savegdrive.PART_SUFFIX}"  # renamed by an editor of the folder
+        self.drive.items["new"] = file_item("new", f"plan{savegdrive.PART_SUFFIX}", "docs", b"plan")
+        renamed, added = self.root / f"Docs/a.txt{savegdrive.PART_SUFFIX}", self.root / f"Docs/plan{savegdrive.PART_SUFFIX}"
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses[f"Docs/{renamed.name}"], "NEW")
+        for _ in range(2):
+            statuses, _ = self.run_sync()
+            self.assertEqual(statuses[f"Docs/{renamed.name}"], "UNCHANGED")
+            self.assertEqual(statuses[f"Docs/{added.name}"], "UNCHANGED")
+            self.assertEqual((renamed.read_bytes(), added.read_bytes()), (b"alpha", b"plan"))
+        self.assertFalse(self.drive.is_trashed(self.drive.items["a"]))
+        self.assertFalse(self.drive.is_trashed(self.drive.items["new"]))
+
+        # Deleted on Drive: the local copy goes to the system trash like any synced file, never unlinked
+        self.drive.items["a"]["trashed"] = True
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses[f"Docs/{renamed.name}"], "TRASH_LOCAL")
+        self.assertFalse(renamed.exists())
+        self.assertEqual([path.read_bytes() for path in self.trash.glob(f"*{renamed.name}")], [b"alpha"])
+
     def test_drive_name_near_the_255_byte_limit_comes_down(self):
         # bugs 16: ".<name>.savegdrive.part" is 17 bytes longer than the name: 239 to 255 bytes failed (Errno 36)
         name = "会議録" * 27 + ".pdf"  # 247 bytes in UTF-8

@@ -4106,7 +4106,12 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 continue
             if child.is_dir() and holds_state(child):
                 continue  # another SaveGDrive folder, synced on its own
-            if child.name.endswith(PART_SUFFIX):
+            if (
+                child.name.endswith(PART_SUFFIX)
+                and relative_path not in remote_files
+                and relative_path not in tracked
+                and drive_spelling(child, relative_path, "FILE") is None
+            ):  # a Drive file may carry this name too: synced like any file, never deleted here
                 if child.is_file():
                     with contextlib.suppress(OSError):
                         child.unlink()  # left by a killed run (kill -9, power cut): ours, never complete
