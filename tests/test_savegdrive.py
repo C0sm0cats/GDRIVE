@@ -6269,6 +6269,35 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one("#notice").render().plain.splitlines(), [
                 "Done  12 downloaded · 3 updated from Drive · 5 sent to Drive · 140 unchanged · 2 moved to the Drive trash"])
 
+    async def test_error_notice_leaves_room_for_the_tree_in_80x24(self):
+        # design 20: three long errors and the "Since the last sync" line took 9 rows, leaving the tree 2.
+        plan = [{"kind": "FILE", "status": "NEW", "relative_path": Path(f"f{index}.jpg"),
+                 "item": {"name": f"f{index}.jpg", "size": "10"}, "destination": self.root / f"f{index}.jpg"}
+                for index in range(3)]
+        results = savegdrive.Counter(FILE_NEW=12, FILE_UPDATE=3, FILE_UPLOAD=5, FILE_UNCHANGED=140, FILE_ERROR=5)
+        results.failures = ["Photos from the family reunion 2025/IMG_20250014_183205.jpg: "
+                            "403 The user does not have sufficient permissions for this file."] * 5
+        views = [savegdrive.DriveView("My Drive", "root")]
+        drive, cache = demo_drive(), {}
+        savegdrive.load_view(drive, views[0], cache)
+        app = savegdrive.DriveSelectorApp(views, self.root, savegdrive.load_state(self.root), drive, None, cache,
+                                          notice=savegdrive.result_notice(plan, results))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.last_sync_text = savegdrive.last_sync_summary(plan)
+            app.update_notice()
+            await pilot.pause()
+            self.assertGreaterEqual(app.query_one(savegdrive.DriveTree).scrollable_content_region.height, 5)
+            box, notice = app.query_one("#notice-box"), app.query_one("#notice")
+            self.assertLessEqual(box.outer_size.height, 24 * 3 // 10)
+            # Nothing is cut: the rest scrolls into view, and lines are fitted beside the scrollbar.
+            self.assertGreater(box.max_scroll_y, 0)
+            self.assertEqual(notice.size.width, box.size.width - 1)
+            text = notice.render().plain
+            self.assertTrue(text.startswith("Done  12 downloaded · 3 updated from Drive · 5 sent to Drive\n"), text)
+            self.assertIn("… and 2 more", text)
+            self.assertIn("Since the last sync: 3 ↓ to download", text)
+
     async def test_preview_shows_the_local_folder_in_80x24(self):
         destination = Path.home() / "Documents" / "Google Drive"
         plan = [{

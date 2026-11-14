@@ -2202,9 +2202,15 @@ class DriveSelectorApp(App):
     ENABLE_COMMAND_PALETTE = False
 
     CSS = SHARED_CSS + """
+    #notice-box {
+        height: auto;
+        max-height: 30%;  /* a long error list scrolls instead of squeezing the tree */
+        margin: 1 2 0 2;
+        scrollbar-size-vertical: 1;
+    }
+
     #notice {
         height: auto;
-        margin: 1 2 0 2;
     }
 
     #views {
@@ -2381,9 +2387,12 @@ class DriveSelectorApp(App):
         views = Static(id="views")
         views.display = len(self.views) > 1
         yield views
-        notice = Static(id="notice")
-        notice.display = False
-        yield notice
+        notice_box = VerticalScroll(id="notice-box", can_focus=False)
+        notice_box.display = False
+        with notice_box:
+            notice = Static(id="notice")
+            notice.display = False
+            yield notice
         self.trees = {view: DriveTree(Text(view.name, style="bold bright_blue"), view, classes="drive-tree")
                       for view in self.views}
         for view, tree in self.trees.items():
@@ -2485,12 +2494,24 @@ class DriveSelectorApp(App):
         if not self.is_mounted:
             return
         lines = [text for text in (self.notice, self.last_sync_text) if text]
-        notice = self.query_one("#notice", Static)
-        notice.display = bool(lines)
-        width = (screen_width or self.size.width) - notice.styles.margin.width
-        notice.update(Text("\n").join(
+        box = self.query_one("#notice-box", VerticalScroll)
+        box.display = self.query_one("#notice", Static).display = bool(lines)
+        width = (screen_width or self.size.width) - box.styles.margin.width
+        self.fit_notice(lines, width)
+        if lines:
+            self.call_after_refresh(self.fit_notice_beside_scrollbar, lines, width)
+
+    def fit_notice(self, lines, width):
+        self.query_one("#notice", Static).update(Text("\n").join(
             Text(line) if isinstance(line, str) else line.fit(width) if isinstance(line, Summary) else line
             for line in lines))
+
+    def fit_notice_beside_scrollbar(self, lines, width):
+        # A notice taller than its box scrolls: fit its lines beside the scrollbar, not under it.
+        box = self.query_one("#notice-box", VerticalScroll)
+        current = [text for text in (self.notice, self.last_sync_text) if text]
+        if box.show_vertical_scrollbar and current == lines:
+            self.fit_notice(lines, width - box.styles.scrollbar_size_vertical)
 
     def action_review_last(self):
         if self.busy:
