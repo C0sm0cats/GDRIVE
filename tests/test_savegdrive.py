@@ -2252,6 +2252,34 @@ class SyncTest(unittest.TestCase):
         for path in ("Old/old.txt", "Old/Sub/deep.txt", "gone.txt"):
             self.assertTrue((trash / path).is_file(), path)
 
+    def test_trash_view_file_edited_here_is_a_conflict_never_sent(self):
+        # tests 84: classify_file's own Trash/ check, not is_readonly_path, keeps the Trash view download-only.
+        self.drive.items["gone"] = file_item("gone", "gone.txt", "root", b"gone", trashed=True)
+
+        def sync_trash_view():
+            cache = {}
+            nodes, browsed = savegdrive.collect_drive_tree(self.drive, savegdrive.TRASH, cache,
+                                                           base=Path(savegdrive.TRASH_DIR))
+            selections = []
+            for node in nodes:
+                if node["parent"] is None:
+                    savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+            scopes = savegdrive.build_local_scopes(selections, browsed)
+            state = savegdrive.load_state(self.root)
+            plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, cache)
+            self.apply(plan, state)
+            return {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+
+        self.assertEqual(sync_trash_view()["Trash/gone.txt"], "NEW")
+        copy = self.root / savegdrive.TRASH_DIR / "gone.txt"
+        self.assertEqual(copy.read_bytes(), b"gone")
+
+        copy.write_bytes(b"edited the trashed copy here")
+        self.assertEqual(sync_trash_view()["Trash/gone.txt"], "CONFLICT")
+        self.assertEqual(self.drive.items["gone"]["content"], b"gone")
+        self.assertTrue(self.drive.items["gone"]["trashed"])
+        self.assertEqual(self.drive.uploads, [])
+
     def test_item_restored_from_the_trash_view_leaves_trash_with_again(self):
         # The whole Trash view synced, then a.txt restored on Drive: --again moves the copy out of Trash/.
         self.drive.items.update({
