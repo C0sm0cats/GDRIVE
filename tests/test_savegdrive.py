@@ -4234,6 +4234,30 @@ class SyncTest(unittest.TestCase):
         self.assertEqual([path for path in statuses if path.split("/")[0] == "Work"], [])
         self.assertNotIn(savegdrive.STATE_FILE_NAME, {item["name"] for item in self.drive.items.values()})
 
+    def check_state_file_name_from_drive_in_a_subfolder(self, name):
+        # bugs 58: a Drive file named like a state file comes down with the rest; its folder is still synced.
+        photos = self.root / "Photos"
+        self.drive.items["st"] = file_item("st", name, "photos", b'{"version": 1, "files": {}}')
+        self.drive.items["p2"] = file_item("p2", "sea.jpg", "photos", b"sea")
+        self.sync_everything()
+        self.assertTrue((photos / name).is_file())
+        (photos / "new_here.jpg").write_bytes(b"new")
+        plan, _ = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses.get("Photos/new_here.jpg"), "UPLOAD_NEW")  # the tree's sync plans it too
+        del self.drive.items["p2"]
+        self.drive.change("p2")
+        self.run_main("--again", "--yes")
+        self.assertFalse((photos / "sea.jpg").exists())
+        self.assertEqual([item["parent"] for item in self.drive.items.values() if item["name"] == "new_here.jpg"],
+                         ["photos"])
+
+    def test_state_file_name_from_drive_in_a_subfolder_does_not_stop_its_sync(self):
+        self.check_state_file_name_from_drive_in_a_subfolder(savegdrive.STATE_FILE_NAME)
+
+    def test_legacy_state_file_name_from_drive_in_a_subfolder_does_not_stop_its_sync(self):
+        self.check_state_file_name_from_drive_in_a_subfolder(savegdrive.LEGACY_STATE_FILE_NAME)
+
     def test_two_runs_never_sync_the_same_folder(self):
         # This run holds self.root: another process cannot take it.
         script = "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"

@@ -3969,6 +3969,17 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
         except OSError:
             return None
 
+    def other_savegdrive_folder(child, relative_path):
+        """A folder synced on its own: its state file is there, and is not a Drive file synced like any other."""
+        if not holds_state(child):
+            return False
+        spellings = {relative_path, drive_spelling(child, relative_path, "FOLDER") or relative_path}
+        return not any(
+            path / name in remote_files or path / name in tracked
+            for path in spellings
+            for name in (STATE_FILE_NAME, LEGACY_STATE_FILE_NAME)
+        )
+
     def can_send(relative_path):
         parent = relative_path.parent
         if is_readonly_path(relative_path):
@@ -4104,7 +4115,7 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 if not at_or_below_trashed(relative_path):
                     add_symlink_entry(child, relative_path)
                 continue
-            if child.is_dir() and holds_state(child):
+            if child.is_dir() and other_savegdrive_folder(child, relative_path):
                 continue  # another SaveGDrive folder, synced on its own
             if (
                 child.name.endswith(PART_SUFFIX)
