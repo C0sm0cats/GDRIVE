@@ -3,12 +3,15 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# .venv/bin/python links to the system Python. After a minor upgrade of it
-# (3.13 -> 3.14) that interpreter looks for a lib/python3.14 the venv lacks, so
-# nothing imports and pip is gone: rebuild the venv instead of failing forever.
+# Rebuild a .venv that cannot work instead of failing forever:
+# - .venv/bin/python links to the system Python. After a minor upgrade of it
+#   (3.13 -> 3.14) that interpreter looks for a lib/python3.14 the venv lacks,
+#   so nothing imports and pip is gone.
+# - A "python3 -m venv" that failed (no ensurepip: python3-venv missing on
+#   Debian and Ubuntu) or was interrupted leaves a .venv without pip.
 if [ -e "$script_dir/.venv" ] && ! "$script_dir/.venv/bin/python" -c \
-    'import os, sys, sysconfig; sys.exit(not os.path.isdir(sysconfig.get_path("purelib")))' >/dev/null 2>&1; then
-    echo "SaveGDrive: .venv does not match the installed Python any more; rebuilding it." >&2
+    'import importlib.util, os, sys, sysconfig; sys.exit(not os.path.isdir(sysconfig.get_path("purelib")) or importlib.util.find_spec("pip") is None)' >/dev/null 2>&1; then
+    echo "SaveGDrive: .venv is incomplete or does not match the installed Python; rebuilding it." >&2
     rm -rf "$script_dir/.venv"
 fi
 
@@ -25,7 +28,11 @@ if [ ! -x "$script_dir/.venv/bin/python" ]; then
         echo "SaveGDrive needs Python 3.11 or newer; $python is $("$python" -V 2>&1)." >&2
         exit 1
     fi
-    "$python" -m venv "$script_dir/.venv"
+    if ! "$python" -m venv "$script_dir/.venv"; then
+        rm -rf "$script_dir/.venv"
+        echo "SaveGDrive could not create its .venv (see the error above); fix it, then run $0 again." >&2
+        exit 1
+    fi
 fi
 
 # The stamp is written only after a successful install. The dependencies are

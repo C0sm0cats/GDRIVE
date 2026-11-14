@@ -7278,11 +7278,16 @@ FAKE_PYTHON = """#!/bin/sh
 case "$1" in
     -V) echo "Python $FAKE_PY_VERSION"; exit 0 ;;
     -c) case "$2" in *version_info*) [ "$FAKE_PY_OK" = 1 ]; exit $? ;;
-            *purelib*) [ -d "$(dirname "$0")/../lib/site-packages" ]; exit $? ;; esac
+            *purelib*) [ -d "$(dirname "$0")/../lib/site-packages" ] || exit 1
+                case "$2" in *find_spec*) [ -d "$(dirname "$0")/../lib/site-packages/pip" ]; exit $? ;; esac
+                exit 0 ;; esac
         [ "$FAKE_IMPORTS_OK" = 1 ]; exit $? ;;
     -m) case "$2" in
-            venv) {mkdir} -p "$3/bin" "$3/lib/site-packages" && {cp} "$0" "$3/bin/python"; exit $? ;;
-            pip) echo "$*" >> "$FAKE_PIP_LOG"; exit "$FAKE_PIP_RC" ;;
+            venv) {mkdir} -p "$3/bin" "$3/lib/site-packages" && {cp} "$0" "$3/bin/python" || exit 1
+                [ "$FAKE_VENV_OK" = 1 ] || {{ echo "ensurepip is not available" >&2; exit 1; }}
+                {mkdir} -p "$3/lib/site-packages/pip"; exit $? ;;
+            pip) [ -d "$(dirname "$0")/../lib/site-packages/pip" ] || {{ echo "No module named pip" >&2; exit 1; }}
+                echo "$*" >> "$FAKE_PIP_LOG"; exit "$FAKE_PIP_RC" ;;
         esac; exit 1 ;;
 esac
 echo "ran $*"
@@ -7296,7 +7301,7 @@ class LauncherTest(unittest.TestCase):
     PACKAGES = "google-api-python-client google-auth google-auth-oauthlib send2trash textual"
 
     def run_launcher(self, names, version_ok=True, venv=False, stamp=None, stamp_age_days=0,
-                     imports_ok=True, pip_rc=0, venv_site=True):
+                     imports_ok=True, pip_rc=0, venv_site=True, venv_pip=True, venv_ok=True):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         shutil.copy(Path(__file__).resolve().parent.parent / "run-savegdrive.sh", root)
         (root / "savegdrive.py").write_text("")
@@ -7314,6 +7319,8 @@ class LauncherTest(unittest.TestCase):
             (root / ".venv" / "bin" / "python").chmod(0o755)
             if venv_site:
                 (root / ".venv" / "lib" / "site-packages").mkdir(parents=True)
+                if venv_pip:
+                    (root / ".venv" / "lib" / "site-packages" / "pip").mkdir()
         if stamp is not None:
             stamp_path = root / ".venv" / ".savegdrive-deps"
             stamp_path.write_text(stamp + "\n")
@@ -7326,6 +7333,7 @@ class LauncherTest(unittest.TestCase):
             "FAKE_IMPORTS_OK": "1" if imports_ok else "0",
             "FAKE_PIP_LOG": str(root / "pip.log"),
             "FAKE_PIP_RC": str(pip_rc),
+            "FAKE_VENV_OK": "1" if venv_ok else "0",
         }
         result = subprocess.run(
             [shutil.which("sh"), str(root / "run-savegdrive.sh"), "--help"],
@@ -7395,6 +7403,24 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(len(self.pip_calls(root)), 1)
         self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
         self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_rebuilds_venv_left_without_pip(self):
+        # A first "python3 -m venv" failed for lack of ensurepip (python3-venv
+        # missing on Debian/Ubuntu), then the package was installed.
+        result, root = self.run_launcher(["python3"], venv=True, imports_ok=False, venv_pip=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rebuilding it", result.stderr)
+        self.assertTrue((root / ".venv" / "lib" / "site-packages" / "pip").is_dir())
+        self.assertEqual(len(self.pip_calls(root)), 1)
+        self.assertEqual((root / ".venv" / ".savegdrive-deps").read_text(), self.PACKAGES + "\n")
+        self.assertIn("savegdrive.py --help", result.stdout)
+
+    def test_launcher_removes_half_created_venv(self):
+        result, root = self.run_launcher(["python3"], imports_ok=False, venv_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not create its .venv", result.stderr)
+        self.assertFalse((root / ".venv").exists())
+        self.assertNotIn("savegdrive.py --help", result.stdout)
 
     def test_launcher_keeps_a_matching_venv(self):
         result, root = self.run_launcher(["python3"], venv=True, stamp=self.PACKAGES)
