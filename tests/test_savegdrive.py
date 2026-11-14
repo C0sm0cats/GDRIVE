@@ -3586,6 +3586,32 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Course/Scan (3).pdf"], "NEW")
         self.assertEqual((self.root / "Course/Scan (3).pdf").read_bytes(), b"third")
 
+    def test_read_only_duplicate_deleted_on_drive_goes_to_system_trash(self):
+        # Ann deletes the Scan.pdf that kept the plain name: the others keep theirs, its copy goes to the trash.
+        read_only = {"canEdit": False, "canTrash": False, "canAddChildren": False}
+        self.drive.items["course"] = {"id": "course", "name": "Course", "mimeType": FOLDER, "parent": "root",
+                                      "capabilities": read_only}
+        for item_id, content in [("scan1", b"first"), ("scan2", b"second"), ("scan3", b"third")]:
+            self.drive.items[item_id] = file_item(item_id, "Scan.pdf", "course", content, capabilities=read_only)
+        self.run_sync()
+        self.assertEqual((self.root / "Course/Scan (3).pdf").read_bytes(), b"third")
+
+        del self.drive.items["scan1"]
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Course/Scan.pdf"], "TRASH_LOCAL")
+        self.assertEqual((statuses["Course/Scan (2).pdf"], statuses["Course/Scan (3).pdf"]), ("UNCHANGED", "UNCHANGED"))
+        self.assertFalse((self.root / "Course/Scan.pdf").exists())
+        self.assertEqual((self.root / "Course/Scan (2).pdf").read_bytes(), b"second")
+        self.assertEqual([path.read_bytes() for path in self.trash.iterdir()], [b"first"])
+
+        del self.drive.items["scan2"]  # the last one left keeps its numbered name too
+        statuses, _ = self.run_sync()
+        self.assertEqual((statuses["Course/Scan (2).pdf"], statuses["Course/Scan (3).pdf"]), ("TRASH_LOCAL", "UNCHANGED"))
+        self.assertEqual((self.root / "Course/Scan (3).pdf").read_bytes(), b"third")
+        self.assertEqual(sorted(path.read_bytes() for path in self.trash.iterdir()), [b"first", b"second"])
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Course/Scan (3).pdf"], "UNCHANGED")
+
     def test_keep_both(self):
         self.run_sync()
         (self.root / "Docs/b.txt").write_bytes(b"edited locally")

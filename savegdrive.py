@@ -18,7 +18,7 @@ import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httplib2
 from google.auth.exceptions import GoogleAuthError, TransportError
@@ -3764,20 +3764,37 @@ def number_readonly_duplicates(service, plan, state):
             synced_as.setdefault(record_key.partition("::")[0], set()).add(record["path"])
     for indexes in list(groups.values()):
         entries = [plan[index] for index in indexes]
-        if len(entries) < 2 or any(
+        if any(  # one file left alone too: it keeps the numbered name it was synced under
             entry["kind"] != "FILE" or entry.get("item") is None or can(entry["item"], "canEdit")
             or entry["relative_path"] in RESERVED_PATHS
             for entry in entries
         ):
             continue  # a file you may rename on Drive, or a folder: a duplicate to rename there
         relative_path = entries[0]["relative_path"]
-        names = [relative_path.name] + [numbered_name(relative_path.name, number) for number in range(2, len(entries) + 1)]
+        prefix, _, suffix = numbered_name(relative_path.name, "\0").partition("\0")
+
+        def name_number(path):
+            """1 for the plain name, n for `name (n).ext` in this folder, None for any other path."""
+            path = PurePosixPath(path)
+            if path.parent.as_posix() != relative_path.parent.as_posix():
+                return None
+            if path.name == relative_path.name:
+                return 1
+            middle = path.name[len(prefix):len(path.name) - len(suffix)]
+            if (len(path.name) > len(prefix) + len(suffix) and path.name.startswith(prefix)
+                    and path.name.endswith(suffix) and middle.isascii() and middle.isdigit() and int(middle) >= 2):
+                return int(middle)
+            return None
+
         indexes = sorted(indexes, key=lambda index: effective_id(plan[index]["item"]))
         chosen = {}
         for index in indexes:  # synced before under one of these names: it keeps it
-            for name in names:
-                path = (relative_path.parent / name).as_posix()
-                if name not in chosen.values() and path in synced_as.get(effective_id(plan[index]["item"]), ()):
+            numbers = (name_number(path) for path in synced_as.get(effective_id(plan[index]["item"]), ()))
+            for number in sorted(number for number in numbers if number is not None):
+                name = relative_path.name if number == 1 else numbered_name(relative_path.name, number)
+                if name not in chosen.values() and (
+                    number == 1 or same_name_key(entries[0]["destination"].with_name(name)) not in taken
+                ):
                     chosen[index] = name
                     break
         number = 1
