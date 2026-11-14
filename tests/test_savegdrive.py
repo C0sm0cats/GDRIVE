@@ -3588,6 +3588,25 @@ class SyncTest(unittest.TestCase):
             self.assertEqual("not enough disk space" in line, warned, line)
             self.assertEqual(line.startswith("! "), warned, line)
 
+    def test_space_counts_updates_and_keep_both_downloads(self):
+        # tests 89: a file grown on Drive (UPDATE) and a conflict kept as both (KEEP_BOTH) both count.
+        self.run_sync()
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"x" * 5000))
+        self.drive.items["p"].update(file_item("p", "beach.jpg", "photos", b"y" * 3000))
+        (self.root / "Photos/beach.jpg").write_bytes(b"jpeg, edited here")
+        plan, _ = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual(statuses["Docs/a.txt"], "UPDATE")
+        conflict = next(entry for entry in plan if entry["relative_path"].as_posix() == "Photos/beach.jpg")
+        savegdrive.set_keep_both(plan, [conflict], True)
+        self.assertEqual(conflict["status"], "KEEP_BOTH")
+        self.assertEqual(savegdrive.download_size(plan), (8000, 0))
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200, highlight=False)), \
+                mock.patch.object(savegdrive.shutil, "disk_usage", return_value=mock.Mock(free=4000)):
+            savegdrive.print_plan(plan, self.root)
+        self.assertIn("! 8.0 KB to download · 4.0 KB free: not enough disk space", output.getvalue())
+
     def test_header_text(self):
         home = Path.home()
         self.assertEqual(
