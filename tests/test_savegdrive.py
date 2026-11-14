@@ -7214,6 +7214,56 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry["relative_path"].as_posix() for entry in result["plan"]],
                          ["Photos", "Photos/beach.jpg"])
 
+    async def test_moved_last_selection_tells_why_in_the_tree(self):
+        # ux 44: warn() prints to stdout, which Textual captures: the tree said only "deleted on Drive".
+        drive = demo_drive()
+        state = savegdrive.load_state(self.root)
+        selections = [{"item": dict(drive.public(drive.items["photos"])), "relative_parent": Path()}]
+        savegdrive.remember_selection(state, selections, [Path("Photos")])
+        savegdrive.save_state(self.root, state)
+        drive.items["photos"]["parent"] = "docs"  # moved on Drive since
+        app = self.make_app(drive)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.wait(app, pilot)
+            messages = [notification.message for notification in app._notifications]
+            self.assertIn("Photos was moved to another folder on Drive", messages)
+            await pilot.press("s")
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
+            notes = str(app.screen.query_one("#preview-notes").render())
+            self.assertIn("! Photos was moved to another folder on Drive", notes)
+            await pilot.press("escape")
+            app.check_last_sync()  # a new check finds it again: not notified twice
+            await self.wait(app, pilot)
+            messages = [notification.message for notification in app._notifications]
+            self.assertEqual(messages.count("Photos was moved to another folder on Drive"), 1)
+            await pilot.press("q")
+
+    async def test_preview_tells_why_a_broken_shortcut_is_skipped(self):
+        # ux 44: the reason given by warn() reaches the preview's notes, not only Textual's capture.
+        drive = demo_drive()
+        drive.items["q4"] = {"id": "q4", "name": "Q4 numbers.txt", "mimeType": savegdrive.SHORTCUT_MIME_TYPE,
+                             "parent": "docs", "shortcutDetails": {"targetId": "gone", "targetMimeType": "text/plain"}}
+        app = self.make_app(drive)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("down", "space", "d")  # Docs
+            await self.wait(app, pilot)
+            self.assertIsInstance(app.screen, savegdrive.PreviewScreen)
+            notes = str(app.screen.query_one("#preview-notes").render())
+            self.assertIn("! Docs/Q4 numbers.txt: shortcut target not available, skipped", notes)
+            await pilot.press("escape", "q")
+
+    def test_collecting_warnings_keeps_only_this_threads_messages(self):
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200)):
+            with savegdrive.collecting_warnings() as warnings:
+                savegdrive.warn("here [red]x[/]")
+                other = threading.Thread(target=savegdrive.warn, args=("another thread",))
+                other.start()
+                other.join()
+            savegdrive.warn("after")
+        self.assertEqual(warnings, ["here [red]x[/]"])
+        self.assertIn("! here [red]x[/]", output.getvalue())  # still printed, escaped
+
     async def test_no_last_selection_no_line(self):
         app = self.make_app()
         async with app.run_test() as pilot:

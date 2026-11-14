@@ -172,8 +172,27 @@ def debug(message):
         console.print(f"[dim]  {escape(printable(message))}[/]")
 
 
+# warn() messages of the current thread, kept while collecting_warnings() runs: in the tree, Textual
+# captures what is printed, so the workers hand them to the screen instead.
+WARNINGS = threading.local()
+
+
 def warn(message):
+    collected = getattr(WARNINGS, "collected", None)
+    if collected is not None:
+        collected.append(printable(message))
     console.print(f"[yellow]![/] {escape(printable(message))}")
+
+
+@contextlib.contextmanager
+def collecting_warnings():
+    """The list of the warn() messages this thread gives inside the block."""
+    previous = getattr(WARNINGS, "collected", None)
+    WARNINGS.collected = collected = []
+    try:
+        yield collected
+    finally:
+        WARNINGS.collected = previous
 
 
 def error_text(error):
@@ -2251,6 +2270,7 @@ class DriveSelectorApp(App):
         self.last_sync_text = None
         self.last_sync_round = 0
         self.last_sync_error = False  # the last check failed: s checks again
+        self.shown_warnings = set()  # warn() messages of the last selection already notified
         self.account = account
         self.views = views
         self.view = view if view in views else views[0]
@@ -2421,17 +2441,19 @@ class DriveSelectorApp(App):
 
     def last_sync_in_background(self, destination, round_):
         try:
-            service = self.make_service()
-            self.refresh_cache(service)
-            state = load_state(destination)
-            kept = []
-            selections, scopes = last_selection(service, state, self.cache, kept)
-            roots = saved_roots(state)
-            plan = build_plan(service, selections, scopes, destination, state, self.cache, roots=upload_roots(roots))
+            with collecting_warnings() as warnings:
+                service = self.make_service()
+                self.refresh_cache(service)
+                state = load_state(destination)
+                kept = []
+                selections, scopes = last_selection(service, state, self.cache, kept)
+                roots = saved_roots(state)
+                plan = build_plan(service, selections, scopes, destination, state, self.cache,
+                                  roots=upload_roots(roots))
             if self.keep_both:
                 set_keep_both(plan, plan, True)
             result = {"plan": plan, "selections": selections, "scopes": scopes, "destination": destination,
-                      "state": state, "roots": roots, "kept": kept, "round": round_}
+                      "state": state, "roots": roots, "kept": kept, "round": round_, "warnings": warnings}
         except Exception as error:  # a worker error would end the app: report it instead
             self.call_from_thread(self.last_sync_failed, round_, error_text(error))
             return
@@ -2443,6 +2465,10 @@ class DriveSelectorApp(App):
         self.last_sync = result
         self.last_sync_text = last_sync_summary(result["plan"])
         self.update_notice()
+        for message in result["warnings"]:
+            if message not in self.shown_warnings:  # each new check finds it again: shown once
+                self.shown_warnings.add(message)
+                self.notify(message, severity="warning", markup=False, timeout=15)
 
     def last_sync_failed(self, round_, message):
         if round_ == self.last_sync_round:
@@ -3212,20 +3238,21 @@ class DriveSelectorApp(App):
                 self.call_from_thread(self.update_selection_summary, f"Comparing with local files… {checked}")
 
         try:
-            service = self.make_service()
-            self.refresh_cache(service)
-            selections = self.fresh_selections(selections)
-            state = load_state(destination)
-            plan = build_plan(
-                service, selections, scopes, destination, state, self.cache, on_item, view_roots(self.views)
-            )
+            with collecting_warnings() as warnings:
+                service = self.make_service()
+                self.refresh_cache(service)
+                selections = self.fresh_selections(selections)
+                state = load_state(destination)
+                plan = build_plan(
+                    service, selections, scopes, destination, state, self.cache, on_item, view_roots(self.views)
+                )
             if self.keep_both:
                 set_keep_both(plan, plan, True)
         except Exception as error:  # a worker error would end the app: report it instead
             self.call_from_thread(self.plan_failed, error_text(error))
             return
         result = {"plan": plan, "selections": selections, "scopes": scopes,
-                  "destination": destination, "state": state}
+                  "destination": destination, "state": state, "warnings": warnings}
         self.call_from_thread(self.plan_ready, result)
 
     def plan_failed(self, message):
@@ -3245,7 +3272,9 @@ class DriveSelectorApp(App):
                 self.exit(result)
 
         self.push_screen(
-            PreviewScreen(result["plan"], result["destination"], self.account, result["state"]), answered
+            PreviewScreen(result["plan"], result["destination"], self.account, result["state"],
+                          result.get("warnings", ())),
+            answered,
         )
 
     def action_cancel(self):
@@ -4992,9 +5021,10 @@ class PreviewScreen(Screen):
         Binding("escape,n", "back", "Back"),
     ]
 
-    def __init__(self, plan, destination, account=None, state=None):
+    def __init__(self, plan, destination, account=None, state=None, warnings=()):
         super().__init__()
         self.plan = plan
+        self.warnings = warnings  # warn() messages of the plan: printed before the preview only with --again
         self.destination = destination
         self.account = account
         self.state = state
@@ -5023,6 +5053,9 @@ class PreviewScreen(Screen):
 
     def update_notes(self):
         notes = Text()
+        for message in self.warnings:
+            notes.append("! ", style="bold yellow")
+            notes.append(message + "\n", style="yellow")
         for note in plan_notes(self.plan):
             notes.append(note + "\n")
         if not has_actions(self.plan):
