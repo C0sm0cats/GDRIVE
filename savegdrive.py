@@ -1690,23 +1690,30 @@ def mtime_matches(path_stat, modified_time):
 
 
 NAME_COLUMN_MIN = 24  # cells from the tree's left edge to the end of the names, however narrow the tree
+TREE_GUIDES = (4, 2)  # cells per tree level: Tree's default, then narrower when the deepest names lack room
+NAME_ROOM_MIN = 8  # cells a name keeps at the deepest level before the guides narrow
 
 
-def label_start(node, children_of, base=Path()):
+def label_start(node, children_of, base=Path(), guide=4):
     """Cells before a node's label: tree guides, plus the expand arrow of folders with children.
     The view's base (Shared with me, Shared drives/<name>, Trash) is not tree depth."""
     depth = len(node["relative_parent"].relative_to(base).parts) + 1
-    return depth * 4 + (2 if node["index"] in children_of else 0)
+    return depth * guide + (2 if node["index"] in children_of else 0)
 
 
-def name_column(nodes, base=Path()):
+def name_column(nodes, base=Path(), guide=4):
     children_of = {node["parent"] for node in nodes}
     widest = 0
     for node in nodes:
         prefix = 4 + (2 if node["item"]["mimeType"] == SHORTCUT_MIME_TYPE else 0)  # checkbox, mark
         name = Text(printable(node["item"]["name"]))
-        widest = max(widest, label_start(node, children_of, base) + prefix + name.cell_len)
+        widest = max(widest, label_start(node, children_of, base, guide) + prefix + name.cell_len)
     return widest
+
+
+def deepest_label_start(nodes, base=Path(), guide=4):
+    children_of = {node["parent"] for node in nodes}
+    return max((label_start(node, children_of, base, guide) for node in nodes), default=0)
 
 
 def label_columns(entry, totals):
@@ -1992,6 +1999,7 @@ class DriveTree(Tree):
         self.node_paths = {}  # index -> selected_path of its entry, for the tree nodes
         self.populated = set()
         self.label_column = None  # the name column of its labels, to redo them when the width changes
+        self.label_guide = None  # the guide width of its labels, likewise
         self.built_nodes = None  # the view's listing, sort and filter the tree shows
         self.built_key = None
         self.stale = None  # "selection" or "all": labels to redo when it is shown again
@@ -2016,7 +2024,8 @@ class DriveView:
         self.children_of = {}
         self.totals = {}
         self.marks = {}
-        self.name_column = 0  # widest label start + name: what the names need
+        self.name_columns = {guide: 0 for guide in TREE_GUIDES}  # widest label start + name, per guide width
+        self.deepest = {guide: 0 for guide in TREE_GUIDES}  # widest label start, per guide width
         self.tail_width = 0  # widest size, date and format after the names
         self.expanded = set()  # local paths of the open folders: indexes change when the view is listed again
         self.error = None
@@ -2029,7 +2038,8 @@ class DriveView:
             self.children_of.setdefault(node["parent"], []).append(node)
         self.totals = folder_totals(nodes)
         self.newest = folder_newest(nodes)
-        self.name_column = name_column(nodes, self.base)
+        self.name_columns = {guide: name_column(nodes, self.base, guide) for guide in TREE_GUIDES}
+        self.deepest = {guide: deepest_label_start(nodes, self.base, guide) for guide in TREE_GUIDES}
         self.tail_width = max((Text(label_tail(node, self.totals)).cell_len for node in nodes), default=0)
         self.sorted_by = "name"
 
@@ -2299,18 +2309,27 @@ class DriveSelectorApp(App):
         return self.fit_name_column(self.size.width)
 
     def fit_name_column(self, screen_width):
-        """Names get what they need, up to the tree's width less the columns after them."""
+        """Names get what they need, up to the tree's width less the columns after them.
+        Sets the tree's guide width: narrower when a deep tree would leave its names no room."""
         if self.tree_frame is None:  # margins, border, padding and scrollbar around the labels
             styles = self.drive_tree.styles
             self.tree_frame = styles.margin.width + styles.gutter.width + styles.scrollbar_size_vertical
         width = screen_width - self.tree_frame
-        return min(self.view.name_column, max(width - self.view.tail_width, NAME_COLUMN_MIN))
+        allowed = max(width - self.view.tail_width, NAME_COLUMN_MIN)
+        guide = next((guide for guide in TREE_GUIDES
+                      if self.view.deepest[guide] + 4 + NAME_ROOM_MIN <= allowed), TREE_GUIDES[-1])
+        self.drive_tree.guide_depth = guide
+        return min(self.view.name_columns[guide], allowed)
+
+    def labels_fit(self, column):
+        """The tree's labels were made for this name column and its current guide width."""
+        return self.label_column == column and self.drive_tree.label_guide == self.drive_tree.guide_depth
 
     def on_resize(self, event):  # runs before App's own handler: self.size is still the old one
         if self.query("#views"):
             self.update_views(event.size.width)
         self.update_notice(event.size.width)
-        if self.view.nodes is None or self.label_column == self.fit_name_column(event.size.width):
+        if self.view.nodes is None or self.labels_fit(self.fit_name_column(event.size.width)):
             return
         self.label_column = self.fit_name_column(event.size.width)
         for tree_node in self.tree_nodes.values():
@@ -2472,7 +2491,7 @@ class DriveSelectorApp(App):
                 self.apply_filter(filter_input.value)  # computed on the loaded items
             elif tree.built_nodes is not view.nodes or tree.built_key != self.tree_key():
                 self.rebuild()
-            elif tree.stale == "all" or tree.label_column != self.name_column:
+            elif tree.stale == "all" or not self.labels_fit(self.name_column):
                 self.relabel_nodes()
             elif tree.stale == "selection":
                 self.relabel_nodes(selection_only=True)
@@ -2663,7 +2682,8 @@ class DriveSelectorApp(App):
         name_style = "bold cyan" if folder else "bright_black" if unsupported else "bright_white"
         if column is None:
             column = self.label_column = self.name_column
-        width = column - label_start(entry, self.children_of, self.view.base) - label.cell_len
+        guide = self.drive_tree.label_guide = self.drive_tree.guide_depth
+        width = column - label_start(entry, self.children_of, self.view.base, guide) - label.cell_len
         name = Text(printable(item["name"]), style=name_style)
         name.truncate(max(width, 4), overflow="ellipsis", pad=True)
         label.append_text(name)
