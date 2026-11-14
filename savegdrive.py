@@ -3063,7 +3063,7 @@ class DriveSelectorApp(App):
         service = self.make_service()
         try:
             failed = work(service) or {}
-        except (HttpError, OSError) as error:
+        except DRIVE_CALL_ERRORS as error:  # network (httplib2) or session (google.auth) too: the tree stays
             failed = {"": error_text(error)}
         replayed = False
         if self.drive_token is not None:
@@ -6269,6 +6269,8 @@ def main():
             )
             result = app.run()
             view, sort, destination_root, token = app.view, app.sort, app.destination, app.drive_token
+            # A tree ended by an error (Textual prints its trace, run() returns None like q) is not a success.
+            failed = failed or bool(app.return_code)
             if not result:
                 break
             plan, selections, local_scopes = result["plan"], result["selections"], result["scopes"]

@@ -2607,6 +2607,35 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("✗", output)
         self.assertEqual(labels, ["My Drive  timed out  (switch views to try again)"])
 
+    def test_tree_ended_by_an_error_exits_with_code_1(self):
+        # bugs 59: Textual prints the trace of a failed worker and run() returns None, like q:
+        # main exited with code 0, as if all went well.
+        import asyncio
+
+        from textual.worker import WorkerFailed
+
+        def run(app):
+            async def drive_it():
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    await pilot.press("down", "down", "x", "y")
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+            try:
+                with mock.patch.object(sys, "stderr", io.StringIO()):  # Textual's trace of the failed worker
+                    asyncio.run(drive_it())
+            except WorkerFailed:
+                pass  # App.run() does not raise it: it ends the app with return code 1
+            self.assertEqual(app.return_code, 1)
+            return app.return_value
+
+        with mock.patch.object(savegdrive.DriveSelectorApp, "run", run), \
+                mock.patch.object(savegdrive, "trash_items", side_effect=RuntimeError("unexpected")):
+            with self.assertRaises(SystemExit) as raised:
+                self.run_main(isatty=True)
+        self.assertEqual(raised.exception.code, 1)
+
     def test_tree_with_yes_refuses_a_mass_deletion(self):
         self.sync_everything()
         import asyncio
@@ -6639,6 +6668,43 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(item_id, drive.items)
             self.assertTrue(drive.items[item_id]["trashed"])
         self.assertNotIn("trashed", drive.items["photos"])
+
+    async def test_network_or_session_lost_during_a_drive_change_keeps_the_tree_open(self):
+        # bugs 59: x, r, delete forever and shift+t ended the tree on a trace when the network
+        # (httplib2) or the Google session (google.auth) failed: the tree stays, with the failure.
+        import httplib2
+        from google.auth.exceptions import RefreshError
+        lost = (httplib2.ServerNotFoundError("Unable to find the server at www.googleapis.com"),
+                RefreshError("invalid_grant"))
+        for error in lost:
+            with self.subTest(error=type(error).__name__):
+                drive = demo_drive()
+                drive.items["a"]["trashed"] = True
+                drive.items["n"]["trashed"] = True
+
+                app = self.make_app(drive, savegdrive.drive_views(drive, "root"))
+                # Listing still works; the change itself fails out of the batch (or emptyTrash) call.
+                failing = lambda *args, **kwargs: FakeRequest(mock.Mock(side_effect=error))  # noqa: B023, E731
+                drive.update = drive.delete = drive.emptyTrash = failing
+
+                def toasts():
+                    return " ".join(toast.render().plain for toast in app.screen.query(Toast))  # noqa: B023
+
+                async with app.run_test(size=(140, 30), notifications=True) as pilot:
+                    actions = [("down", "down", "x", "y"), ("shift+tab", "down", "r", "y"),
+                               ("down", "x", *"delete", "enter"), ("T", *"empty", "enter")]
+                    for keys in actions:
+                        await pilot.press(*keys)
+                        await self.wait(app, pilot)
+                        self.assertTrue(app.is_running, keys)
+                        self.assertIn(f"1 item failed: {savegdrive.error_text(error)}", toasts())
+                        app.clear_notifications()
+                        await pilot.pause()
+                    await pilot.press("q")
+                self.assertEqual(app.return_code, 0)
+                self.assertNotIn("trashed", drive.items["photos"])
+                for item_id in ("a", "n"):
+                    self.assertTrue(drive.items[item_id]["trashed"])
 
     def trash_view_app(self, drive):
         drive.items["n"]["trashed"] = True  # notes.txt is in the Drive trash
