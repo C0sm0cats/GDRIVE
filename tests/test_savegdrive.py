@@ -739,6 +739,27 @@ class SyncTest(unittest.TestCase):
         january = folders[("01", folders[("2000", archive)])]
         self.assertIn(("a.txt", january), folders)
 
+    def test_folder_batch_failing_as_a_whole_is_an_error_and_the_rest_syncs(self):
+        # tests 90: a network error or 5xx on batch.execute() itself must count as an error for each folder of
+        # the batch, not stop the whole sync on a traceback.
+        self.run_sync()
+        (self.root / "Docs/New").mkdir()
+        (self.root / "Docs/New/x.txt").write_bytes(b"x")
+        (self.root / "Docs/b.txt").write_bytes(b"bravo, edited here")
+        plan, state = self.preview()
+        real = savegdrive.create_remote_folders
+
+        def network_down(service, folders):
+            down = mock.Mock(execute=mock.Mock(side_effect=OSError("Network is unreachable")))
+            with mock.patch.object(self.drive, "new_batch_http_request", lambda callback: down):
+                return real(service, folders)
+
+        with mock.patch.object(savegdrive, "create_remote_folders", network_down):
+            results = self.apply(plan, state)
+        self.assertEqual((results["FOLDER_ERROR"], results["FILE_ERROR"], results["FILE_UPLOAD"]), (1, 1, 1))
+        self.assertEqual(self.drive.items["b"]["content"], b"bravo, edited here")
+        self.assertNotIn("x.txt", [item["name"] for item in self.drive.items.values()])
+
     def test_file_whose_folder_could_not_be_made_on_drive_is_not_sent(self):
         # tests 94: sent with parents [null], Drive puts the file at the root of My Drive; the next sync then
         # moved it to the root here and put its local folder in your trash.
