@@ -6045,6 +6045,9 @@ def destination_path(path_text):
     destination = Path(path_text).expanduser()
     if not destination.is_absolute():
         destination = Path.cwd() / destination
+    if destination.name == "..":
+        # "x/.." is x's parent: left unresolved, that folder would be among its own parents.
+        return destination.resolve()
     return destination.parent.resolve() / destination.name
 
 

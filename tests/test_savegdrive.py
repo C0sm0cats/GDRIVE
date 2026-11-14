@@ -4464,6 +4464,16 @@ class SyncTest(unittest.TestCase):
         self.assertEqual([path for path in statuses if path.split("/")[0] == "Work"], [])
         self.assertNotIn(savegdrive.STATE_FILE_NAME, {item["name"] for item in self.drive.items.values()})
 
+    def test_download_path_dot_dot_from_a_subfolder_is_the_managed_folder(self):
+        # bugs 56: --download-path .. from ~/GDrive/Docs is ~/GDrive, not a folder inside it.
+        self.run_sync()
+        (self.root / "Sub").mkdir(exist_ok=True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.root / "Sub")
+        self.assertEqual(savegdrive.destination_path(".."), self.root)
+        self.assertEqual(savegdrive.destination_path("../Sub/.."), self.root)
+        self.assertEqual(savegdrive.resolve_destination(".."), self.root)
+
     def check_state_file_name_from_drive_in_a_subfolder(self, name):
         # bugs 58: a Drive file named like a state file comes down with the rest; its folder is still synced.
         photos = self.root / "Photos"
