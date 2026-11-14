@@ -6729,6 +6729,47 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 for item_id in ("a", "n"):
                     self.assertTrue(drive.items[item_id]["trashed"])
 
+    async def test_quitting_during_a_drive_change_waits_for_its_result(self):
+        # bugs 61: q or esc during "Updating Google Drive…" ended the tree: a refusal from Drive was never
+        # shown and the tool exited with code 0. Quitting now waits for the change and its result.
+        import threading
+        drive = demo_drive()
+        drive.items["a"]["trashed"] = True
+        drive.items["n"]["trashed"] = True
+        app = self.make_app(drive, savegdrive.drive_views(drive, "root"))
+        release = threading.Event()
+
+        def refused(*args, **kwargs):
+            release.wait(10)
+            return {"x": "403 The user does not have sufficient permissions"}
+
+        def toasts():
+            return " ".join(toast.render().plain for toast in app.screen.query(Toast))
+
+        with mock.patch.multiple(savegdrive, trash_items=refused, restore_items=refused,
+                                 delete_items=refused, empty_drive_trash=refused):
+            async with app.run_test(size=(140, 30), notifications=True) as pilot:
+                actions = [("down", "down", "x", "y"), ("shift+tab", "down", "r", "y"),
+                           ("down", "x", *"delete", "enter"), ("T", *"empty", "enter")]
+                for keys in actions:
+                    release.clear()
+                    await pilot.press(*keys)
+                    await pilot.pause()
+                    for quit_key in ("q", "escape"):
+                        await pilot.press(quit_key)
+                        await pilot.pause()
+                        self.assertTrue(app.is_running, (keys, quit_key))
+                    self.assertIn("Google Drive is being updated: wait for it to finish.", toasts())
+                    release.set()
+                    await self.wait(app, pilot)
+                    self.assertIn("1 item failed: 403 The user does not have sufficient permissions", toasts())
+                    app.clear_notifications()
+                    await pilot.pause()
+                await pilot.press("q")
+                await pilot.pause()
+            self.assertFalse(app.is_running)
+        self.assertEqual(app.return_code, 0)
+
     def trash_view_app(self, drive):
         drive.items["n"]["trashed"] = True  # notes.txt is in the Drive trash
         views = savegdrive.drive_views(drive, "root")

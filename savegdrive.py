@@ -2263,6 +2263,7 @@ class DriveSelectorApp(App):
         self.filter_visible = None
         self.filter_timer = None  # pending apply_filter while typing
         self.busy = False
+        self.changing = False  # a Drive change (x, r, delete forever, shift+t) is running: quitting would hide its result
         self.sort = sort
 
     # The current view's data.
@@ -3054,7 +3055,7 @@ class DriveSelectorApp(App):
         def answered(yes):
             if not yes:
                 return
-            self.busy = True
+            self.busy = self.changing = True
             self.update_selection_summary("Updating Google Drive…")
             self.run_worker(lambda: self.change_in_background(work, done), thread=True)
 
@@ -3078,7 +3079,7 @@ class DriveSelectorApp(App):
         self.call_from_thread(self.drive_changed, done, failed, replayed)
 
     def drive_changed(self, done, failed, replayed=False):
-        self.busy = False
+        self.busy = self.changing = False
         if failed:
             first = next(iter(failed.values()))
             self.notify(f"{plural(len(failed), 'item')} failed: {first}", severity="error", markup=False)
@@ -3242,9 +3243,12 @@ class DriveSelectorApp(App):
         if self.query_one("#filter", Input).display:
             self.clear_filter()
             return
-        self.exit(None)
+        self.action_quit_selector()
 
     def action_quit_selector(self):
+        if self.changing:  # its result (a refusal from Drive) is only shown in the tree
+            self.notify("Google Drive is being updated: wait for it to finish.", severity="warning")
+            return
         self.exit(None)
 
 
