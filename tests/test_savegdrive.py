@@ -1630,6 +1630,22 @@ class SyncTest(unittest.TestCase):
         picked = savegdrive.load_state(self.root)["last_selection"]["items"]
         self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs", "Photos"])
 
+    def test_names_with_brackets_show_whole_in_the_terminal(self):
+        # [draft] and [old] would vanish as markup from the preview, the log and the warnings.
+        self.drive.items["docs"]["name"] = "Docs [draft]"
+        self.drive.items["nr"] = file_item("nr", "notes [old].txt", "root", b"n")
+        self.sync_picked("Docs [draft]", "Photos", "notes [old].txt")
+        self.drive.items["a"].update(file_item("a", "a.txt", "docs", b"alpha v2"))
+        self.drive.change("a")
+        del self.drive.items["nr"]
+        self.drive.change("nr")
+        output = self.run_main("--again", "--yes")
+        self.assertIn("! notes [old].txt is no longer on Drive", output)
+        self.assertIn("Again  Docs [draft], Photos", output)
+        self.assertIn("to your trash  notes [old].txt", output)
+        self.assertIn("notes [old].txt → your trash", output)
+        self.assertEqual(output.count("Docs [draft]/a.txt"), 2, output)  # the preview, then the log
+
     def test_again_tells_why_each_picked_item_left(self):
         # bugs 53: a picked item put in the Drive trash was said to be "no longer in the Drive trash".
         self.sync_picked("Docs", "Photos", "notes.txt")
