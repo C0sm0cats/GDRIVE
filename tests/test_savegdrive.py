@@ -3805,6 +3805,42 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"kept last time")
         self.assertEqual((self.root / "Docs/b (local 2).txt").read_bytes(), b"edited locally again")
 
+    def keep_both_b_planned(self):
+        """b.txt edited here and on Drive, keep both chosen in the preview: (plan, state)."""
+        self.run_sync()
+        (self.root / "Docs/b.txt").write_bytes(b"my edit of b")
+        self.drive.items["b"].update(file_item("b", "b.txt", "docs", b"b changed on Drive"))
+        plan, state = self.preview()
+        conflict = next(entry for entry in plan if entry["relative_path"].as_posix() == "Docs/b.txt")
+        self.assertEqual(conflict["status"], "CONFLICT")
+        savegdrive.set_keep_both(plan, [conflict], True)
+        self.assertEqual(conflict["local_copy"].name, "b (local).txt")
+        return plan, state
+
+    def test_keep_both_never_overwrites_a_copy_made_after_the_preview(self):
+        # tests 82: "b (local).txt" appears while the preview is open, after the plan picked that name.
+        plan, state = self.keep_both_b_planned()
+        (self.root / "Docs/b (local).txt").write_bytes(b"notes typed while the preview was open")
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 1)
+        self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"notes typed while the preview was open")
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"my edit of b")
+
+    def test_keep_both_never_overwrites_a_save_made_during_the_download(self):
+        # tests 85: an editor saves b.txt again after keep both moved it aside, while Drive's version downloads.
+        plan, state = self.keep_both_b_planned()
+
+        def fetch_while_the_editor_saves(service, item, file_handle, stop=None):
+            if savegdrive.effective_id(item) == "b":
+                (self.root / "Docs/b.txt").write_bytes(b"saved by the editor during the download")
+            fake_fetch(service, item, file_handle, stop)
+
+        with mock.patch.object(savegdrive, "fetch_media", fetch_while_the_editor_saves):
+            results = self.apply(plan, state)
+        self.assertEqual(results["FILE_ERROR"], 1)
+        self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"saved by the editor during the download")
+        self.assertEqual((self.root / "Docs/b (local).txt").read_bytes(), b"my edit of b")
+
     def test_keep_both_never_takes_a_name_the_plan_downloads(self):
         self.run_sync()
         (self.root / "Docs/a.txt").write_bytes(b"MY UNSAVED WORK")
