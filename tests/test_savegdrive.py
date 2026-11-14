@@ -1603,6 +1603,25 @@ class SyncTest(unittest.TestCase):
         picked = savegdrive.load_state(self.root)["last_selection"]["items"]
         self.assertEqual(sorted(saved["path"] for saved in picked), ["Docs", "Photos"])
 
+    def test_again_tells_why_each_picked_item_left(self):
+        # bugs 53: a picked item put in the Drive trash was said to be "no longer in the Drive trash".
+        self.sync_picked("Docs", "Photos", "notes.txt")
+        self.drive.items["n"]["trashed"] = True
+        self.drive.change("n")
+        del self.drive.items["photos"]
+        self.drive.change("photos")
+        output = self.run_main("--again", "--yes")
+        self.assertIn("! notes.txt is in the Drive trash\n", output)
+        self.assertIn("! Photos is no longer on Drive\n", output)
+        self.assertNotIn("no longer in the Drive trash", output)
+        # Picked in the Trash view, then restored on Drive.
+        self.drive.items["n"]["trashed"] = False
+        state = {"last_selection": {"items": [
+            {"id": "n", "path": "Trash/notes.txt", "relative_parent": "Trash", "parent_id": None}]}}
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())) as output:
+            savegdrive.last_selection(self.drive, state, {})
+        self.assertEqual(output.file.getvalue(), "! Trash/notes.txt is no longer in the Drive trash\n")
+
     def test_again_after_the_whole_selection_left_drive_says_so(self):
         # Only Photos picked, then deleted on Drive: the first --again trashes the copy, the next one has nothing.
         self.sync_picked("Photos")

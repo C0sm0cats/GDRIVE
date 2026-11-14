@@ -3339,7 +3339,13 @@ def last_selection(service, state, cache, kept=None):
             # Picked in the Trash view and restored on Drive: gone from that view, its new place comes if selected.
             if item is not None and item.get("trashed") and kept is not None:
                 kept.append(saved_item)  # in the Drive trash: it may be restored there
-            warn(f"{saved_item['path']} is no longer " + ("in the Drive trash" if item is not None else "on Drive"))
+            if item is None:
+                gone = "is no longer on Drive"
+            elif item.get("trashed"):
+                gone = "is in the Drive trash"
+            else:
+                gone = "is no longer in the Drive trash"  # picked in the Trash view, restored since
+            warn(f"{saved_item['path']} {gone}")
             scopes.append(Path(saved_item["path"]))
             continue
         elif moved_on_drive(saved_item, item):
