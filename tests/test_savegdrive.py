@@ -1512,6 +1512,25 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(len(self.drive.uploads), uploads_before)
         self.assertTrue((self.root / "Photos-old/beach.jpg").exists())
 
+    def test_picked_item_renamed_here_to_a_name_that_is_not_utf8_is_never_sent(self):
+        # maint 7: next to an item picked alone, a name that is not UTF-8 got "select its parent folder to send
+        # it", which could never send it: the same note as in a whole view, it cannot go to Drive.
+        self.sync_picked("notes.txt")
+        name = os.fsdecode(b"notes-\xe9.txt")
+        (self.root / "notes.txt").rename(self.root / name)
+        state = savegdrive.load_state(self.root)
+        with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+            selections, scopes = savegdrive.last_selection(self.drive, state, {})
+        plan = savegdrive.build_plan(self.drive, selections, scopes, self.root, state, {})
+        by_path = {entry["relative_path"].as_posix(): entry for entry in plan}
+        self.assertEqual(by_path["notes.txt"]["status"], "TRASH_REMOTE")
+        self.assertEqual(by_path[name]["status"], "LOCAL_ONLY")
+        self.assertTrue(by_path[name].get("not_utf8"))
+        self.assertFalse(by_path[name].get("outside_selection"))
+        notes = savegdrive.plan_notes(plan)
+        self.assertTrue(any(note.startswith("Names that are not UTF-8") for note in notes))
+        self.assertFalse(any(note.startswith("Not in your selection") for note in notes))
+
     def test_picked_items_moved_on_drive_into_another_pick_are_synced_once(self):
         # Docs, Photos and notes.txt picked; on Drive, Photos and notes.txt are moved into Docs, then --again.
         self.sync_picked("Docs", "Photos", "notes.txt")
@@ -2835,6 +2854,12 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(marks()["Docs"], "synced")
         (self.root / "Docs/x.txt.savegdrive.part").unlink()
         (self.root / "Docs/link").unlink()
+        # maint 12: nor a name that is not UTF-8, which the sync never sends.
+        latin1 = self.root / os.fsdecode(b"Docs/notes-\xe9.txt")
+        latin1.write_text("latin-1 name")
+        self.assertEqual(marks()["Docs"], "synced")
+        self.assertEqual(statuses()[os.fsdecode(b"Docs/notes-\xe9.txt")], "LOCAL_ONLY")
+        latin1.unlink()
 
         # Deleted here: goes to the Drive trash, not a change on Drive.
         (self.root / "Docs/b.txt").unlink()

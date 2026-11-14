@@ -1134,6 +1134,39 @@ def holds_state(directory):
     return any(os.path.isfile(directory / name) for name in (STATE_FILE_NAME, LEGACY_STATE_FILE_NAME))
 
 
+def local_child_rule(relative_directory, child, on_drive=lambda child, relative_path, kind: False,
+                     other_savegdrive_folder=lambda child, relative_path: holds_state(child)):
+    """Why a local item is not planned like any other, or None: the one filter of every walk of the local side
+    (the sync plan, the items next to those picked alone, the marks of the tree), so a new rule reaches them all.
+
+    child: its path on disk, in relative_directory. on_drive(child, relative_path, kind): Drive has (or had, at
+    the last sync) an item there, so a view's name or the part suffix is synced like any other name.
+    other_savegdrive_folder(child, relative_path): a folder synced on its own, by its own state file.
+
+    "reserved": SaveGDrive's own files, or the disk's trash. "view": the folder of a view (Shared with me, Shared
+    drives, Trash), which has its own scope. "symlink": never followed. "other_savegdrive": synced on its own.
+    "part": left by a killed run. "special": neither a file nor a folder (a socket, a pipe). "not_utf8": Drive
+    names are UTF-8, so it can never go there.
+    """
+    name = child.name
+    relative_path = relative_directory / name
+    if relative_path.parts[0] in RESERVED_NAMES or is_disk_trash(relative_path.parts[0]):
+        return "reserved"
+    if relative_directory == Path() and name in VIEW_DIRS and not on_drive(child, relative_path, "FOLDER"):
+        return "view"
+    if os.path.islink(child):
+        return "symlink"
+    if os.path.isdir(child) and other_savegdrive_folder(child, relative_path):
+        return "other_savegdrive"
+    if name.endswith(PART_SUFFIX) and not on_drive(child, relative_path, "FILE"):
+        return "part"
+    if not (os.path.isdir(child) or os.path.isfile(child)):
+        return "special"
+    if not is_utf8_name(name):
+        return "not_utf8"
+    return None
+
+
 def initialize_managed_destination(destination):
     outer = next((parent for parent in destination.parents if holds_state(parent)), None)
     if outer is not None:
@@ -1760,25 +1793,29 @@ def local_only_marks(directory, relative_directory, drive_names, tracked, tracke
     takes new items), or synced before and deleted on Drive (goes to your trash). One listing, no hashing."""
     found = Counter()
     try:
-        children = list(os.scandir(directory))
+        children = [Path(entry.path) for entry in os.scandir(directory)]
     except OSError:
         return found
     folded = {unicodedata.normalize("NFC", name).casefold() for name in drive_names}
+
+    def synced_before(child, relative_path, kind):
+        return relative_path in tracked or relative_path in tracked_directories
+
+    def other_savegdrive_folder(child, relative_path):
+        return not synced_before(child, relative_path, "FOLDER") and holds_state(child)
+
     for child in children:
         name = child.name
-        if name in drive_names or name.endswith(PART_SUFFIX) or child.is_symlink():
+        if name in drive_names:
             continue
+        if local_child_rule(relative_directory, child, synced_before, other_savegdrive_folder) is not None:
+            continue  # what the sync never sends nor trashes
         relative_path = relative_directory / name
-        if relative_path in tracked or relative_path in tracked_directories:
+        if synced_before(child, relative_path, None):
             found["changed"] += 1  # deleted on Drive: goes to your trash, or a conflict if changed here
             continue
         if unicodedata.normalize("NFC", name).casefold() in folded:
             continue  # the Drive item under another spelling (case-insensitive disk), or a name clash
-        try:
-            if child.is_dir() and holds_state(Path(child.path)):
-                continue  # another SaveGDrive folder, synced on its own
-        except OSError:
-            continue
         if can_receive and not is_readonly_path(relative_path):
             found["edited"] += 1  # new here: goes up at the next sync
     return found
@@ -3893,36 +3930,12 @@ def maybe_exists(path):
     return True
 
 
-def add_local_entries(plan, destination_root, state, scopes, remote_folders):
-    """Local files and folders Drive does not have: new here (sent to Drive), or deleted on Drive (to your trash).
+def forget_gone_from_both_sides(state, destination_root, scopes, remote_files, remote_directories,
+                                at_or_below_trashed):
+    """Gone from Drive and from here since the last sync: forget it (saved only if the sync is applied), so what
+    is restored or made again there later counts as new. Kept below a folder going to the Drive trash: counted."""
 
-    remote_folders maps local folder paths to their Drive folder id (None: nothing can be sent there).
-    """
-    remote_files = {
-        entry["relative_path"]
-        for entry in plan
-        if entry["kind"] == "FILE" and entry.get("item") is not None
-    }
-    remote_directories = {
-        entry["relative_path"]
-        for entry in plan
-        if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE"
-    }
-    trashed_remote = {
-        entry["relative_path"] for entry in plan
-        if entry["kind"] == "FOLDER"
-        and (
-            entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat") or entry.get("too_deep")
-            or entry.get("symlink") or entry.get("view_name")
-        )
-    }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link here:
-    # nothing below goes anywhere
-
-    def at_or_below_trashed(path):
-        # One set lookup per parent: a scan of every trashed folder for each local path was quadratic
-        return bool(trashed_remote) and (path in trashed_remote or not trashed_remote.isdisjoint(path.parents))
-
-    def gone_from_both_sides(path, remote):
+    def gone(path, remote):
         return (
             path_is_in_scope(path, scopes)
             and path not in remote
@@ -3930,64 +3943,113 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             and not maybe_exists(destination_root / path)
         )
 
-    # Gone from Drive and from here since the last sync: forget it (saved only if the sync is applied), so what
-    # is restored or made again there later counts as new. Kept below a folder going to the Drive trash: counted.
     for key, record in list(state["files"].items()):
-        if record.get("path") and gone_from_both_sides(Path(record["path"]), remote_files):
+        if record.get("path") and gone(Path(record["path"]), remote_files):
             del state["files"][key]
     for path_text in list(state.get("folders", {})):
-        if gone_from_both_sides(Path(path_text), remote_directories):
+        if gone(Path(path_text), remote_directories):
             del state["folders"][path_text]
-    tracked = tracked_files_by_path(state)
-    synced_folders = {Path(path) for path in state.get("folders", {})}
-    tracked_directories = {
-        parent for tracked_path in tracked for parent in tracked_path.parents
-    } | synced_folders
-    planned_local_paths = {
-        entry["relative_path"]
-        for entry in plan
-        if entry.get("item") is None
-    }
-    new_folders = set()
-    unreadable = set()  # folders that cannot be listed here, and files that cannot be read
-    # On a case-insensitive disk (macOS, exFAT...), Drive's "Report.txt" can be the local "report.txt"
-    remote_by_key = {
-        "FILE": {same_name_key(path): path for path in remote_files},
-        "FOLDER": {same_name_key(path): path for path in remote_directories},
-    }
 
-    def drive_spelling(child, relative_path, kind):
+
+class LocalScan:
+    """The walk of the local side of a sync plan, for add_local_entries: what it adds to plan, and what it has
+    seen so far (folders created again, what cannot be read here)."""
+
+    def __init__(self, plan, destination_root, state, scopes, remote_folders):
+        self.plan = plan
+        self.destination_root = destination_root
+        self.scopes = scopes
+        self.remote_folders = remote_folders
+        self.remote_files = {
+            entry["relative_path"]
+            for entry in plan
+            if entry["kind"] == "FILE" and entry.get("item") is not None
+        }
+        self.remote_directories = {
+            entry["relative_path"]
+            for entry in plan
+            if entry["kind"] == "FOLDER" and entry.get("item") is not None and entry["status"] != "TRASH_REMOTE"
+        }
+        self.trashed_remote = {
+            entry["relative_path"] for entry in plan
+            if entry["kind"] == "FOLDER"
+            and (
+                entry["status"] == "TRASH_REMOTE" or entry.get("duplicate") or entry.get("repeat")
+                or entry.get("too_deep") or entry.get("symlink") or entry.get("view_name")
+            )
+        }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link
+        # here: nothing below goes anywhere
+        forget_gone_from_both_sides(
+            state, destination_root, scopes, self.remote_files, self.remote_directories, self.at_or_below_trashed
+        )
+        self.tracked = tracked_files_by_path(state)
+        self.synced_folders = {Path(path) for path in state.get("folders", {})}
+        self.tracked_directories = {
+            parent for tracked_path in self.tracked for parent in tracked_path.parents
+        } | self.synced_folders
+        self.planned_local_paths = {
+            entry["relative_path"]
+            for entry in plan
+            if entry.get("item") is None
+        }
+        self.new_folders = set()
+        self.unreadable = set()  # folders that cannot be listed here, and files that cannot be read
+        # On a case-insensitive disk (macOS, exFAT...), Drive's "Report.txt" can be the local "report.txt"
+        self.remote_by_key = {
+            "FILE": {same_name_key(path): path for path in self.remote_files},
+            "FOLDER": {same_name_key(path): path for path in self.remote_directories},
+        }
+
+    def at_or_below_trashed(self, path):
+        # One set lookup per parent: a scan of every trashed folder for each local path was quadratic
+        trashed = self.trashed_remote
+        return bool(trashed) and (path in trashed or not trashed.isdisjoint(path.parents))
+
+    def drive_spelling(self, child, relative_path, kind):
         """The Drive path child is on disk under another spelling, or None."""
-        remote = remote_by_key[kind].get(same_name_key(relative_path))
+        remote = self.remote_by_key[kind].get(same_name_key(relative_path))
         if remote is None or remote == relative_path:
             return None
         try:
-            return remote if os.path.samefile(child, destination_root / remote) else None
+            return remote if os.path.samefile(child, self.destination_root / remote) else None
         except OSError:
             return None
 
-    def other_savegdrive_folder(child, relative_path):
+    def on_drive(self, child, relative_path, kind):
+        """Drive has an item there, or had one at the last sync: its name is synced like any other."""
+        if kind == "FOLDER":
+            return relative_path in self.remote_directories
+        return (
+            relative_path in self.remote_files
+            or relative_path in self.tracked
+            or self.drive_spelling(child, relative_path, "FILE") is not None
+        )
+
+    def other_savegdrive_folder(self, child, relative_path):
         """A folder synced on its own: its state file is there, and is not a Drive file synced like any other."""
         if not holds_state(child):
             return False
-        spellings = {relative_path, drive_spelling(child, relative_path, "FOLDER") or relative_path}
+        spellings = {relative_path, self.drive_spelling(child, relative_path, "FOLDER") or relative_path}
         return not any(
-            path / name in remote_files or path / name in tracked
+            path / name in self.remote_files or path / name in self.tracked
             for path in spellings
             for name in (STATE_FILE_NAME, LEGACY_STATE_FILE_NAME)
         )
 
-    def can_send(relative_path):
+    def rule(self, relative_directory, child):
+        return local_child_rule(relative_directory, child, self.on_drive, self.other_savegdrive_folder)
+
+    def can_send(self, relative_path):
         parent = relative_path.parent
         if is_readonly_path(relative_path):
             return False
-        return parent in new_folders or remote_folders.get(parent) is not None
+        return parent in self.new_folders or self.remote_folders.get(parent) is not None
 
-    def add_local_entry(relative_path, kind, symlink=False, not_utf8=False):
-        if relative_path in planned_local_paths:
+    def add_local_entry(self, relative_path, kind, symlink=False, not_utf8=False):
+        if relative_path in self.planned_local_paths:
             return
-        destination = destination_root / relative_path
-        tracked_entry = tracked.get(relative_path) if kind == "FILE" else None
+        destination = self.destination_root / relative_path
+        tracked_entry = self.tracked.get(relative_path) if kind == "FILE" else None
         tracked_key, current_sha256 = None, None
 
         planned_stat = None
@@ -3995,9 +4057,9 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
             status = "LOCAL_ONLY"  # never followed: neither the link nor what it points to is sent or trashed
         elif not_utf8:
             status = "LOCAL_ONLY"  # Drive names are UTF-8: neither it nor what is in it is sent or trashed
-        elif kind == "FOLDER" and relative_path in new_folders:
+        elif kind == "FOLDER" and relative_path in self.new_folders:
             status = "UPLOAD_NEW"  # gone from Drive, but what is in it goes up: created again
-        elif kind == "FOLDER" and relative_path in synced_folders:
+        elif kind == "FOLDER" and relative_path in self.synced_folders:
             status = "TRASH_LOCAL"  # an empty folder synced before, deleted on Drive
         elif tracked_entry:
             tracked_key, record = tracked_entry
@@ -4006,23 +4068,23 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 current_sha256 = local_hash(destination, record)
             except OSError:
                 current_sha256 = None
-                unreadable.add(relative_path)
-            if relative_path in unreadable:
+                self.unreadable.add(relative_path)
+            if relative_path in self.unreadable:
                 status = "CONFLICT"  # cannot read it here: neither sent nor trashed
             elif current_sha256 == record.get("local_sha256"):
                 status = "TRASH_LOCAL"  # synced before, deleted on Drive
-            elif can_send(relative_path):
+            elif self.can_send(relative_path):
                 status = "UPLOAD_NEW"  # deleted on Drive but changed here: the change wins
             else:
                 status = "CONFLICT"
-        elif can_send(relative_path):
+        elif self.can_send(relative_path):
             status = "UPLOAD_NEW"
             if kind == "FOLDER":
-                new_folders.add(relative_path)
+                self.new_folders.add(relative_path)
         else:
             status = "LOCAL_ONLY"
 
-        plan.append(
+        self.plan.append(
             {
                 "status": status,
                 "kind": kind,
@@ -4036,32 +4098,33 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 "not_utf8": not_utf8,
             }
         )
-        planned_local_paths.add(relative_path)
+        self.planned_local_paths.add(relative_path)
 
-    def add_symlink_entry(child, relative_path):
+    def add_symlink_entry(self, child, relative_path):
         """A symbolic link Drive has no item for: listed as local only, never followed."""
         if (
-            relative_path in remote_files
-            or relative_path in remote_directories
-            or drive_spelling(child, relative_path, "FILE") is not None
-            or drive_spelling(child, relative_path, "FOLDER") is not None
+            relative_path in self.remote_files
+            or relative_path in self.remote_directories
+            or self.drive_spelling(child, relative_path, "FILE") is not None
+            or self.drive_spelling(child, relative_path, "FOLDER") is not None
         ):
             return  # planned with Drive's item: a conflict
-        add_local_entry(relative_path, "FOLDER" if os.path.isdir(child) else "FILE", symlink=True)
+        self.add_local_entry(relative_path, "FOLDER" if os.path.isdir(child) else "FILE", symlink=True)
 
-    def scan_gone_folder(relative_path, directory):
+    def scan_gone_folder(self, relative_path, directory):
         """A folder synced before and gone from Drive. Something changed or new in it goes up (the change wins
         over the deletion): the folder is created again on Drive. Else what is in it follows the deletion."""
+        plan = self.plan
         start = len(plan)
-        maybe_sent = can_send(relative_path)
+        maybe_sent = self.can_send(relative_path)
         if maybe_sent:
-            new_folders.add(relative_path)  # its content is planned as if it were created again
-        scan_directory(relative_path, directory)
+            self.new_folders.add(relative_path)  # its content is planned as if it were created again
+        self.scan_directory(relative_path, directory)
         if maybe_sent and any(entry["status"] == "UPLOAD_NEW" for entry in plan[start:]):
-            add_local_entry(relative_path, "FOLDER")
+            self.add_local_entry(relative_path, "FOLDER")
             plan.insert(start, plan.pop())  # listed before its content
             return
-        new_folders.discard(relative_path)  # nothing goes up: nothing in it was planned through can_send
+        self.new_folders.discard(relative_path)  # nothing goes up: nothing in it was planned through can_send
         below = plan[start:]
         if below and all(entry["status"] == "TRASH_LOCAL" for entry in below) and holds_only(directory, below):
             # All of it follows the deletion: one folder to the system trash, not one call (and one name
@@ -4081,93 +4144,84 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                     "files_below": sum(entry.get("files_below", 1) for entry in below),
                 }
             )
-            planned_local_paths.add(relative_path)
+            self.planned_local_paths.add(relative_path)
             return
-        if relative_path in synced_folders and not any(directory.rglob("*")):
-            add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
+        if relative_path in self.synced_folders and not any(directory.rglob("*")):
+            self.add_local_entry(relative_path, "FOLDER")  # synced, empty, gone from Drive
 
-    def scan_directory(relative_directory, directory=None):
+    def scan_directory(self, relative_directory, directory=None):
         """directory: where relative_directory is on disk, when the disk spells it differently."""
         if directory is None:
-            directory = destination_root / relative_directory
+            directory = self.destination_root / relative_directory
         if not os.path.isdir(directory):
             return
         try:
             children = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
         except OSError:
-            unreadable.add(relative_directory)  # nothing in it or below goes anywhere: see the end
+            self.unreadable.add(relative_directory)  # nothing in it or below goes anywhere: see mark_unreadable
             return
 
         for child in children:
             relative_path = relative_directory / child.name
-            if relative_path.parts[0] in RESERVED_NAMES or is_disk_trash(relative_path.parts[0]):
+            rule = self.rule(relative_directory, child)
+            if rule == "symlink":
+                if not self.at_or_below_trashed(relative_path):
+                    self.add_symlink_entry(child, relative_path)
                 continue
-            if (
-                relative_directory == Path()
-                and child.name in VIEW_DIRS
-                and relative_path not in remote_directories
-            ):
-                continue  # the Shared with me / Shared drives / Trash views have their own scopes
-            if os.path.islink(child):
-                if not at_or_below_trashed(relative_path):
-                    add_symlink_entry(child, relative_path)
-                continue
-            if os.path.isdir(child) and other_savegdrive_folder(child, relative_path):
-                continue  # another SaveGDrive folder, synced on its own
-            if (
-                child.name.endswith(PART_SUFFIX)
-                and relative_path not in remote_files
-                and relative_path not in tracked
-                and drive_spelling(child, relative_path, "FILE") is None
-            ):  # a Drive file may carry this name too: synced like any file, never deleted here
+            if rule == "part":  # a Drive file may carry this name too: synced like any file, never deleted here
                 if os.path.isfile(child):
                     with contextlib.suppress(OSError):
                         child.unlink()  # left by a killed run (kill -9, power cut): ours, never complete
                 continue
-            if at_or_below_trashed(relative_path):
+            if rule not in (None, "not_utf8"):
+                continue
+            if self.at_or_below_trashed(relative_path):
                 continue  # deleted here; Drive's copy goes to the Drive trash
-            if not is_utf8_name(child.name):
-                if os.path.isdir(child) or os.path.isfile(child):
-                    add_local_entry(relative_path, "FOLDER" if os.path.isdir(child) else "FILE", not_utf8=True)
+            if rule == "not_utf8":
+                self.add_local_entry(relative_path, "FOLDER" if os.path.isdir(child) else "FILE", not_utf8=True)
                 continue
 
             if os.path.isdir(child):
-                remote = drive_spelling(child, relative_path, "FOLDER")
-                if relative_path in remote_directories:
-                    scan_directory(relative_path, child)
+                remote = self.drive_spelling(child, relative_path, "FOLDER")
+                if relative_path in self.remote_directories:
+                    self.scan_directory(relative_path, child)
                 elif remote is not None:
-                    scan_directory(remote, child)  # the same folder under Drive's spelling
-                elif relative_path in tracked_directories:
-                    scan_gone_folder(relative_path, child)
+                    self.scan_directory(remote, child)  # the same folder under Drive's spelling
+                elif relative_path in self.tracked_directories:
+                    self.scan_gone_folder(relative_path, child)
                 else:
-                    add_local_entry(relative_path, "FOLDER")
-                    if relative_path in new_folders:
-                        scan_directory(relative_path, child)  # its files go up too
+                    self.add_local_entry(relative_path, "FOLDER")
+                    if relative_path in self.new_folders:
+                        self.scan_directory(relative_path, child)  # its files go up too
             elif (
-                os.path.isfile(child)
-                and relative_path not in remote_files
-                and drive_spelling(child, relative_path, "FILE") is None  # else Drive's file, under another spelling
+                relative_path not in self.remote_files
+                and self.drive_spelling(child, relative_path, "FILE") is None  # else Drive's, under another spelling
             ):
-                add_local_entry(relative_path, "FILE")
+                self.add_local_entry(relative_path, "FILE")
 
-    for scope in scopes:
-        destination = destination_root / scope
-        if symlink_on_path(destination_root, scope):
-            if os.path.islink(destination) and not symlink_on_path(destination_root, scope.parent):
-                if not at_or_below_trashed(scope):
-                    add_symlink_entry(destination, scope)
-            continue  # never followed
-        if scope != Path() and os.path.isdir(destination) and scope not in remote_folders:
-            scan_gone_folder(scope, destination)  # picked before, gone from Drive (--again)
-        elif scope == Path() or os.path.isdir(destination):
-            scan_directory(scope)
-        elif os.path.isfile(destination) and scope not in remote_files:
-            add_local_entry(scope, "FILE")
+    def scan_scopes(self):
+        destination_root = self.destination_root
+        for scope in self.scopes:
+            destination = destination_root / scope
+            if symlink_on_path(destination_root, scope):
+                if os.path.islink(destination) and not symlink_on_path(destination_root, scope.parent):
+                    if not self.at_or_below_trashed(scope):
+                        self.add_symlink_entry(destination, scope)
+                continue  # never followed
+            if scope != Path() and os.path.isdir(destination) and scope not in self.remote_folders:
+                self.scan_gone_folder(scope, destination)  # picked before, gone from Drive (--again)
+            elif scope == Path() or os.path.isdir(destination):
+                self.scan_directory(scope)
+            elif os.path.isfile(destination) and scope not in self.remote_files:
+                self.add_local_entry(scope, "FILE")
 
-    # In or below a folder that cannot be listed here, files look deleted here (to the Drive trash) or missing
-    # (to download into it): all left as they are on both sides, until it can be read.
-    if unreadable:
-        for entry in plan:
+    def mark_unreadable(self):
+        """In or below a folder that cannot be listed here, files look deleted here (to the Drive trash) or
+        missing (to download into it): all left as they are on both sides, until it can be read."""
+        unreadable = self.unreadable
+        if not unreadable:
+            return
+        for entry in self.plan:
             path = entry["relative_path"]
             if path in unreadable or not unreadable.isdisjoint(path.parents):
                 if entry["status"] != "SKIPPED":
@@ -4175,51 +4229,63 @@ def add_local_entries(plan, destination_root, state, scopes, remote_folders):
                 entry["unreadable"] = True
                 entry.pop("contents", None)
 
-    # An item picked alone and deleted here may have been renamed or moved next to it: the new name is outside
-    # the selection, so it is not sent. Listed as local only, so the preview does not hide it.
-    beside_picked = sorted({
-        entry["relative_path"].parent
-        for entry in plan
-        if entry["status"] == "TRASH_REMOTE" and not path_is_in_scope(entry["relative_path"].parent, scopes)
-    }, key=lambda path: path.as_posix())
-    for parent in beside_picked:
-        directory = destination_root / parent
-        if not os.path.isdir(directory):
-            continue
-        for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
-            relative_path = parent / child.name
-            kind = "FOLDER" if os.path.isdir(child) else "FILE"
-            if (
-                relative_path.parts[0] in RESERVED_NAMES
-                or is_disk_trash(relative_path.parts[0])
-                or (parent == Path() and child.name in VIEW_DIRS)
-                or os.path.islink(child)
-                or child.name.endswith(PART_SUFFIX)
-                or not (os.path.isdir(child) or os.path.isfile(child))
-                or (os.path.isdir(child) and holds_state(child))
-                or path_is_in_scope(relative_path, scopes)
-                or relative_path in planned_local_paths
-                or relative_path in remote_files
-                or relative_path in remote_directories
-                or relative_path in tracked
-                or relative_path in tracked_directories
-                or drive_spelling(child, relative_path, kind) is not None
-            ):
+    def add_beside_picked(self):
+        """An item picked alone and deleted here may have been renamed or moved next to it: the new name is
+        outside the selection, so it is not sent. Listed as local only, so the preview does not hide it."""
+        scopes = self.scopes
+        beside_picked = sorted({
+            entry["relative_path"].parent
+            for entry in self.plan
+            if entry["status"] == "TRASH_REMOTE" and not path_is_in_scope(entry["relative_path"].parent, scopes)
+        }, key=lambda path: path.as_posix())
+        for parent in beside_picked:
+            directory = self.destination_root / parent
+            if not os.path.isdir(directory):
                 continue
-            plan.append(
-                {
-                    "status": "LOCAL_ONLY",
-                    "kind": kind,
-                    "item": None,
-                    "relative_path": relative_path,
-                    "destination": child,
-                    "state_key": None,
-                    "local_sha256": None,
-                    "local_stat": None,
-                    "outside_selection": True,
-                }
-            )
-            planned_local_paths.add(relative_path)
+            for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
+                relative_path = parent / child.name
+                rule = self.rule(parent, child)
+                if rule not in (None, "not_utf8"):
+                    continue
+                kind = "FOLDER" if os.path.isdir(child) else "FILE"
+                if (
+                    path_is_in_scope(relative_path, scopes)
+                    or relative_path in self.planned_local_paths
+                    or relative_path in self.remote_files
+                    or relative_path in self.remote_directories
+                    or relative_path in self.tracked
+                    or relative_path in self.tracked_directories
+                    or self.drive_spelling(child, relative_path, kind) is not None
+                ):
+                    continue
+                if rule == "not_utf8":
+                    self.add_local_entry(relative_path, kind, not_utf8=True)  # never sent, selected or not
+                    continue
+                self.plan.append(
+                    {
+                        "status": "LOCAL_ONLY",
+                        "kind": kind,
+                        "item": None,
+                        "relative_path": relative_path,
+                        "destination": child,
+                        "state_key": None,
+                        "local_sha256": None,
+                        "local_stat": None,
+                        "outside_selection": True,
+                    }
+                )
+                self.planned_local_paths.add(relative_path)
+
+
+def add_local_entries(plan, destination_root, state, scopes, remote_folders):
+    """Local files and folders Drive does not have: new here (sent to Drive), or deleted on Drive (to your trash).
+
+    remote_folders maps local folder paths to their Drive folder id (None: nothing can be sent there).
+    """
+    scan = LocalScan(plan, destination_root, state, scopes, remote_folders)
+    scan.scan_scopes()
+    scan.mark_unreadable()
+    scan.add_beside_picked()
 
 
 def moved_scopes(state, selections):
