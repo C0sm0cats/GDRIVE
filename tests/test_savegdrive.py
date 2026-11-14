@@ -4260,6 +4260,32 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(statuses["Docs/Inbox/scan-0001.pdf"], "UPLOAD_NEW")  # kept here and sent, not trashed
         self.assertEqual((self.root / "Docs/b.txt").read_bytes(), b"budget v2, a colleague's work")
 
+    def test_file_and_folder_put_back_after_the_preview_are_not_trashed_on_drive(self):
+        # tests 83: deleted here, shown as Drive trash, then put back before the plan runs.
+        import shutil
+
+        self.run_sync()
+        kept_aside = Path(self.temp.name) / "aside"
+        shutil.copytree(self.root / "Photos", kept_aside / "Photos")
+        shutil.copy2(self.root / "Docs/b.txt", kept_aside / "b.txt")
+        shutil.rmtree(self.root / "Photos")
+        (self.root / "Docs/b.txt").unlink()
+        plan, state = self.preview()
+        statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+        self.assertEqual([statuses["Photos"], statuses["Docs/b.txt"]], ["TRASH_REMOTE", "TRASH_REMOTE"])
+
+        shutil.copytree(kept_aside / "Photos", self.root / "Photos")  # put back while the preview is open
+        shutil.copy2(kept_aside / "b.txt", self.root / "Docs/b.txt")
+        results = self.apply(plan, state)
+        self.assertEqual(results["FILE_TRASH_REMOTE"] + results["FOLDER_TRASH_REMOTE"], 0)
+        self.assertEqual((results["FILE_ERROR"], results["FOLDER_ERROR"]), (1, 1))
+        for item_id in ("b", "photos", "p"):
+            self.assertFalse(self.drive.is_trashed(self.drive.items[item_id]), item_id)
+
+        statuses, _ = self.run_sync()
+        self.assertEqual([statuses[path] for path in ("Docs/b.txt", "Photos", "Photos/beach.jpg")],
+                         ["UNCHANGED", "UNCHANGED", "UNCHANGED"])
+
     def test_keep_both_in_a_read_only_folder_says_so(self):
         self.drive.items["docs"]["capabilities"] = {"canAddChildren": False}
         self.run_sync()
