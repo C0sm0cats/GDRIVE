@@ -3981,26 +3981,29 @@ def number_readonly_duplicates(service, plan, state):
 
         indexes = sorted(indexes, key=lambda index: effective_id(plan[index]["item"]))
         chosen = {}
+        used = set()  # chosen's names: a list scan per name was quadratic in the number of duplicates
         for index in indexes:  # synced before under one of these names: it keeps it
             numbers = (name_number(path) for path in synced_as.get(effective_id(plan[index]["item"]), ()))
             for number in sorted(number for number in numbers if number is not None):
                 name = relative_path.name if number == 1 else numbered_name(relative_path.name, number)
-                if name not in chosen.values() and (
+                if name not in used and (
                     number == 1 or same_name_key(entries[0]["destination"].with_name(name)) not in taken
                 ):
                     chosen[index] = name
+                    used.add(name)
                     break
         number = 1
         for index in indexes:
             if index in chosen:
                 continue
             name = relative_path.name
-            while name in chosen.values() or (
+            while name in used or (
                 name != relative_path.name and same_name_key(entries[0]["destination"].with_name(name)) in taken
             ):
                 number += 1
                 name = numbered_name(relative_path.name, number)
             chosen[index] = name
+            used.add(name)
         for index, name in chosen.items():
             entry = plan[index]
             taken.add(same_name_key(entry["destination"].with_name(name)))
@@ -4010,6 +4013,9 @@ def number_readonly_duplicates(service, plan, state):
                 service, entry["item"], entry["relative_path"].with_name(name), entry["destination"].with_name(name), state
             )
             plan[index]["numbered"] = True
+
+
+DUPLICATE_NAMES_SHOWN = 3  # the other Drive items a duplicate's label names, then "and n others"
 
 
 def mark_duplicate_targets(plan):
@@ -4039,13 +4045,16 @@ def mark_duplicate_targets(plan):
     for entry in plan:
         if entry["status"] != "SKIPPED" and targets[same_name_key(entry["destination"])] > 1:
             names.setdefault(same_name_key(entry["destination"]), []).append(entry)
+    listed = {id(entry) for others in names.values() for entry in others}
     for entry in plan:
         if targets[same_name_key(entry["destination"])] > 1:
             entry["status"] = "CONFLICT"
             entry["duplicate"] = True
-            entry["same_local_name"] = [
-                source_name(other) for other in names.get(same_name_key(entry["destination"]), []) if other is not entry
-            ]
+            # A few names and a count: each of N duplicates naming all the others printed N² names.
+            others = names.get(same_name_key(entry["destination"]), [])
+            shown = [source_name(other) for other in others[:DUPLICATE_NAMES_SHOWN + 1] if other is not entry]
+            entry["same_local_name"] = shown[:DUPLICATE_NAMES_SHOWN]
+            entry["same_local_more"] = len(others) - (id(entry) in listed) - len(entry["same_local_name"])
 
 
 def source_name(entry):
@@ -4057,6 +4066,9 @@ def source_name(entry):
 def duplicate_label(entry):
     """`(Drive: Report · same local name as Report.docx)`: which Drive items clash, under their Drive names."""
     others = ", ".join(entry.get("same_local_name") or [])
+    more = entry.get("same_local_more", 0)
+    if others and more:
+        others += f" and {more} other{'s' if more > 1 else ''}"
     return printable(f"(Drive: {source_name(entry)} · same local name as {others or 'another item'})")
 
 

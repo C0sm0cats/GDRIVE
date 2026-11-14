@@ -3954,6 +3954,25 @@ class SyncTest(unittest.TestCase):
             savegdrive.print_plan(plan, self.root)
         self.assertIn("Docs/Report.docx  (Drive: Report · same local name as Report.docx)", output.getvalue())
 
+    def test_many_drive_duplicates_name_a_few_others_and_a_count(self):
+        # perf 16: 200 "Untitled document" in one folder, each line naming the 199 others, printed 40,000 names.
+        for index in range(200):
+            self.drive.items[f"u{index:03d}"] = file_item(f"u{index:03d}", "Untitled.txt", "docs", b"x")
+        plan, _ = self.preview()
+        clashing = [entry for entry in plan if entry["relative_path"].as_posix() == "Docs/Untitled.txt"]
+        self.assertEqual(len(clashing), 200)
+        self.assertEqual(savegdrive.duplicate_label(clashing[0]), "(Drive: Untitled.txt · same local name as "
+                         "Untitled.txt, Untitled.txt, Untitled.txt and 196 others)")
+        self.assertTrue(all(entry["same_local_more"] == 196 for entry in clashing))
+        output = io.StringIO()
+        with mock.patch.object(savegdrive, "console", Console(file=output, width=200)):
+            savegdrive.print_plan(plan, self.root)
+        self.assertEqual(output.getvalue().count("Untitled.txt"), 200 * 5)  # its path, its name, 3 others
+        # One more: "and 1 other", not "and 1 others".
+        self.assertEqual(savegdrive.duplicate_label({
+            "item": {"name": "A"}, "same_local_name": ["B", "C", "D"], "same_local_more": 1,
+        }), "(Drive: A · same local name as B, C, D and 1 other)")
+
     def test_drive_names_cannot_send_terminal_sequences(self):
         # security 5: a name chosen by whoever shares a file reaches the terminal through the preview, the
         # report line of each transfer and warnings: its ESC sequences (title, clipboard, erase line) and
