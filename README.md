@@ -401,7 +401,7 @@ tree and `./run-savegdrive.sh --help` list them all with these descriptions.
 | --- | --- |
 | `↑` `↓` `enter` | Pick a parent directory in the tree (space: unfold it) |
 | `tab` | Next field: parent directory, folder name, buttons |
-| `ctrl+s` | Apply: use this folder for the session |
+| `ctrl+s` | Apply: use this folder for the session (or `enter` in a field) |
 | `esc` | Cancel |
 
 ### In a confirmation

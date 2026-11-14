@@ -1429,6 +1429,10 @@ class DestinationSetupScreen(Screen):
     def input_changed(self):
         self.update_final_path()
 
+    @on(Input.Submitted)
+    def field_submitted(self):
+        self.action_save()
+
     @on(Button.Pressed)
     def button_pressed(self, event):
         if event.button.id == "save-destination":
@@ -1587,7 +1591,7 @@ KEYS = {
         ("Folder", [
             ("↑ ↓ enter", "pick", "pick a parent directory in the tree (space: unfold it)"),
             ("tab", "next field", "next field: parent directory, folder name, buttons"),
-            ("ctrl+s", "apply", "apply: use this folder for the session"),
+            ("ctrl+s", "apply", "apply: use this folder for the session (or enter in a field)"),
             ("esc", "cancel", "cancel"),
         ]),
     ]),

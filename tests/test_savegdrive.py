@@ -6427,6 +6427,26 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Session", app.sub_title)
                 await pilot.press("q")
 
+    async def test_enter_in_a_destination_field_applies_it(self):
+        # ux 48: enter in either field applies the folder, like ctrl+s.
+        for field in ["#folder-name", "#parent-path"]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                app = self.make_app()
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.press("f")
+                    screen = app.screen
+                    self.assertIsInstance(screen, savegdrive.DestinationSetupScreen)
+                    screen.query_one("#parent-path", Input).value = temp
+                    screen.query_one("#folder-name", Input).value = "Work"
+                    screen.query_one(field, Input).focus()
+                    await pilot.pause()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIsNot(app.screen, screen)
+                    self.assertEqual(app.destination, Path(temp).resolve() / "Work")
+                    self.assertTrue(savegdrive.has_valid_state(app.destination))
+                    await pilot.press("q")
+
     async def test_destination_refusal_and_button_stay_visible_on_small_terminals(self):
         for size in [(80, 24), (110, 27)]:
             with self.subTest(size=size), tempfile.TemporaryDirectory() as temp:
