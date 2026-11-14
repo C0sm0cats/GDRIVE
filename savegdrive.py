@@ -3957,12 +3957,8 @@ def duplicate_label(entry):
 
 
 def path_is_in_scope(relative_path, scopes):
-    return any(
-        scope == Path()
-        or relative_path == scope
-        or scope in relative_path.parents
-        for scope in scopes
-    )
+    """scopes: a set, built once by the caller (scanning every scope for each path was quadratic)."""
+    return Path() in scopes or relative_path in scopes or not scopes.isdisjoint(relative_path.parents)
 
 
 def tracked_files_by_path(state):
@@ -4014,6 +4010,7 @@ class LocalScan:
         self.plan = plan
         self.destination_root = destination_root
         self.scopes = scopes
+        self.scope_set = frozenset(scopes)
         self.remote_folders = remote_folders
         self.remote_files = {
             entry["relative_path"]
@@ -4035,7 +4032,8 @@ class LocalScan:
         }  # deleted here, two Drive folders on this path, synced at another path, too deep or a symbolic link
         # here: nothing below goes anywhere
         forget_gone_from_both_sides(
-            state, destination_root, scopes, self.remote_files, self.remote_directories, self.at_or_below_trashed
+            state, destination_root, self.scope_set, self.remote_files, self.remote_directories,
+            self.at_or_below_trashed,
         )
         self.tracked = tracked_files_by_path(state)
         self.synced_folders = {Path(path) for path in state.get("folders", {})}
@@ -4287,7 +4285,7 @@ class LocalScan:
     def add_beside_picked(self):
         """An item picked alone and deleted here may have been renamed or moved next to it: the new name is
         outside the selection, so it is not sent. Listed as local only, so the preview does not hide it."""
-        scopes = self.scopes
+        scopes = self.scope_set
         beside_picked = sorted({
             entry["relative_path"].parent
             for entry in self.plan
@@ -4404,6 +4402,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             remote_folders.setdefault(Path(saved_item["relative_parent"]), saved_item["parent_id"])
     scopes = compact_scopes([*scopes, *moved_scopes(state, selections)])
     add_local_entries(plan, destination_root, state, scopes, remote_folders)
+    scope_set = frozenset(scopes)
     # The Drive folder of a file picked alone, from the tree: its local folder is not scanned.
     picked_parents = {
         selection["relative_parent"]: selection["parent_id"]
@@ -4421,7 +4420,7 @@ def build_plan(service, selections, scopes, destination_root, state, cache, on_i
             sendable = (parent_id or picked_parents.get(parent)) is not None and not is_readonly_path(
                 entry["relative_path"]
             )
-            entry["copy_goes_up"] = sendable and path_is_in_scope(parent, scopes)
+            entry["copy_goes_up"] = sendable and path_is_in_scope(parent, scope_set)
             entry["copy_on_again"] = sendable and not entry["copy_goes_up"]
     return plan
 

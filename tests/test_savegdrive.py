@@ -4662,6 +4662,48 @@ class LastSyncNewFoldersScalingTest(unittest.TestCase):
         self.assertEqual(self.comparisons(2), self.comparisons(40))
 
 
+class ManyScopesScalingTest(unittest.TestCase):
+    """Paths are checked against the picked folders by lookup, not one scan of them each (perf 18)."""
+
+    setUp = SyncTest.setUp
+    preview = SyncTest.preview
+    apply = SyncTest.apply
+
+    def parents_per_file(self, empty):
+        """Path.parents reads per Drive file of an unchanged sync with empty + 1 picked folders."""
+        counts = []
+        for files in (100, 200):
+            items = [{"id": f"e{index}", "name": f"Empty{index}", "mimeType": FOLDER, "parent": "root"}
+                     for index in range(empty)]
+            # Sorted after every other scope: a scan of the scopes reaches it last.
+            items.append({"id": "big", "name": "Zbig", "mimeType": FOLDER, "parent": "root"})
+            items += [file_item(f"f{index}", f"f{index}.txt", "big", b"x") for index in range(files)]
+            items.append({"id": "out", "name": "Out", "mimeType": FOLDER, "parent": "root"})
+            self.drive = FakeDrive(items)
+            only = {"Zbig"} | {f"Empty{index}" for index in range(empty)}
+            plan, state = self.preview(only)
+            self.apply(plan, state)
+            real, reads = type(Path()).parents, []
+
+            def counting_parents(path):
+                reads.append(path)
+                return real.fget(path)
+
+            with mock.patch.object(type(Path()), "parents", property(counting_parents)):
+                plan, _ = self.preview(only)
+            statuses = {entry["relative_path"].as_posix(): entry["status"] for entry in plan}
+            self.assertEqual({statuses[f"Zbig/f{index}.txt"] for index in range(files)}, {"UNCHANGED"})
+            self.assertTrue(all(entry["copy_goes_up"] for entry in plan if entry["kind"] == "FILE"))
+            self.assertNotIn("Out", statuses)
+            counts.append(len(reads))
+            self.temp.cleanup()
+            self.setUp()
+        return counts[1] - counts[0]
+
+    def test_files_are_not_compared_with_each_picked_folder(self):
+        self.assertEqual(self.parents_per_file(2), self.parents_per_file(40))
+
+
 class DriveCallBatchingTest(unittest.TestCase):
     """--again and planning fetch saved items and shortcut targets in batches, not one call each (perf 4)."""
 
