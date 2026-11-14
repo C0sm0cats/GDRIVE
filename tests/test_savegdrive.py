@@ -604,6 +604,15 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs", "Docs/a.txt", "Docs/Report.docx")}, {"UNCHANGED"})
 
+    def test_drive_name_with_a_nul_byte_comes_down_without_it(self):
+        # tests 95: Drive takes a NUL in a name; the local path refuses it (ValueError), which stopped the whole sync.
+        self.drive.items["z"] = file_item("z", "scan\x001.pdf", "docs", b"scan")
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/scan1.pdf"], "NEW")
+        self.assertEqual(results["FILE_NEW"], 6)
+        self.assertEqual((self.root / "Docs/scan1.pdf").read_bytes(), b"scan")
+        self.assertEqual((self.root / "Docs/a.txt").read_bytes(), b"alpha")
+
     def test_listing_snapshot_written_after_a_sync_is_never_sent_to_drive(self):
         # tests 74: main's run_sync saves the --again snapshot at the root of the folder after each sync
         self.run_sync()
