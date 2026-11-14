@@ -5944,7 +5944,8 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             tree = app.query_one(Tree)
             self.assertLessEqual(tree.virtual_size.width, tree.scrollable_content_region.width)
             lines = ["".join(segment.text for segment in tree.render_line(y)) for y in range(12)]
-            self.assertTrue(any("…" in line and "4 B  2025-01-02" in line for line in lines), lines)
+            day = savegdrive.display_date(drive.items["v4"])  # local date: 2025-01-01 west of UTC-3
+            self.assertTrue(any("…" in line and f"4 B  {day}" in line for line in lines), lines)
 
     async def test_deep_trees_fit_the_tree_width(self):
         # design 23: ten nested folders in 80x24 keep their names, dates and totals in view, without a scrollbar.
@@ -5963,7 +5964,8 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             tree.scroll_end(animate=False)
             await pilot.pause()
             lines = ["".join(segment.text for segment in tree.render_line(y)) for y in range(12)]
-            self.assertTrue(any("CheckoutContr" in line and "8.4 KB  2025-01-02" in line for line in lines), lines)
+            day = savegdrive.display_date(items[len(folders) + 2])  # local date: 2025-01-01 west of UTC-3
+            self.assertTrue(any("CheckoutContr" in line and f"8.4 KB  {day}" in line for line in lines), lines)
             self.assertTrue(any("controller" in line and "3 files" in line for line in lines), lines)
             await pilot.resize_terminal(220, 55)
             await pilot.pause()
