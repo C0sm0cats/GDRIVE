@@ -141,8 +141,14 @@ class FakeDrives:
     def __init__(self, drive):
         self.drive = drive
 
-    def list(self, **kwargs):
-        return fields_request(lambda: {"drives": self.drive.shared_drives}, kwargs.get("fields"))
+    def list(self, pageSize=10, pageToken=None, fields=None):
+        # Pages like drives.list: at most pageSize drives (the API allows 100), then nextPageToken.
+        start = int(pageToken or 0)
+        drives = self.drive.shared_drives
+        page = {"drives": drives[start:start + pageSize]}
+        if start + pageSize < len(drives):
+            page["nextPageToken"] = str(start + pageSize)
+        return fields_request(lambda: page, fields)
 
 
 class FakeDrive:
@@ -3339,6 +3345,13 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
             savegdrive.apply_plan(self.drive, plan, self.root, state)
         return {entry["relative_path"].as_posix(): entry for entry in plan}
+
+    def test_every_shared_drive_gets_a_view_past_the_first_page(self):
+        # More than 100 shared drives: drives.list returns them in several pages, each must get its view.
+        self.drive.shared_drives = [{"id": f"d{i}", "name": f"Team {i:03}", "capabilities": {"canAddChildren": True}}
+                                    for i in range(130)]
+        views = savegdrive.drive_views(self.drive, "root")
+        self.assertEqual([view.root_id for view in views[2:-1]], [drive["id"] for drive in self.drive.shared_drives])
 
     def test_shared_drive_named_like_yours_never_gets_your_files(self):
         # Someone adds you to their own drive "Finance": what you put in your Finance folder stays in yours.
