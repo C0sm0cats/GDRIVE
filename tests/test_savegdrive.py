@@ -732,6 +732,23 @@ class SyncTest(unittest.TestCase):
         january = folders[("01", folders[("2000", archive)])]
         self.assertIn(("a.txt", january), folders)
 
+    def test_file_whose_folder_could_not_be_made_on_drive_is_not_sent(self):
+        # tests 94: sent with parents [null], Drive puts the file at the root of My Drive; the next sync then
+        # moved it to the root here and put its local folder in your trash.
+        self.run_sync()
+        (self.root / "Docs/Taxes").mkdir()
+        (self.root / "Docs/Taxes/2025.pdf").write_bytes(b"tax return")
+        self.drive.create_failures["Taxes"] = [http_error(403)]
+        statuses, results = self.run_sync()
+        self.assertEqual(statuses["Docs/Taxes/2025.pdf"], "UPLOAD_NEW")
+        self.assertEqual((results["FOLDER_ERROR"], results["FILE_ERROR"], results["FILE_UPLOAD_NEW"]), (1, 1, 0))
+        self.assertNotIn("2025.pdf", [item["name"] for item in self.drive.items.values()])
+        statuses, results = self.run_sync()  # sent into its folder on the next run
+        taxes = next(item["id"] for item in self.drive.items.values() if item["name"] == "Taxes")
+        self.assertTrue(any(item["name"] == "2025.pdf" and item["parent"] == taxes for item in self.drive.items.values()))
+        self.assertEqual((self.root / "Docs/Taxes/2025.pdf").read_bytes(), b"tax return")
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_drive_folder_that_cannot_be_made_here_is_an_error_and_comes_back(self):
         # tests 51: a failed local mkdir of a new empty Drive folder must count as an error, not pass as synced.
         self.run_sync()
