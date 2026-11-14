@@ -2246,6 +2246,16 @@ class SyncTest(unittest.TestCase):
             savegdrive.main()
         return output.file.getvalue()
 
+    def test_again_without_yes_and_without_a_terminal_never_opens_the_preview(self):
+        # From cron or a script, the full-screen preview would wait forever and keep the folder locked.
+        self.sync_everything()
+        (self.root / "Docs" / "a.txt").unlink()
+        with mock.patch.object(savegdrive.PreviewApp, "run", side_effect=AssertionError("preview without a terminal")), \
+                mock.patch.object(savegdrive, "ask", return_value=""):
+            output = self.run_main("--again", isatty=False)
+        self.assertIn("Cancelled. Nothing was changed.", output)
+        self.assertFalse(self.drive.items["a"].get("trashed"))
+
     def test_folder_id_copied_from_a_drive_link_opens_that_folder(self):
         # ux 36: Drive's "Copy link" ends in ?usp=sharing or ?usp=drive_link; a full link works too.
         opened = []
