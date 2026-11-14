@@ -604,6 +604,17 @@ class SyncTest(unittest.TestCase):
         statuses, _ = self.run_sync()
         self.assertEqual({statuses[path] for path in ("Docs", "Docs/a.txt", "Docs/Report.docx")}, {"UNCHANGED"})
 
+    def test_identical_file_already_here_is_marked_synced(self):
+        # tests 96: an identical copy taken as synced gets Drive's date, else the tree marks it edited for good.
+        (self.root / "Docs").mkdir()
+        (self.root / "Docs/a.txt").write_bytes(b"alpha")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/a.txt"], "UNCHANGED")
+        nodes, _ = savegdrive.collect_drive_tree(self.drive, "root", {})
+        marks = savegdrive.local_marks(nodes, self.root, savegdrive.load_state(self.root))
+        node = next(node for node in nodes if node["display_path"] == "Docs/a.txt")
+        self.assertEqual(marks.get(node["index"]), "synced")
+
     def test_drive_name_with_a_nul_byte_comes_down_without_it(self):
         # tests 95: Drive takes a NUL in a name; the local path refuses it (ValueError), which stopped the whole sync.
         self.drive.items["z"] = file_item("z", "scan\x001.pdf", "docs", b"scan")
