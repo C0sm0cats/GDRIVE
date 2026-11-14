@@ -153,8 +153,8 @@ rebuilt.
 
 SaveGDrive then signs in to Google Drive with full Drive access (it sends files
 and manages the Drive trash). Your browser opens the Google sign-in page; if it
-does not, the terminal shows a clickable link. The session is kept in
-`token.json` and renewed automatically.
+does not, the terminal shows a clickable link and the address to copy. The
+session is kept in `token.json` and renewed automatically.
 
 ## How the sync works
 

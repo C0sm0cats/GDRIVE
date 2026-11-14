@@ -236,15 +236,18 @@ def local_expiry(creds):
 def sign_in(reason):
     """Browser OAuth sign-in with compact output, erased once signed in (kept with --verbose)."""
     flow = oauth_flow()
+    prompt_lines = [2]
 
     class QuietBrowser(webbrowser.BaseBrowser):
         # run_local_server hands us the sign-in URL here, so the prompt and opening are ours.
         def open(self, url, new=0, autoraise=True):
             console.print(f"[yellow]![/] {reason}")
             console.print(f"  [dim]Didn't open?[/] [link={url}]Open the sign-in page[/link]")
-            if VERBOSE:
-                # Soft wrap keeps the URL one logical line, so terminals still detect it as a link.
-                console.print(f"  {url}", style="dim", markup=False, soft_wrap=True)
+            # Printed in full even without --verbose: terminals without OSC 8 links (xterm, the Linux
+            # console, screen) show the link text only, so the address must be there to copy.
+            # Soft wrap keeps the URL one logical line, so terminals still detect it as a link.
+            console.print(f"  {url}", style="dim", markup=False, soft_wrap=True)
+            prompt_lines[0] = 2 + -(-(len(url) + 2) // max(console.width, 1))
             return open_quietly(url)
 
     webbrowser.register("savegdrive", None, QuietBrowser("savegdrive"))
@@ -265,7 +268,7 @@ def sign_in(reason):
         )
         sys.exit(1)
     if not VERBOSE and console.is_terminal:
-        console.file.write("\x1b[2F\x1b[J")  # erase the two prompt lines
+        console.file.write(f"\x1b[{prompt_lines[0]}F\x1b[J")  # erase the prompt lines, wrapped URL included
     debug(f"Token expires {local_expiry(creds)}")
     return creds
 

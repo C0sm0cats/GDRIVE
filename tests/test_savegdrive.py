@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import webbrowser
 from collections import Counter
 from pathlib import Path
 from unittest import mock
@@ -3551,6 +3552,28 @@ class SyncTest(unittest.TestCase):
         self.assertIn("Run again and allow access", output.getvalue())
         self.assertEqual(len(pages), 1)
         self.assertNotIn("signed in", pages[0])
+
+    def test_sign_in_prints_the_address_without_verbose_and_erases_its_wrapped_lines(self):
+        # ux 47: terminals without OSC 8 links (xterm) show only the link text, so the address is printed too.
+        url = "https://accounts.example/auth?" + "x" * 120
+        creds = mock.Mock(expiry=None)
+
+        class Flow:
+            def run_local_server(self, browser, **kwargs):
+                webbrowser.get(browser).open(url)
+                return creds
+
+        output = io.StringIO()
+        console = Console(file=output, width=80, force_terminal=True, highlight=False)
+        with mock.patch.object(savegdrive, "oauth_flow", Flow), \
+                mock.patch.object(savegdrive, "open_quietly", lambda opened: False), \
+                mock.patch.object(savegdrive, "VERBOSE", False), \
+                mock.patch.object(savegdrive, "console", console):
+            self.assertIs(savegdrive.sign_in("Sign in to Google Drive in your browser."), creds)
+        text = output.getvalue()
+        self.assertIn(f"  {url}", re.sub(r"\x1b\][^\x1b]*\x1b\\|\x1b\[[0-9;]*m", "", text))
+        # Reason, "Didn't open?", then the 152-character address soft-wrapped over two 80-column lines.
+        self.assertTrue(text.endswith("\x1b[4F\x1b[J"), repr(text[-20:]))
 
     def test_tree_without_a_terminal_says_to_use_again_and_does_not_hang(self):
         # ux 40: cron with --yes but no --again; the tree would wait for keys forever, its screen in the log.
