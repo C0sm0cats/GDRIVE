@@ -5323,16 +5323,22 @@ def check_unchanged_since_plan(entry):
 CHANGED_ON_DRIVE_SINCE_PREVIEW = "changed on Drive since the preview, not trashed: compared again at the next sync"
 
 
-def still_deleted_here(service, entry, state):
-    """Right before the Drive trash: still gone here, and Drive's side still the one last synced (the plan may be old)."""
+def still_deleted_here(service, entry, state, current=None, cache=None):
+    """Right before the Drive trash: still gone here, and Drive's side still the one last synced (the plan may be old).
+    current (id -> item or HttpError) and cache (folder listings) hold what was just read in batches."""
     if os.path.lexists(entry["destination"]):
         return False
     item = entry["item"]
     try:
         if entry["kind"] == "FOLDER":
-            return remote_subtree_unchanged(service, effective_id(item), entry["relative_path"], state, {})
-        now = service.files().get(fileId=item["id"], fields=ITEM_FIELDS, supportsAllDrives=True).execute(
-            num_retries=API_RETRIES)
+            return remote_subtree_unchanged(service, effective_id(item), entry["relative_path"], state,
+                                            {} if cache is None else cache)
+        now = (current or {}).get(item["id"])
+        if now is None:
+            now = service.files().get(fileId=item["id"], fields=ITEM_FIELDS, supportsAllDrives=True).execute(
+                num_retries=API_RETRIES)
+        elif isinstance(now, Exception):
+            raise now  # the HttpError Drive gave for it in the batch
     except HttpError:
         return False
     return remote_signature(now) == remote_signature(item) and can(now, "canTrash")
@@ -5719,10 +5725,20 @@ def run_transfers(service, make_service, transfers, folder_ids, state, results, 
 def trash_remote_entries(service, plan, state, results, report, forgotten):
     """Phase 4. Deleted here: Drive's copies go to the Drive trash. Their paths are added to forgotten."""
     trashed = []
-    for entry in plan:
-        if entry["status"] != "TRASH_REMOTE":
-            continue
-        if still_deleted_here(service, entry, state):
+    deleted = [entry for entry in plan if entry["status"] == "TRASH_REMOTE"]
+    gone = [entry for entry in deleted if not os.path.lexists(entry["destination"])]
+    # Read Drive's side again in batches (perf 15): one call per item or per folder took minutes.
+    files = [entry["item"]["id"] for entry in gone if entry["kind"] != "FOLDER"]
+    current = get_items(service, files, ITEM_FIELDS) if files else {}
+    cache = {}
+    folders = [effective_id(entry["item"]) for entry in gone if entry["kind"] == "FOLDER"]
+    if folders:
+        try:
+            prefetch_folders(service, folders, cache)  # listed again, one batched call per level
+        except HttpError:
+            pass  # what is not listed yet, still_deleted_here lists itself
+    for entry in deleted:
+        if still_deleted_here(service, entry, state, current, cache):
             trashed.append(entry)
             continue
         results[f"{entry['kind']}_ERROR"] += 1

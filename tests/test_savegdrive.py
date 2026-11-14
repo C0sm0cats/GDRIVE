@@ -4694,6 +4694,73 @@ class DriveCallBatchingTest(unittest.TestCase):
         self.assertEqual(len(gets), 60)
         self.assertEqual(drive.batches, [50, 10])  # every get went through a batch
 
+    def test_drive_trash_checks_what_was_deleted_here_in_batches(self):
+        # perf 15: right before the Drive trash, each file deleted here was read again by its own call, and a
+        # folder deleted here was listed one subfolder per call.
+        drive = FakeDrive(
+            [{"id": "proj", "name": "Projects", "mimeType": FOLDER, "parent": "root"},
+             {"id": "old", "name": "Old", "mimeType": FOLDER, "parent": "proj"}]
+            + [file_item(f"f{index}", f"f{index}.txt", "proj", b"x") for index in range(60)]
+            + [item for index in range(4) for item in (
+                {"id": f"s{index}", "name": f"S{index}", "mimeType": FOLDER, "parent": "old"},
+                file_item(f"s{index}f", "f.txt", f"s{index}", b"y"),
+            )]
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "GDrive"
+            savegdrive.initialize_managed_destination(root)
+
+            def sync(plan_only=False):
+                cache = {}
+                nodes, browsed = savegdrive.collect_drive_tree(drive, "root", cache)
+                selections = []
+                for node in nodes:
+                    if node["parent"] is None:
+                        savegdrive.add_selected_item(selections, node["item"], node["relative_parent"])
+                scopes = savegdrive.build_local_scopes(selections, browsed)
+                state = savegdrive.load_state(root)
+                plan = savegdrive.build_plan(drive, selections, scopes, root, state, cache)
+                if plan_only:
+                    return plan, state
+                with mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                    return savegdrive.apply_plan(drive, plan, root, state, 1, lambda: drive)
+
+            with mock.patch.object(savegdrive, "fetch_media", fake_fetch), \
+                    mock.patch.object(savegdrive, "upload_file", fake_upload):
+                sync()
+                for index in range(60):
+                    (root / f"Projects/f{index}.txt").unlink()
+                shutil.rmtree(root / "Projects/Old")
+                plan, state = sync(plan_only=True)
+                drive.items["f7"].update(file_item("f7", "f7.txt", "proj", b"x v2"))  # changed on Drive since the preview
+                drive.items["s2f"].update(file_item("s2f", "f.txt", "s2", b"y v2"))
+                direct = []
+                real_execute = FakeRequest.execute
+
+                def execute(request, num_retries=0):
+                    direct.append(request)
+                    return real_execute(request, num_retries)
+
+                real_batch_execute = FakeBatch.execute
+
+                def batch_execute(batch):
+                    with mock.patch.object(FakeRequest, "execute", real_execute):
+                        return real_batch_execute(batch)
+
+                drive.batches.clear()
+                with mock.patch.object(FakeRequest, "execute", execute), \
+                        mock.patch.object(FakeBatch, "execute", batch_execute), \
+                        mock.patch.object(savegdrive, "console", Console(file=io.StringIO())):
+                    results = savegdrive.apply_plan(drive, plan, root, state, 1, lambda: drive)
+        self.assertEqual(direct, [])  # no call outside a batch
+        self.assertEqual(drive.batches, [50, 10, 1, 4, 50, 9])  # gets, Old, its 4 subfolders, then the trash
+        self.assertEqual(results["FILE_TRASH_REMOTE"], 59)
+        self.assertEqual(results["FILE_ERROR"], 1)  # the guard of security 14 still holds
+        self.assertEqual(results["FOLDER_ERROR"], 1)
+        self.assertFalse(drive.items["f7"].get("trashed"))
+        self.assertFalse(drive.items["old"].get("trashed"))
+        self.assertTrue(drive.items["f8"].get("trashed"))
+
     def test_trash_restore_and_delete_handle_every_batch(self):
         # A sort of more than API_BATCH_SIZE photos: no batch after the first may be skipped (tests 47).
         ids = [f"f{index}" for index in range(60)]
