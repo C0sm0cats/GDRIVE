@@ -6092,6 +6092,31 @@ class SelectorTest(unittest.IsolatedAsyncioTestCase):
             labels = [node.label.plain for node in app.tree_nodes.values()]
             self.assertTrue(any("CheckoutController.java" in label for label in labels), labels)
 
+    async def test_long_view_names_fit_the_tree_width(self):
+        # design 22: a shared drive or --folder-id name over 71 cells is cut with "…" on the root, without a scrollbar.
+        name = "Rapports trimestriels du service comptabilité et contrôle de gestion 2026"
+        for nodes in ("full", "empty", "error"):
+            drive = FakeDrive([]) if nodes == "empty" else demo_drive()
+            views = [savegdrive.DriveView(name, "root", Path("Shared drives") / name), savegdrive.DriveView("Other", "root")]
+            app = self.make_app(drive, views)
+            if nodes == "error":
+                views[0].nodes, views[0].error = None, "Drive refused the listing"
+            async with app.run_test(size=(220, 55)) as pilot:
+                await pilot.pause()
+                app.show_view(views[0])
+                await pilot.pause()
+                self.assertIn(name, app.drive_tree.root.label.plain)
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                tree = app.query_one(Tree)
+                self.assertLessEqual(tree.virtual_size.width, tree.scrollable_content_region.width, nodes)
+                root = tree.root.label.plain
+                self.assertTrue(root.startswith("Rapports") and "…" in root, root)
+                self.assertTrue(root.endswith({"full": "…", "empty": "empty", "error": "try again)"}[nodes]), root)
+                await pilot.resize_terminal(220, 55)
+                await pilot.pause()
+                self.assertIn(name, tree.root.label.plain)
+
     async def test_names_cut_alike_in_every_view(self):
         # A shared drive, Shared with me or Trash has a base path: it is not tree depth, names keep their room.
         drive = demo_drive()

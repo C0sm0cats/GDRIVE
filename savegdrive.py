@@ -2376,6 +2376,7 @@ class DriveSelectorApp(App):
         if self.query("#views"):
             self.update_views(event.size.width)
         self.update_notice(event.size.width)
+        self.set_root_label(event.size.width)
         if self.view.nodes is None or self.labels_fit(self.fit_name_column(event.size.width)):
             return
         self.label_column = self.fit_name_column(event.size.width)
@@ -2546,14 +2547,10 @@ class DriveSelectorApp(App):
         if view.nodes is None:
             tree.clear()
             tree.built_nodes = tree.built_key = None
-            tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  loading…", "dim")))
+            self.set_root_label()
             if view.error is None:
                 self.run_worker(lambda: self.load_in_background(view), thread=True, group="views")
-            else:
-                retry = ("  (switch views to try again)", "dim") if len(self.views) > 1 else ""
-                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), (f"  {view.error}", "red"), retry))
         else:
-            tree.root.set_label(Text(view.name, style="bold bright_blue"))
             view.sort(self.sort)
             if self.filter_terms:
                 self.apply_filter(filter_input.value)  # computed on the loaded items
@@ -2564,12 +2561,32 @@ class DriveSelectorApp(App):
             elif tree.stale == "selection":
                 self.relabel_nodes(selection_only=True)
             tree.stale = None
-            if not view.nodes:
-                tree.root.set_label(Text.assemble((view.name, "bold bright_blue"), ("  empty", "dim")))
+            self.set_root_label()
         self.update_views()
         self.update_selection_summary()
         if not filter_input.has_focus:
             self.query_one("#keys", KeyBar).set_context("trash" if view.root_id == TRASH else "tree")
+
+    def set_root_label(self, screen_width=None):
+        """The view's name and state on the tree's root, cut with "…" to the tree's width like the other
+        lines: a long shared drive or --folder-id name would otherwise add a horizontal scrollbar."""
+        view = self.view
+        if view.nodes is None and view.error is None:
+            parts = [("  loading…", "dim")]
+        elif view.nodes is None:
+            parts = [(f"  {view.error}", "red")]
+            if len(self.views) > 1:
+                parts.append(("  (switch views to try again)", "dim"))
+        else:
+            parts = [] if view.nodes else [("  empty", "dim")]
+        self.fit_name_column(screen_width or self.size.width)  # sets self.tree_frame
+        room = max((screen_width or self.size.width) - self.tree_frame - 2, NAME_COLUMN_MIN)  # 2: root's "▼ "
+        state = Text.assemble(*parts)
+        name = Text(view.name, style="bold bright_blue")
+        name.truncate(max(room - state.cell_len, min(name.cell_len, NAME_ROOM_MIN)), overflow="ellipsis")
+        label = Text.assemble(name, state)
+        label.truncate(room, overflow="ellipsis")
+        self.drive_tree.root.set_label(label)
 
     def load_in_background(self, view):
         try:
