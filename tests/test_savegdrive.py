@@ -3550,6 +3550,18 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.drive.items["up"]["content"], b"camera photo")
         self.assertEqual(self.drive.items["low"]["content"], b"phone photo")
 
+    def test_name_differing_only_by_case_here_is_still_sent(self):
+        # A case-sensitive disk keeps "A.txt" apart from Drive's "a.txt", and "docs" from "Docs": both are new.
+        self.run_sync()
+        (self.root / "Docs/A.txt").write_bytes(b"my own notes")
+        (self.root / "docs").mkdir()
+        (self.root / "docs/todo.txt").write_bytes(b"todo made here")
+        statuses, _ = self.run_sync()
+        self.assertEqual(statuses["Docs/A.txt"], "UPLOAD_NEW")
+        self.assertEqual(statuses["docs/todo.txt"], "UPLOAD_NEW")
+        self.assertEqual(sorted(item["name"] for item in self.drive.items.values()
+                                if item.get("content") in (b"my own notes", b"todo made here")), ["A.txt", "todo.txt"])
+
     def test_case_only_rename_on_drive_is_not_a_deletion(self):
         # On a case-insensitive disk, "report.txt" and "Report.txt" are one file: a hard link
         # (and a folder symlink) gives this disk the same two names for one file.
